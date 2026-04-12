@@ -2,7 +2,11 @@
 
 package loader
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/cilium/ebpf"
+)
 
 // stubImpl lets the project build on non-Linux hosts (macOS dev workflow).
 // XDP is Linux-only; calling Attach here returns a clear error.
@@ -15,3 +19,8 @@ func (stubImpl) attach(ifaceIndex int) error {
 }
 
 func (stubImpl) close() error { return nil }
+
+// BlocklistMap is a no-op on non-Linux builds.
+func (l *Loader) BlocklistMap() (*ebpf.Map, error) {
+	return nil, fmt.Errorf("blocklist map not available on non-linux builds")
+}

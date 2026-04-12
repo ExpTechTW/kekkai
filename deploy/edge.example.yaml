@@ -1,3 +1,9 @@
 node_id: edge-01
 region: tw-tpe
 iface: eth0
+
+# Static CIDR blocklist loaded at startup (IPv4 only for now).
+# Each entry can be a bare address (→ /32) or a CIDR.
+static_blocklist:
+  # - 192.0.2.0/24
+  # - 198.51.100.7

@@ -8,9 +8,10 @@ import (
 )
 
 type Config struct {
-	NodeID string `yaml:"node_id"`
-	Region string `yaml:"region"`
-	Iface  string `yaml:"iface"`
+	NodeID          string   `yaml:"node_id"`
+	Region          string   `yaml:"region"`
+	Iface           string   `yaml:"iface"`
+	StaticBlocklist []string `yaml:"static_blocklist"`
 }
 
 func Load(path string) (*Config, error) {

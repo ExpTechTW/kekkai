@@ -16,7 +16,10 @@ import (
 //go:embed bpf/xdp_filter.o
 var programBytes []byte
 
-const bpffsRoot = "/sys/fs/bpf/waf-go"
+const (
+	bpffsRoot        = "/sys/fs/bpf/waf-go"
+	blocklistMapName = "blocklist_v4"
+)
 
 type linuxImpl struct {
 	coll *ebpf.Collection
@@ -74,4 +77,18 @@ func (l *linuxImpl) close() error {
 		l.coll.Close()
 	}
 	return nil
+}
+
+// BlocklistMap returns the raw ebpf.Map handle for the IPv4 blocklist trie.
+// Callers should wrap it with internal/maps.NewBlocklist.
+func (l *Loader) BlocklistMap() (*ebpf.Map, error) {
+	li, ok := l.impl.(*linuxImpl)
+	if !ok || li.coll == nil {
+		return nil, fmt.Errorf("loader not attached")
+	}
+	m := li.coll.Maps[blocklistMapName]
+	if m == nil {
+		return nil, fmt.Errorf("map %s not found", blocklistMapName)
+	}
+	return m, nil
 }

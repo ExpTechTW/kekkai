@@ -1,8 +1,8 @@
 package loader
 
-// Loader attaches and detaches the WAF eBPF program.
-// Platform-specific implementations live in loader_linux.go (real eBPF
-// attach) and loader_stub.go (no-op for darwin development).
+// Loader attaches and detaches the WAF eBPF program and exposes handles to
+// the maps shared with the data plane. Platform-specific implementations
+// live in loader_linux.go (real eBPF) and loader_stub.go (darwin dev stub).
 type Loader struct {
 	iface string
 	impl  implementation
