@@ -1,199 +1,235 @@
 # waf-go (edge)
 
-高效能 L3/L4 邊緣防火牆 agent，用 XDP/eBPF 做 data plane，Go 做 control plane，透過 NATS 與中央 core 交換黑名單與遙測。本 repo 只包含 **edge 端**；core 伺服器另立 repo。
+高效能 L3/L4 邊緣防火牆 agent — XDP/eBPF 做 data plane、Go 做 control plane。本 repo 只包含 **edge 端**；未來與 core server 透過 NATS 交換黑名單與遙測（尚未實作），core server 另立 repo。
 
-## 目標
+## 目前狀態
 
-- 單機 10 萬+ HTTP RPS / 百萬級 PPS 等級的封包過濾
-- 取代 nftables 的 L3/L4 防火牆功能（ACL、rate limit、基本 DDoS 緩解）
-- 本地統計聚合，異常流量取樣上報
-- 從 core 即時同步雲端黑名單（秒級生效）
-- Edge 與 core 解耦：core 掛掉，edge 仍可獨立運作
+已完成 M1–M3：XDP 載入、CIDR 黑名單、完整統計。NATS 整合與 core 協同在路線圖上但尚未動工。edge 目前能獨立運作，是一個會用的本地 L3/L4 防火牆。
+
+| 里程碑 | 狀態 | 交付內容 |
+|---|---|---|
+| **M1** skeleton & loader | ✅ | XDP attach/detach、config、cilium/ebpf 載入器、跨平台建置（macOS 開發 stub） |
+| **M2** blocklist | ✅ | LPM_TRIE map、靜態黑名單、`XDP_DROP` 生效 |
+| **M3** stats | ✅ | 全域 + 協定 + drop 原因計數、per-IP LRU top-N、tx 讀 sysfs、watch 友善輸出 |
+| **M4** NATS 整合 | ⏳ | stats/events publish、心跳 |
+| **M5** 黑名單 KV 同步 | ⏳ | JetStream KV watcher、本地 snapshot、開機回放 |
+| **M6** rate limit & 自動封鎖 | ⏳ | 超閾值 TTL 封鎖、event ringbuf produce |
+| **M7** 運維補強 | ⏳ | systemd unit、graceful reload、壓測 |
 
 ## 架構
 
 ```
-┌─ Edge Node ─────────────────────────────────┐
-│                                             │
-│  ┌─ Data Plane (eBPF/C, kernel) ─────────┐  │
-│  │  XDP program @ NIC driver             │  │
-│  │    ├ LPM_TRIE  : blocklist (CIDR)     │  │
-│  │    ├ PERCPU_HASH: per-IP counters     │  │
-│  │    ├ PERCPU_ARRAY: global stats       │  │
-│  │    └ RINGBUF   : anomaly samples → US │  │
-│  └───────────────────────────────────────┘  │
-│                    ↑ map       ↓ ringbuf    │
-│  ┌─ Control Plane (Go, userspace) ───────┐  │
-│  │  loader       : cilium/ebpf           │  │
-│  │  collector    : ringbuf reader        │  │
-│  │  aggregator   : 本地統計聚合 (1s flush)│  │
-│  │  nats client  : pub stats / events    │  │
-│  │                 KV watch blocklist    │  │
-│  │  map writer   : blocklist → LPM_TRIE  │  │
-│  │  local cache  : BoltDB snapshot       │  │
-│  │  metrics      : Prometheus /metrics   │  │
-│  └───────────────────────────────────────┘  │
-│                    ↕ NATS                   │
-└─────────────────────────────────────────────┘
-                     ↕
-              NATS Cluster (JetStream + KV)
-                     ↕
-                  Core Server
+┌─ Edge Node (本 repo) ─────────────────────────┐
+│                                               │
+│  ┌─ Data Plane (eBPF/C, kernel) ─────────┐    │
+│  │  XDP @ NIC (generic mode on RPi)      │    │
+│  │    ├ LPM_TRIE  blocklist_v4           │    │
+│  │    ├ PERCPU_ARRAY stats (32 slots)    │    │
+│  │    ├ LRU_HASH perip_v4  (65 536)      │    │
+│  │    └ RINGBUF events      (reserved)   │    │
+│  └───────────────────────────────────────┘    │
+│                    ↑ map read / write         │
+│  ┌─ Control Plane (Go, userspace) ───────┐    │
+│  │  loader    : cilium/ebpf attach       │    │
+│  │  maps      : blocklist Add/Del        │    │
+│  │  stats     : dual-goroutine reader    │    │
+│  │              ├ fast 1s  → stats.txt   │    │
+│  │              └ slow 1s  → top-N scan  │    │
+│  │  config    : YAML                     │    │
+│  └───────────────────────────────────────┘    │
+│                                               │
+│  planned: NATS client, event ringbuf consumer │
+└───────────────────────────────────────────────┘
+```
+
+## 功能
+
+**XDP 過濾**
+- IPv4 src address 查 LPM trie，命中 `XDP_DROP`，否則 `XDP_PASS`
+- IPv6、非 IP 協定一律 pass（M2+ 擴充）
+- 封包 header 解析用 repo 內自帶的 `struct ethhdr` / `struct iphdr`，不依賴 BTF / `vmlinux.h`（RPi kernel 常沒開 `CONFIG_DEBUG_INFO_BTF`）
+
+**統計**
+- 全域計數：total / passed / dropped 封包與 bytes
+- 協定分類：tcp / udp / icmp / other
+- Drop 原因：blocklist / malformed（未來加 rate-limit / synflood）
+- Per-source-IP LRU hash：pkts / bytes / dropped / last proto / blocked flag
+- Top-N src IP 排序在 userspace 獨立 goroutine 做，**不阻塞 fast tick 寫檔**
+- rx 從 XDP map 聚合，tx 從 `/sys/class/net/<iface>/statistics/` 讀（XDP 只 hook ingress）
+- 人類可讀 snapshot 寫到 `/var/run/waf-go/stats.txt`，`watch -n 1 cat` 即時監控
+
+**Event ringbuf layout 已定義**，payload 產出留給 M4+（異常封包樣本 → core）
+
+## 專案結構
+
+```
+waf-go/
+├── cmd/edge/main.go              # agent 入口與子系統編排
+├── bpf/
+│   ├── xdp_filter.c              # XDP 程式
+│   └── headers.h                 # 自定義 packet header
+├── internal/
+│   ├── config/                   # YAML 載入
+│   ├── loader/                   # cilium/ebpf attach + map handles
+│   │   ├── loader.go             # 跨平台 API
+│   │   ├── loader_linux.go       # 真實 XDP attach
+│   │   ├── loader_stub.go        # non-linux dev stub
+│   │   └── bpf/xdp_filter.o      # go:embed 目標 (make bpf 產出)
+│   ├── maps/                     # eBPF map 的 Go wrapper
+│   │   └── blocklist.go          # LPM trie Add/Delete/Len
+│   └── stats/                    # 統計 reader + 檔案輸出
+├── deploy/
+│   └── edge.example.yaml         # 範例 config
+├── scripts/
+│   ├── bootstrap.sh              # 一鍵安裝依賴 + build + install
+│   └── build-bpf.sh              # clang 編譯 eBPF
+├── Makefile
+└── readme.md
 ```
 
 ## 技術選型
 
 | 層 | 選擇 | 理由 |
 |---|---|---|
-| Data plane | XDP + eBPF (C) | 在 NIC driver 層處理，比 netfilter/nftables 更前面，可達線速 |
-| eBPF loader | [cilium/ebpf](https://github.com/cilium/ebpf) | 純 Go、無 libbpf CGO 依賴、map 操作成熟 |
-| 訊息匯流排 | [NATS](https://nats.io) + JetStream + KV | Pub/sub 原生、KV Watch 直接解黑名單同步、斷線自動補送 |
-| 序列化 | Protobuf | 10 萬 RPS 下 JSON 的 CPU 開銷過高 |
-| 本地快取 | BoltDB | 單檔、零依賴，重啟時先載入黑名單避免空窗 |
-| 指標 | Prometheus client_golang | 業界標準，與 Grafana 對接簡單 |
-| 設定 | YAML (viper) + 環境變數覆寫 | 容器部署友善 |
+| Data plane | XDP + eBPF (C) | 在 NIC driver 層處理，比 netfilter/nftables 更前面 |
+| eBPF loader | [cilium/ebpf](https://github.com/cilium/ebpf) | 純 Go、無 libbpf CGO、map 操作成熟 |
+| Packet headers | 自帶結構 | 避開 BTF / `vmlinux.h`，支援沒開 `CONFIG_DEBUG_INFO_BTF` 的 kernel |
+| 設定 | YAML (`gopkg.in/yaml.v3`) | 夠用、無 viper 的 magic |
+| 統計輸出 | 純文字檔 + `watch` | 不引入 Prometheus 直到真的需要 |
 
-不使用 fasthttp/net/http — 本 agent 不處理 L7 HTTP，只做 L3/L4。若之後要做 L7 WAF，另開子模組整合 Coraza。
-
-## 功能範圍（edge MVP）
-
-**包含**
-- XDP ingress 過濾（IPv4 優先，IPv6 第二階段）
-- CIDR 黑名單（LPM_TRIE），從 NATS KV 即時同步
-- Per-src-IP PPS / bps 計數
-- 超閾值自動本地封鎖（TTL，短期懲罰）
-- 異常事件取樣上報（packet header + 少量 payload）
-- 統計聚合後週期上報（1s）
-- Prometheus metrics endpoint
-- Graceful reload（SIGHUP 重載設定，不中斷封包處理）
-
-**不包含（留給後續）**
-- Stateful conntrack（複雜度高，MVP 先做 stateless）
-- NAT
-- L7 規則
-- TLS 指紋 / JA3
-- ML 異常偵測（core 端職責）
-
-## NATS Subject 與訊息流
-
-Edge 端只碰這些 subject：
-
-| Subject | 方向 | 傳輸 | 用途 |
-|---|---|---|---|
-| `stats.<region>.<node_id>` | edge → core | Core NATS | 聚合後統計，丟失可接受 |
-| `events.anomaly.<severity>` | edge → core | JetStream | 異常事件，需持久化 |
-| `events.sample.<node_id>` | edge → core | JetStream | 封包樣本，低頻觸發 |
-| `heartbeat.<node_id>` | edge → core | Core NATS | 週期心跳 |
-| `blocklist` (KV bucket) | core → edge | JetStream KV | Watch 模式即時收變更與初始快照 |
-| `control.<node_id>` | core → edge | Core NATS | 下指令（reload、flush、debug） |
-
-黑名單同步完全透過 NATS KV Watch 實作，不自己寫版本協商 — KV 內建版本號、history、斷線重連自動補。
-
-## 專案結構（計畫）
-
-```
-waf-go/
-├── cmd/
-│   └── edge/              # edge agent 進入點
-│       └── main.go
-├── bpf/
-│   ├── xdp_filter.c       # eBPF data plane 原始碼
-│   ├── xdp_filter.h       # map 定義、共用結構
-│   └── headers/           # vmlinux.h 等
-├── internal/
-│   ├── loader/            # eBPF 程式載入、attach、map 句柄
-│   ├── maps/              # LPM_TRIE / per-CPU map 的 Go wrapper
-│   ├── collector/         # ringbuf reader、事件 decode
-│   ├── aggregator/        # 本地統計聚合
-│   ├── blocklist/         # NATS KV watcher → map writer
-│   ├── publisher/         # stats / events 上報（批次 + 背壓）
-│   ├── cache/             # BoltDB 本地快照（開機回放）
-│   ├── config/            # YAML + env 載入
-│   └── metrics/           # Prometheus 指標
-├── pkg/
-│   └── proto/             # Protobuf 定義（與 core 共用）
-├── deploy/
-│   └── systemd/
-├── scripts/
-│   ├── build-bpf.sh       # clang 編譯 eBPF
-│   └── gen-proto.sh
-├── Makefile
-├── go.mod
-└── readme.md
-```
+未來會加的：`nats.go`（M4）、protobuf（M4，跨 edge/core 協議）。刻意不加的：viper、BoltDB、Prometheus — 都是現在沒需求的抽象。
 
 ## 建置需求
 
+- Linux kernel 5.15+（XDP + ringbuf）
+- clang 14+ / llvm
 - Go 1.22+
-- clang 14+ / llvm（編譯 eBPF）
-- Linux kernel 5.15+（XDP + BTF + ringbuf）
-- `libbpf` headers（產 vmlinux.h）
-- `root` 或 `CAP_BPF` + `CAP_NET_ADMIN` 執行權限
+- `libbpf-dev`（提供 `bpf/bpf_helpers.h`）
+- 執行時：root 或 `CAP_BPF + CAP_NET_ADMIN + CAP_PERFMON`
 
-## 實作里程碑
+**BTF 不必要** — data plane 程式不使用 CO-RE。
 
-1. **M1 — Skeleton & eBPF loader**
-   入口 + 設定 + 載入一個最小 XDP 程式（pass all），確認 attach/detach 正常。
+## 快速開始
 
-2. **M2 — Blocklist map & 靜態黑名單**
-   LPM_TRIE map + 從設定檔載入 CIDR 清單 + drop 測試。驗證過濾正確性與效能基準。
+在 Linux 目標機器上：
 
-3. **M3 — 統計與 ringbuf**
-   Per-CPU counter map + ringbuf 事件上報 + Go 端聚合 + Prometheus 輸出。
+```bash
+git clone <repo> waf-go && cd waf-go
+bash scripts/bootstrap.sh          # 裝依賴、build、install binary、寫預設 config
+sudo nano /etc/waf-go/edge.yaml    # 填 iface / static_blocklist
+sudo /usr/local/bin/waf-edge -config /etc/waf-go/edge.yaml
+```
 
-4. **M4 — NATS 整合**
-   連線、重連、stats publish（Core NATS）、events publish（JetStream）。
+另一個 terminal 監控統計：
+```bash
+watch -n 1 cat /var/run/waf-go/stats.txt
+```
 
-5. **M5 — 黑名單 KV 同步**
-   JetStream KV watcher → LPM_TRIE 寫入 + BoltDB 本地快照 + 開機回放。
+**bootstrap.sh 旗標**
+- `--no-install`：跳過 apt（依賴已裝好）
+- `--iface <name>`：指定網卡（預設抓 default route）
+- `--run`：build 完直接啟動
 
-6. **M6 — Rate limit & 自動封鎖**
-   超閾值時 edge 本地寫入短期 TTL 封鎖（不等 core），同時上報 core 決策是否永久化。
+## 設定
 
-7. **M7 — 運維補強**
-   Graceful reload、control subject 處理、壓測與 pprof 剖析、部署腳本。
+[deploy/edge.example.yaml](deploy/edge.example.yaml)
 
-## 效能目標（驗收標準）
+```yaml
+node_id: edge-01           # 預設用 hostname
+region: default
+iface: eth0                # 必填
+stats_path: /var/run/waf-go/stats.txt
 
-| 指標 | 目標 |
-|---|---|
-| 封包過濾吞吐 | 單機 10 Gbps / 10 Mpps（64B 封包） |
-| 黑名單生效延遲 | core publish → edge drop < 1s |
-| 黑名單容量 | 100 萬條 CIDR |
-| 統計上報延遲 | 本地聚合 1s + NATS 傳輸 < 100ms |
-| Agent CPU（idle） | 單核 < 5% |
-| Agent 記憶體 | < 200 MB |
+static_blocklist:          # IPv4 only；裸 IP 視為 /32
+  - 192.0.2.0/24
+  - 198.51.100.7
+```
+
+## 統計輸出範例
+
+```
+waf-go edge stats            updated: 2026-04-13T05:21:10+08:00
+node=exptech  iface=eth0  uptime=54s
+
+traffic (rx via XDP)
+  pps total       :           41.99
+  pps passed      :           40.99
+  pps dropped     :            1.00
+  rx total        :     315.51 Kbps
+  rx dropped      :     783.80 bps
+
+traffic (tx via kernel, not filtered by XDP)
+  tx              :      26.59 Kbps
+  tx pps          :           31.99
+
+protocols (since start)
+  tcp             :  pkts=2,455          bytes=    2.08 MiB
+  udp             :  pkts=97             bytes=   21.89 KiB
+  icmp            :  pkts=27             bytes=    2.58 KiB
+  other l4        :  pkts=3              bytes=     180 B
+
+drops by reason (since start)
+  blocklist       :              27
+  malformed       :               0
+
+top 10 source IPs (scan: 42 entries, 2ms, at 120ms ago)
+  #    SRC_IP           PKTS         BYTES        DROPPED    PROTO  STATUS
+  1    1.2.3.4          12,543       10.21 MiB    0          tcp    pass
+  2    192.0.2.7        27           1.82 KiB     27         icmp   BLOCK
+```
+
+## 開發工作流
+
+eBPF 只能在 Linux 跑。推薦流程：
+
+- **macOS**：寫 Go code、跑 `go build`、`go vet` — `loader_stub.go` 讓 non-linux 可編譯，attach 呼叫會明確回錯
+- **Linux 測試機**：執行 `bash scripts/bootstrap.sh`，驗證 XDP 真實行為
+- 想在本機跑 Linux 測試：用 [Lima](https://lima-vm.io) 或 [OrbStack](https://orbstack.dev)，比 Docker Desktop 的 LinuxKit 更貼近真實 kernel
+
+eBPF `.o` 用 `go:embed` 打包進 binary，部署時單一檔案。
+
+## NATS 整合（規劃，M4+）
+
+Edge 上線後會與 core 透過以下 subject 溝通：
+
+| Subject | 方向 | 傳輸 | 用途 |
+|---|---|---|---|
+| `stats.<region>.<node_id>` | edge → core | Core NATS | 聚合後統計 |
+| `events.anomaly.<severity>` | edge → core | JetStream | 異常事件（持久化） |
+| `heartbeat.<node_id>` | edge → core | Core NATS | 心跳 |
+| `blocklist` (KV bucket) | core → edge | JetStream KV | Watch 收變更與初始快照 |
+| `control.<node_id>` | core → edge | Core NATS | 指令（reload、flush、bypass） |
+
+黑名單同步用 NATS JetStream KV Watch — 內建版本號、history、斷線重連補送，不自己寫同步邏輯。
 
 ## 部署
 
-**裸機 + systemd**（唯一支援方式）
+裸機 + systemd 是唯一支援方式。XDP 在容器裡會被 netns / veth / 權限 / driver 纏住，不值得。
 
-理由：XDP 在容器內會被 netns / veth / 權限 / driver 支援等多重限制纏住，即便 `--privileged --network host` 跑起來，也多一層排查負擔。edge agent 定位就是 host 層基礎設施，直接用 systemd 管理最乾淨。
+- Binary: `/usr/local/bin/waf-edge`（由 bootstrap.sh 安裝）
+- Config: `/etc/waf-go/edge.yaml`
+- Stats: `/var/run/waf-go/stats.txt`
+- Map pin: `/sys/fs/bpf/waf-go/`（預留 agent 重啟不中斷過濾；systemd unit 尚未寫）
 
-- Binary 安裝到 `/usr/local/bin/waf-edge`
-- eBPF `.o` 放 `/usr/local/lib/waf-go/`
-- 設定檔 `/etc/waf-go/edge.yaml`
-- Map pin 到 `/sys/fs/bpf/waf-go/`（agent 重啟不中斷過濾）
-- systemd unit 設 `CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON`，不用 root
+## 效能目標（M7 驗收標準，尚未壓測）
 
-## 開發環境
+| 指標 | 目標 |
+|---|---|
+| 過濾吞吐 | 單機 10 Gbps / 10 Mpps（64B 封包，native XDP） |
+| 黑名單生效延遲 | core publish → edge drop < 1s |
+| 黑名單容量 | 100 萬條 CIDR |
+| Agent CPU (idle) | 單核 < 5% |
+| Agent 記憶體 | < 200 MB |
 
-本 repo 在 macOS 上開發，但 XDP 只能在 Linux 跑。工作流：
+**Raspberry Pi 實測注意**：RPi 4/5 的內建網卡 driver（`macb`、`bcmgenet`）沒有 native XDP 支援，只能 generic/SKB 模式，效能是 native 的 1/5–1/10。功能驗證沒問題，但線速目標要靠支援 native XDP 的硬體（`ixgbe`、`i40e`、`mlx5`、`ena`、`bnxt_en` 等）。
 
-- **Mac**：寫 Go code、跑 `go build`、`go vet`、單元測試（non-eBPF 部分）
-- **Linux 測試機**（VM / 遠端）：跑 `make bpf` 編譯 eBPF、`make run` 實際 attach
-- **CI**：GitHub Actions `ubuntu-latest` 跑 eBPF 編譯與 loader smoke test
-- 建議本機裝 [Lima](https://lima-vm.io) 或 [OrbStack](https://orbstack.dev) 開 Linux VM，比 Docker Desktop 更貼近真實 kernel
+## 不做的事
 
-eBPF 原始碼用 clang 編成 `.o`，Go 端用 `go:embed` 打包進 binary，部署時單一檔案即可。
-
-## 安全與運維注意
-
-- eBPF 程式改動需過 verifier，CI 要跑 `bpftool prog load` 驗證
-- NATS 連線強制 TLS + nkey/JWT 認證，edge 權限限定自己的 subject
-- 黑名單有 TTL，避免永久誤封
-- 保留 `control.<node_id>` 的緊急 bypass 指令，支援快速全放行
-- 部署時 pin eBPF map 到 bpffs，支援 agent 重啟不中斷過濾
+- Stateful conntrack（複雜度高，先做 stateless L3/L4）
+- NAT
+- L7 規則 / HTTP WAF（之後另外包 Coraza，不在本 repo）
+- TLS 指紋 / JA3
+- ML 異常偵測（core 端職責）
 
 ## 授權
 

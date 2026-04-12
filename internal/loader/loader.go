@@ -17,8 +17,6 @@ func New(iface string) *Loader {
 	return &Loader{iface: iface, impl: newImpl()}
 }
 
-func (l *Loader) Iface() string { return l.iface }
-
 func (l *Loader) Attach(ifaceIndex int) error {
 	return l.impl.attach(ifaceIndex)
 }

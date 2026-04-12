@@ -38,30 +38,6 @@ func (b *Blocklist) Add(prefix netip.Prefix) error {
 	return nil
 }
 
-func (b *Blocklist) Delete(prefix netip.Prefix) error {
-	key, err := keyFromPrefix(prefix)
-	if err != nil {
-		return err
-	}
-	if err := b.m.Delete(key); err != nil {
-		return fmt.Errorf("map delete %s: %w", prefix, err)
-	}
-	return nil
-}
-
-// Len returns an approximate count by iterating the trie.
-// LPM tries in the kernel don't expose a counter, so this walks entries.
-func (b *Blocklist) Len() (int, error) {
-	var key lpmV4Key
-	var val uint8
-	n := 0
-	iter := b.m.Iterate()
-	for iter.Next(&key, &val) {
-		n++
-	}
-	return n, iter.Err()
-}
-
 func keyFromPrefix(p netip.Prefix) (lpmV4Key, error) {
 	if !p.IsValid() {
 		return lpmV4Key{}, fmt.Errorf("invalid prefix")

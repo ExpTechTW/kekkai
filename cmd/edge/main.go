@@ -1,17 +1,22 @@
+// Command waf-edge is the edge agent binary. It loads the XDP data plane
+// program, wires the blocklist and stats subsystems, and blocks on SIGINT /
+// SIGTERM. All cross-cutting orchestration lives in run(); main() only parses
+// flags.
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/netip"
-	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/YuYu1015/waf-go/internal/config"
 	"github.com/YuYu1015/waf-go/internal/loader"
-	wafmaps "github.com/YuYu1015/waf-go/internal/maps"
+	"github.com/YuYu1015/waf-go/internal/maps"
 	"github.com/YuYu1015/waf-go/internal/stats"
 )
 
@@ -19,58 +24,66 @@ func main() {
 	cfgPath := flag.String("config", "/etc/waf-go/edge.yaml", "path to edge config")
 	flag.Parse()
 
-	cfg, err := config.Load(*cfgPath)
+	if err := run(*cfgPath); err != nil {
+		log.Fatalf("waf-edge: %v", err)
+	}
+}
+
+func run(cfgPath string) error {
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		return fmt.Errorf("config: %w", err)
 	}
 	log.Printf("waf-edge starting node=%s region=%s iface=%s", cfg.NodeID, cfg.Region, cfg.Iface)
 
 	iface, err := net.InterfaceByName(cfg.Iface)
 	if err != nil {
-		log.Fatalf("lookup iface %s: %v", cfg.Iface, err)
+		return fmt.Errorf("lookup iface %s: %w", cfg.Iface, err)
 	}
 
 	ld := loader.New(cfg.Iface)
 	if err := ld.Attach(iface.Index); err != nil {
-		log.Fatalf("attach xdp: %v", err)
+		return fmt.Errorf("attach xdp: %w", err)
 	}
 	defer ld.Close()
 	log.Printf("xdp attached to %s (ifindex=%d)", cfg.Iface, iface.Index)
 
-	blMap, err := ld.BlocklistMap()
-	if err != nil {
-		log.Fatalf("blocklist map: %v", err)
-	}
-	bl := wafmaps.NewBlocklist(blMap)
-	if err := loadStaticBlocklist(bl, cfg.StaticBlocklist); err != nil {
-		log.Fatalf("static blocklist: %v", err)
+	if _, err := openBlocklist(ld, cfg.StaticBlocklist); err != nil {
+		return err
 	}
 
-	statsMap, err := ld.StatsMap()
+	reader, err := openStats(ld, cfg)
 	if err != nil {
-		log.Fatalf("stats map: %v", err)
+		return err
 	}
-	peripMap, err := ld.PerIPMap()
-	if err != nil {
-		log.Fatalf("perip map: %v", err)
-	}
-	reader := stats.NewReader(statsMap, peripMap, cfg.NodeID, cfg.Iface, cfg.StatsPath)
-	stop := make(chan struct{})
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	done := make(chan struct{})
 	go func() {
-		if err := reader.Run(stop); err != nil {
+		defer close(done)
+		if err := reader.Run(ctx.Done()); err != nil {
 			log.Printf("stats reader: %v", err)
 		}
 	}()
 	log.Printf("stats writing to %s (watch -n 1 cat %s)", cfg.StatsPath, cfg.StatsPath)
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	close(stop)
+	<-ctx.Done()
 	log.Printf("shutting down")
+	<-done
+	return nil
 }
 
-func loadStaticBlocklist(bl *wafmaps.Blocklist, entries []string) error {
+// openBlocklist wraps the eBPF LPM trie map and seeds it with the static
+// CIDRs from config. Each entry may be a bare address (→ /32) or a CIDR.
+func openBlocklist(ld *loader.Loader, entries []string) (*maps.Blocklist, error) {
+	m, err := ld.BlocklistMap()
+	if err != nil {
+		return nil, fmt.Errorf("blocklist map: %w", err)
+	}
+	bl := maps.NewBlocklist(m)
+
 	added := 0
 	for _, s := range entries {
 		p, err := parsePrefix(s)
@@ -79,12 +92,26 @@ func loadStaticBlocklist(bl *wafmaps.Blocklist, entries []string) error {
 			continue
 		}
 		if err := bl.Add(p); err != nil {
-			return err
+			return nil, fmt.Errorf("static blocklist add %s: %w", p, err)
 		}
 		added++
 	}
 	log.Printf("static blocklist loaded: %d entries", added)
-	return nil
+	return bl, nil
+}
+
+// openStats wires the two eBPF stat maps into a decoupled reader that writes
+// /var/run/waf-go/stats.txt on a fixed cadence.
+func openStats(ld *loader.Loader, cfg *config.Config) (*stats.Reader, error) {
+	globalMap, err := ld.StatsMap()
+	if err != nil {
+		return nil, fmt.Errorf("stats map: %w", err)
+	}
+	peripMap, err := ld.PerIPMap()
+	if err != nil {
+		return nil, fmt.Errorf("perip map: %w", err)
+	}
+	return stats.NewReader(globalMap, peripMap, cfg.NodeID, cfg.Iface, cfg.StatsPath), nil
 }
 
 // parsePrefix accepts either "1.2.3.4" (→ /32) or "1.2.3.0/24".

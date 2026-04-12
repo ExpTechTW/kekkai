@@ -21,7 +21,6 @@ const (
 	blocklistMapName = "blocklist_v4"
 	statsMapName     = "stats"
 	peripMapName     = "perip_v4"
-	eventsMapName    = "events"
 )
 
 type linuxImpl struct {
@@ -96,11 +95,6 @@ func (l *Loader) StatsMap() (*ebpf.Map, error) {
 // PerIPMap returns the raw ebpf.Map handle for the per-src-IPv4 LRU hash.
 func (l *Loader) PerIPMap() (*ebpf.Map, error) {
 	return l.mapByName(peripMapName)
-}
-
-// EventsMap returns the raw ebpf.Map handle for the anomaly ringbuf (reserved).
-func (l *Loader) EventsMap() (*ebpf.Map, error) {
-	return l.mapByName(eventsMapName)
 }
 
 func (l *Loader) mapByName(name string) (*ebpf.Map, error) {

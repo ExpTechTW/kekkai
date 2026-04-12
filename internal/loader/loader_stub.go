@@ -33,7 +33,3 @@ func (l *Loader) StatsMap() (*ebpf.Map, error) {
 func (l *Loader) PerIPMap() (*ebpf.Map, error) {
 	return nil, fmt.Errorf("perip map not available on non-linux builds")
 }
-
-func (l *Loader) EventsMap() (*ebpf.Map, error) {
-	return nil, fmt.Errorf("events map not available on non-linux builds")
-}
