@@ -12,6 +12,7 @@ import (
 	"github.com/YuYu1015/waf-go/internal/config"
 	"github.com/YuYu1015/waf-go/internal/loader"
 	wafmaps "github.com/YuYu1015/waf-go/internal/maps"
+	"github.com/YuYu1015/waf-go/internal/stats"
 )
 
 func main() {
@@ -36,19 +37,36 @@ func main() {
 	defer ld.Close()
 	log.Printf("xdp attached to %s (ifindex=%d)", cfg.Iface, iface.Index)
 
-	rawMap, err := ld.BlocklistMap()
+	blMap, err := ld.BlocklistMap()
 	if err != nil {
 		log.Fatalf("blocklist map: %v", err)
 	}
-	bl := wafmaps.NewBlocklist(rawMap)
-
+	bl := wafmaps.NewBlocklist(blMap)
 	if err := loadStaticBlocklist(bl, cfg.StaticBlocklist); err != nil {
 		log.Fatalf("static blocklist: %v", err)
 	}
 
+	statsMap, err := ld.StatsMap()
+	if err != nil {
+		log.Fatalf("stats map: %v", err)
+	}
+	peripMap, err := ld.PerIPMap()
+	if err != nil {
+		log.Fatalf("perip map: %v", err)
+	}
+	reader := stats.NewReader(statsMap, peripMap, cfg.NodeID, cfg.Iface, cfg.StatsPath)
+	stop := make(chan struct{})
+	go func() {
+		if err := reader.Run(stop); err != nil {
+			log.Printf("stats reader: %v", err)
+		}
+	}()
+	log.Printf("stats writing to %s (watch -n 1 cat %s)", cfg.StatsPath, cfg.StatsPath)
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+	close(stop)
 	log.Printf("shutting down")
 }
 

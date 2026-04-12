@@ -19,6 +19,9 @@ var programBytes []byte
 const (
 	bpffsRoot        = "/sys/fs/bpf/waf-go"
 	blocklistMapName = "blocklist_v4"
+	statsMapName     = "stats"
+	peripMapName     = "perip_v4"
+	eventsMapName    = "events"
 )
 
 type linuxImpl struct {
@@ -82,13 +85,32 @@ func (l *linuxImpl) close() error {
 // BlocklistMap returns the raw ebpf.Map handle for the IPv4 blocklist trie.
 // Callers should wrap it with internal/maps.NewBlocklist.
 func (l *Loader) BlocklistMap() (*ebpf.Map, error) {
+	return l.mapByName(blocklistMapName)
+}
+
+// StatsMap returns the raw ebpf.Map handle for the per-CPU stats array.
+func (l *Loader) StatsMap() (*ebpf.Map, error) {
+	return l.mapByName(statsMapName)
+}
+
+// PerIPMap returns the raw ebpf.Map handle for the per-src-IPv4 LRU hash.
+func (l *Loader) PerIPMap() (*ebpf.Map, error) {
+	return l.mapByName(peripMapName)
+}
+
+// EventsMap returns the raw ebpf.Map handle for the anomaly ringbuf (reserved).
+func (l *Loader) EventsMap() (*ebpf.Map, error) {
+	return l.mapByName(eventsMapName)
+}
+
+func (l *Loader) mapByName(name string) (*ebpf.Map, error) {
 	li, ok := l.impl.(*linuxImpl)
 	if !ok || li.coll == nil {
 		return nil, fmt.Errorf("loader not attached")
 	}
-	m := li.coll.Maps[blocklistMapName]
+	m := li.coll.Maps[name]
 	if m == nil {
-		return nil, fmt.Errorf("map %s not found", blocklistMapName)
+		return nil, fmt.Errorf("map %s not found", name)
 	}
 	return m, nil
 }

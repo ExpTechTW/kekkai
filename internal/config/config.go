@@ -12,6 +12,7 @@ type Config struct {
 	Region          string   `yaml:"region"`
 	Iface           string   `yaml:"iface"`
 	StaticBlocklist []string `yaml:"static_blocklist"`
+	StatsPath       string   `yaml:"stats_path"`
 }
 
 func Load(path string) (*Config, error) {
@@ -29,6 +30,9 @@ func Load(path string) (*Config, error) {
 	if c.NodeID == "" {
 		h, _ := os.Hostname()
 		c.NodeID = h
+	}
+	if c.StatsPath == "" {
+		c.StatsPath = "/var/run/waf-go/stats.txt"
 	}
 	return &c, nil
 }

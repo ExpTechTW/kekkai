@@ -24,3 +24,16 @@ func (stubImpl) close() error { return nil }
 func (l *Loader) BlocklistMap() (*ebpf.Map, error) {
 	return nil, fmt.Errorf("blocklist map not available on non-linux builds")
 }
+
+// StatsMap is a no-op on non-Linux builds.
+func (l *Loader) StatsMap() (*ebpf.Map, error) {
+	return nil, fmt.Errorf("stats map not available on non-linux builds")
+}
+
+func (l *Loader) PerIPMap() (*ebpf.Map, error) {
+	return nil, fmt.Errorf("perip map not available on non-linux builds")
+}
+
+func (l *Loader) EventsMap() (*ebpf.Map, error) {
+	return nil, fmt.Errorf("events map not available on non-linux builds")
+}
