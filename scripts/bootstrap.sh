@@ -76,6 +76,12 @@ install_go() {
   fi
 }
 
+# Make a pre-existing /usr/local/go install visible to this shell even when
+# --no-install skipped the toolchain step.
+if [[ -x /usr/local/go/bin/go ]]; then
+  export PATH="/usr/local/go/bin:$PATH"
+fi
+
 if command -v go >/dev/null 2>&1; then
   GO_VER="$(go env GOVERSION 2>/dev/null | sed 's/go//')"
   GO_MAJOR="${GO_VER%%.*}"
