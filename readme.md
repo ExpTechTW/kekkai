@@ -17,7 +17,7 @@
 | **M3** stats | ✅ | 全域 + 協定 + drop/pass reason 計數、per-IP LRU top-N、tx 讀 sysfs |
 | **strict policy** | ✅ | public/private port、ingress allowlist、回程放行、IP fragment、TCP ACK / UDP ephemeral、dynamic blocklist map、hot reload、emergency bypass |
 | **schema + lifecycle** | ✅ | `version: 1` + 預留 migration 機制、三種備份 + GC、`security.*` SSH 防護、可註解保留的 template render |
-| **CLI + TUI** | ✅ | `kekkai status` 互動式 TUI（結界主題配色 + threat meter）、`check`/`show`/`backup`/`reset` 子命令 |
+| **CLI + TUI** | ✅ | `kekkai status` 互動式 TUI（結界主題配色 + threat meter）、`check`/`ports`/`show`/`backup`/`reset` 子命令 |
 | **doctor + installer** | ✅ | 單腳本 `kekkai.sh`（auto install/update/repair/uninstall/doctor）、`kekkai doctor` 彩色健康檢查報告 |
 | **M4** NATS 整合 | ⏳ | stats/events publish、心跳 |
 | **M5** 黑名單 KV 同步 | ⏳ | JetStream KV watcher、本地 snapshot、開機回放 |
@@ -191,8 +191,7 @@ sudo kekkai status                     # 彩色 TUI，1/2/3 切頁，q 退出
 重載規則（不中斷過濾）：
 ```bash
 sudo nano /etc/kekkai/kekkai.yaml
-kekkai check                           # 建議先驗證
-sudo systemctl reload kekkai-agent     # SIGHUP，hot reload
+sudo kekkai reload                     # 先 check 再 systemctl reload
 ```
 
 ## 指令列
@@ -204,8 +203,10 @@ Kekkai 分成兩個 binary：`kekkai-agent` 是 daemon（systemd 管），`kekka
 | `kekkai status`   | 啟動互動式 TUI（3 頁：Overview / Detail / Top-N） |
 | `kekkai doctor`   | 跑全套健康檢查並印彩色報告（read-only） |
 | `kekkai check`    | 驗證 config，**read-only** 非 root 也能跑 |
+| `kekkai ports`    | 彩色列出 public/private port 與 SSH 暴露狀態 |
 | `kekkai show`     | 印出完整正規化後的 config |
 | `kekkai backup`   | 寫一份時戳 manual backup |
+| `kekkai reload`   | 先做 config check，通過才送出 systemd reload |
 | `kekkai reset`    | 用預設 template 覆蓋 config（原檔自動備份，iface 自動偵測） |
 | `kekkai version`  | 版本資訊 |
 | `kekkai help`     | 指令總表 |
@@ -300,8 +301,10 @@ Config 頂層 `version: 1`。目前是初始發佈版本，schema 還沒有 brea
 | CLI | 原始 flag | 行為 |
 |---|---|---|
 | `kekkai check [path]`  | `kekkai-agent -check`  | **read-only** 驗證，非 root 可跑，遇 v1 印「would migrate」不寫回 |
+| `kekkai ports [path]`  | 直接讀 config + 本地渲染 | 彩色檢視 public/private port 與 SSH 暴露狀態 |
 | `kekkai show [path]`   | `kekkai-agent -show`   | read-only 印出完整正規化 config |
 | `kekkai backup [path]` | `kekkai-agent -backup` | 寫 `backup.<ts>`，需要 `sudo` 才能寫 `/etc/kekkai` |
+| `kekkai reload [path]` | `kekkai-agent -check` + `systemctl reload` | 先驗證指定 config，再送 SIGHUP 到 daemon |
 | `kekkai reset [path]`  | `kekkai-agent -reset`  | 寫預設 template，原檔自動備份；`--iface` 覆蓋自動偵測 |
 
 Makefile alias：`make config-check` / `make config-show` / `make config-backup`

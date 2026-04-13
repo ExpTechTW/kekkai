@@ -57,7 +57,7 @@ func DefaultValues() Values {
 		AllowSSHPublic:    false,
 		AllowICMP:         true,
 		AllowARP:          true,
-		UDPEphemeralMin:   EPHEMERALPortMin,
+		UDPEphemeralMin:   DefaultUDPEphemeralMin,
 		PublicTCP:         []uint16{80, 443},
 	}
 }
@@ -79,7 +79,7 @@ func Render(v Values) string {
 		v.StatsFile = DefaultStatsFile
 	}
 	if v.UDPEphemeralMin == 0 {
-		v.UDPEphemeralMin = EPHEMERALPortMin
+		v.UDPEphemeralMin = DefaultUDPEphemeralMin
 	}
 
 	out := defaultTemplate

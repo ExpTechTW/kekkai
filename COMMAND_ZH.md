@@ -69,7 +69,21 @@ kekkai check /tmp/new-kekkai.yaml          # 指定檔案
 
 Exit code：`0` 通過、`1` 驗證失敗（錯誤訊息到 stderr）。推薦每次 reload 前先跑。
 
-### 2.3 kekkai show
+### 2.3 kekkai ports
+
+快速列出 `public/private` port，含顏色與 SSH 暴露提示，方便在 reload 前做肉眼檢查。
+
+```bash
+kekkai ports                               # 讀 /etc/kekkai/kekkai.yaml
+kekkai ports /tmp/new-kekkai.yaml          # 指定檔案
+```
+
+輸出重點：
+- `PUBLIC`（綠色）與 `PRIVATE`（黃色）分開顯示 TCP/UDP
+- `SSH exposure` 會標示 22 在 public/private/未配置
+- 顯示 `ingress_allowlist` 條目數，快速判斷 private gate 是否有設
+
+### 2.4 kekkai show
 
 印出正規化後的 config（post-migrate, post-defaults, post-normalize），**read-only**。輸入是舊版 v1 時顯示遷移後的 v2，但不會寫回磁碟。
 
@@ -83,7 +97,7 @@ kekkai show /tmp/test.yaml                 # 指定檔案
 - v1 遷移時預覽新版長怎樣（但要 daemon 正式啟動才會真的寫回）
 - Diff 兩個 config 找差異
 
-### 2.4 kekkai backup
+### 2.5 kekkai backup
 
 手動寫一份備份。檔名 `kekkai.yaml.backup.<時戳>`。
 
@@ -94,7 +108,7 @@ sudo kekkai backup /etc/kekkai/kekkai.yaml   # 指定路徑
 
 需要 `sudo` 因為備份寫到 `/etc/kekkai/`。每個 kind (update/auto/backup) 各保留最新 10 份，舊的自動刪。
 
-### 2.5 kekkai reset
+### 2.6 kekkai reset
 
 用**預設 template** 覆蓋 config。原檔會先被複製成 `kekkai.yaml.backup.<時戳>` (manual backup kind) 所以永遠可以 rollback。
 
@@ -128,7 +142,7 @@ sudo systemctl restart kekkai-agent
 - 升級 schema 後發現遷移結果不理想，想用全新 template 重來
 - 第一次安裝不想抄 internal/config/default.yaml
 
-### 2.6 kekkai doctor
+### 2.7 kekkai doctor
 
 **完全 read-only 健康檢查**，不寫檔、不啟停 service、不 attach/detach XDP。印出彩色報告，分七大區塊，每項標 ✓ / ⚠ / ✗：
 
@@ -188,7 +202,7 @@ Exit code：`0` 為 healthy 或只有 warning、`1` 為任何 error。設計上 
 - `kekkai check` 只驗 config 語法
 - `kekkai doctor` 驗**整個系統**：binary 在不在、systemd 啟沒啟、pinned map 存不存在、網卡 driver 支不支援、stats 檔有沒有在更新
 
-### 2.7 kekkai version / kekkai help
+### 2.8 kekkai version / kekkai help
 
 ```bash
 kekkai version        # 印 kekkai 版本 + 偵測 kekkai-agent 是否存在
@@ -614,7 +628,7 @@ journalctl -u kekkai-agent -n 30 --no-pager
 kekkai show | grep -A20 filter
 
 # 備份 + 編輯 + 驗證 + reload 的標準流程
-sudo kekkai backup && sudo nano /etc/kekkai/kekkai.yaml && kekkai check && sudo systemctl reload kekkai-agent
+sudo kekkai backup && sudo nano /etc/kekkai/kekkai.yaml && sudo kekkai reload
 
 # 看被擋最多的 src IP
 sudo kekkai status      # 切到 Top-N 頁，排序已經是 by pkts
@@ -651,8 +665,10 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 | `kekkai status [path]`          | ✅ | 互動式 TUI |
 | `kekkai doctor`                 | ✅ | 全系統健康檢查（read-only） |
 | `kekkai check [path]`           | ✅ | 驗證 config (read-only) |
+| `kekkai ports [path]`           | ✅ | 彩色列出 public/private port 與 SSH 暴露狀態 |
 | `kekkai show [path]`            | ✅ | 印出正規化 config (read-only) |
 | `kekkai backup [path]`          | ✅ | 手動時戳備份 |
+| `kekkai reload [path]`          | ✅ | 先做 config check，再送出 systemd reload |
 | `kekkai reset [path] [--iface]` | ✅ | 覆蓋成預設 template，原檔自動備份 |
 | `kekkai version`                | ✅ | 版本資訊 |
 | `kekkai help`                   | ✅ | 指令總表 |
@@ -678,7 +694,7 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 | `kekkai unblock <ip>`         | M6 | 從動態黑名單移除 |
 | `kekkai bypass on\|off`       | M7 | 切 `runtime.emergency_bypass` + reload |
 | `kekkai logs [-f] [-n N]`     | M7 | `journalctl -u kekkai-agent` 包裝 |
-| `kekkai start/stop/restart/reload/enable/disable` | M7 | systemctl 包裝 |
+| `kekkai start/stop/restart/enable/disable` | M7 | systemctl 包裝 |
 | `kekkai stats`                | M7 | 印 `stats.txt` 一次（script 友善） |
 
 `kekkai update` 目前由 `./kekkai.sh update`（或 `make update`）提供，未來 M7 會把它整進 `kekkai` CLI。M4 / M5 / M6 / M7 會陸續補齊上表。

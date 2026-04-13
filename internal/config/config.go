@@ -22,19 +22,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// CurrentVersion is the schema version this build writes and expects.
-// Not yet bumped — the project has not shipped a breaking schema change.
-// The field is reserved so older agents can refuse to load future formats
-// and future agents know when to run migration.
-const CurrentVersion = 1
-
-const (
-	DefaultStatsFile      = "/var/run/kekkai/stats.txt"
-	DefaultPerIPTableSize = 65536
-	DefaultXDPMode        = "generic"
-	SSHPort               = uint16(22)
-)
-
 // Config is the root document.
 type Config struct {
 	// Version is the schema version. Missing or 1 triggers migration.
@@ -328,7 +315,7 @@ func (c *Config) applyDefaults() {
 		c.Filter.AllowARP = &v
 	}
 	if c.Filter.UDPEphemeralMin == 0 {
-		c.Filter.UDPEphemeralMin = EPHEMERALPortMin
+		c.Filter.UDPEphemeralMin = DefaultUDPEphemeralMin
 	}
 }
 
@@ -464,9 +451,6 @@ func containsPort(list []uint16, p uint16) bool {
 	}
 	return false
 }
-
-// EPHEMERALPortMin matches the data-plane default in bpf/headers.h.
-const EPHEMERALPortMin = uint16(32768)
 
 // writeAtomic writes `data` to `path` via a temporary sibling file and
 // rename, so readers never observe a partial file.
