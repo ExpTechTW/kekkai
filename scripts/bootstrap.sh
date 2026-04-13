@@ -152,6 +152,8 @@ if [[ ! -f "$CFG" ]]; then
   log "writing default config to $CFG"
   $SUDO mkdir -p /etc/waf-go
   $SUDO tee "$CFG" >/dev/null <<EOF
+version: 2
+
 node:
   id: $(hostname)
   region: default
@@ -167,6 +169,12 @@ runtime:
 observability:
   stats_file: /var/run/waf-go/stats.txt
 
+security:
+  # Auto-add port 22 to filter.private.tcp on every load. Protects SSH.
+  enforce_ssh_private: true
+  # Refuse to start when port 22 is in filter.public.tcp (unless true).
+  allow_ssh_public: false
+
 filter:
   public:
     tcp: [80, 443]
@@ -174,6 +182,8 @@ filter:
   private:
     tcp: []
     udp: []
+  # You MUST list a network here before restarting — SSH (22) is auto-added
+  # to private.tcp above, and an empty allowlist would lock you out.
   ingress_allowlist: []
   static_blocklist: []
 EOF

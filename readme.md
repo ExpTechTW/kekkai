@@ -186,20 +186,26 @@ bash scripts/update.sh --no-restart  # 安裝但不重啟 service
 
 ## 設定
 
-完整範例見 [deploy/edge.example.yaml](deploy/edge.example.yaml)。核心結構：
+完整範例見 [deploy/edge.example.yaml](deploy/edge.example.yaml)（含中英雙語註解）。核心結構：
 
 ```yaml
+version: 2
+
 node:          { id: edge-01, region: default }
 interface:     { name: eth0, xdp_mode: generic }
 runtime:       { emergency_bypass: false, perip_table_size: 65536 }
 observability: { stats_file: /var/run/waf-go/stats.txt }
 
+security:
+  enforce_ssh_private: true    # 強制 port 22 進 private.tcp
+  allow_ssh_public: false      # 允許 port 22 放 public.tcp (預設不允許)
+
 filter:
   public:
-    tcp: [80, 443]         # 任何來源都可連
+    tcp: [80, 443]             # 任何來源都可連
     udp: [53]
   private:
-    tcp: [22]              # 只有 ingress_allowlist 可連
+    tcp: []                    # 22 會因 enforce_ssh_private 自動加入
     udp: []
   ingress_allowlist:
     - 10.0.0.0/8
@@ -208,18 +214,60 @@ filter:
   static_blocklist: []
 ```
 
-**驗證規則**（啟動與 reload 都跑）：
+**版本化與自動遷移**
+
+Config 頂層 `version: 2` 標註 schema 版本。Agent 啟動或 reload 時偵測版本號，比當前版本舊的會**自動升級並寫回磁碟**，原始檔備份到 `edge.yaml.update_backup.<時戳>`。最多保留 10 份，舊的自動刪除。
+
+- **v1 → v2 遷移**：平坦的 M3 schema (`node_id` / `iface` / `static_blocklist` 等) 自動轉成巢狀結構
+- v1 沒有的欄位（`filter.public` / `filter.private` / `ingress_allowlist`）用**保守預設**：`public.tcp: [80, 443]`、其他空。結果是 SSH 會被預設拒絕擋掉 → agent 拒絕啟動 → 強迫 user 檢視遷移後 config
+- 不支援降級遷移。rollback 請手動從備份檔還原
+
+**備份種類與命名**
+
+| 觸發 | 檔名格式 | 時機 |
+|---|---|---|
+| 自動遷移 (migration) | `edge.yaml.update_backup.<ts>` | 載入時發現版本落後 |
+| Reload 有變化 | `edge.yaml.auto_backup.<ts>` | SIGHUP 且新 config struct 和舊的不同 (DeepEqual 判定) |
+| 手動備份 | `edge.yaml.backup.<ts>` | `waf-edge -backup` 或 `make config-backup` |
+
+時戳格式 `20060102T150405`（UTC，ISO8601 basic format，檔名安全）。每種 kind 各自保留最新 10 份。
+
+**CLI 旗標**
+
+| 旗標 | 用途 |
+|---|---|
+| `-check` | 驗證 config 後退出 (含 migration 預演)，exit code 0/1 |
+| `-show` | 印出完整正規化後 config (migration + defaults + normalize) |
+| `-backup` | 寫一份 `backup.<ts>` 並退出 |
+
+```bash
+waf-edge -check /etc/waf-go/edge.yaml     # 啟動前驗證
+waf-edge -show  /etc/waf-go/edge.yaml     # 看 agent 實際解讀成什麼樣
+waf-edge -backup /etc/waf-go/edge.yaml    # 手動備份
+```
+
+或用 Makefile alias：`make config-check` / `make config-show` / `make config-backup`
+
+**驗證規則**（啟動和 reload 都跑）
 - `interface.name` 必填且存在
 - 所有 port 在 1..65535
 - 同一 proto 的 port 不可重複出現在 public 和 private
 - 所有 CIDR 必須解析成功
-- `private.tcp` 含 22 但 `ingress_allowlist` 空 → 拒絕啟動（避免鎖 SSH）
+- SSH 安全：
+  - 22 在 `public.tcp` + `allow_ssh_public=false` → 拒絕啟動
+  - 22 同時在 public 和 private → 拒絕啟動
+  - 22 在 `private.tcp` 但 `ingress_allowlist` 空 → 拒絕啟動（鎖 SSH 防護）
+- `enforce_ssh_private=true`（預設）時 22 自動加進 `private.tcp`（log 印 `normalize: auto-added ...`）
+- `allow_ssh_public=true` + 22 在 public → 啟動，但印三行 `SECURITY WARNING` log
 
-**Hot reload 範圍**（SIGHUP）：
-- ✅ filter 所有子欄位（public / private / allowlist / blocklist）
+**Hot reload 範圍**（SIGHUP / `systemctl reload waf-edge`）
+- ✅ `filter.*` 所有子欄位
+- ✅ `security.*`（會重新跑 normalize，22 可能被加進/移出 private）
 - ✅ `runtime.emergency_bypass`（即時 detach/re-attach）
 - ❌ `interface.*`（需重啟）
-- ❌ `runtime.perip_table_size`（需重啟，動到 map 大小）
+- ❌ `runtime.perip_table_size`（需重啟，動到 eBPF map 大小）
+
+Reload 成功且新舊 struct 不同 → 自動寫 `auto_backup.<ts>`，log 印 backup 路徑。
 
 ## 統計輸出範例
 

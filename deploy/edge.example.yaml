@@ -1,93 +1,157 @@
 # waf-go edge agent configuration.
 #
-# Validation is strict: unknown keys, invalid ports, bad CIDRs, or rules that
-# would lock SSH out cause the agent to refuse to start. Use `waf-edge
-# -check /path/to/edge.yaml` to validate without launching.
+# EN: Validation is strict. Unknown keys, invalid ports, bad CIDRs, or rules
+#     that would lock SSH out cause the agent to refuse to start. Use
+#     `waf-edge -check /path/to/edge.yaml` to validate without launching.
+# ZH: 驗證採嚴格模式。未知欄位、非法 port、壞 CIDR、或會鎖掉 SSH 的規則
+#     都會讓 agent 拒絕啟動。可用 `waf-edge -check <path>` 離線驗證。
 #
-# Reload model: SIGHUP reloads this file. `filter.*`, `static_blocklist`,
-# `ingress_allowlist`, and `runtime.emergency_bypass` hot-reload. Changes to
-# `interface.*` or `runtime.perip_table_size` require a full restart.
+# EN: Schema version. On load, older versions are auto-migrated and the
+#     previous file is copied to edge.yaml.update_backup.<timestamp>.
+# ZH: Schema 版本號。載入時舊版會自動升級，原始檔案會備份到
+#     edge.yaml.update_backup.<時戳>，總共保留最新 10 份。
+version: 2
 
 # ---------- identity ----------
 node:
-  id: edge-01                # defaults to hostname
-  region: default            # region tag (consumed by future NATS integration)
+  # EN: Node identifier. Defaults to hostname if empty.
+  # ZH: 節點識別。留空自動用 hostname。
+  id: edge-01
+
+  # EN: Region label consumed by future NATS integration.
+  # ZH: 區域標籤，供未來 NATS 整合使用。
+  region: default
 
 # ---------- network interface ----------
 interface:
-  name: eth0                 # REQUIRED. XDP attaches here.
-  xdp_mode: generic          # generic | driver | offload
-                             #   generic: works everywhere, slowest
-                             #   driver:  native XDP, needs driver support
-                             #            (ixgbe, i40e, mlx5, ena, bnxt_en, ...)
-                             #   offload: runs on SmartNIC hardware (rare)
-                             # If `driver` fails at attach time the loader
-                             # automatically falls back to `generic`.
+  # EN: REQUIRED. XDP attaches here.
+  # ZH: 必填。XDP 會 attach 到這張網卡。
+  name: eth0
+
+  # EN: generic | driver | offload
+  #     - generic: works everywhere, slowest (RPi macb/bcmgenet are here)
+  #     - driver:  native XDP, needs driver support (ixgbe/i40e/mlx5/ena/bnxt_en)
+  #     - offload: SmartNIC hardware offload (rare)
+  #     If `driver` fails at attach time the loader auto-falls-back to
+  #     `generic`.
+  # ZH: XDP 模式選擇。
+  #     - generic: 相容性最好也最慢 (RPi macb/bcmgenet 只能用這個)
+  #     - driver:  native XDP，要網卡 driver 支援
+  #     - offload: 用 SmartNIC 硬體 (很少見)
+  #     driver 失敗時會自動降級回 generic。
+  xdp_mode: generic
 
 # ---------- runtime toggles ----------
 runtime:
-  # Emergency bypass loads the eBPF program and maps but does NOT attach
-  # the XDP hook to the interface. Toggle on via SIGHUP when rules look
-  # suspect — connectivity is restored instantly, maps stay populated, and
-  # you can re-enable once the config is fixed.
+  # EN: Emergency bypass loads the eBPF program and maps but does NOT attach
+  #     the XDP hook. Flip to true via SIGHUP when rules look suspect — the
+  #     network is restored instantly, maps stay populated, and you can
+  #     re-enable once the config is fixed.
+  # ZH: 緊急旁路。true = 載入 eBPF 但不 attach 到網卡。規則懷疑有問題時
+  #     透過 SIGHUP 切 true 快速恢復網路，不必 stop service。
   emergency_bypass: false
 
-  # Size of the per-source-IPv4 LRU hash used for statistics (not filtering).
-  # ~64 bytes per entry in kernel memory. Power of 2 recommended.
-  #   65 536  →  4 MiB   typical scan <5 ms   (default)
-  #   262 144 → 16 MiB
-  #  1 048 576 → 64 MiB   typical scan <50 ms on a Pi
+  # EN: Size of the per-source-IPv4 LRU hash used for statistics (not
+  #     filtering). ~64 bytes per entry kernel memory. Power of 2 recommended.
+  #       65 536  →  4 MiB   typical scan <5 ms   (default)
+  #       262 144 → 16 MiB
+  #      1 048 576 → 64 MiB  typical scan <50 ms on a Pi
+  #     Changing this value requires a full restart.
+  # ZH: per-source-IPv4 LRU hash 容量 (統計用，不是過濾用)。每筆 ~64 B
+  #     kernel 記憶體。建議用 2 的次方。修改需重啟 agent。
   perip_table_size: 65536
 
 # ---------- observability ----------
 observability:
-  # Human-readable stats snapshot. Monitor with:
-  #   watch -n 1 cat /var/run/waf-go/stats.txt
+  # EN: Human-readable stats snapshot. Monitor with:
+  #       watch -n 1 cat /var/run/waf-go/stats.txt
+  # ZH: 人類可讀的統計快照檔。用 `watch -n 1 cat <path>` 監看。
   stats_file: /var/run/waf-go/stats.txt
+
+# ---------- security ----------
+security:
+  # EN: Force SSH (port 22) into filter.private.tcp on every load/reload.
+  #     If the user hasn't listed 22 anywhere, it's auto-added. Works with
+  #     ingress_allowlist to guarantee SSH is never accidentally exposed.
+  #     Set to false only if you want full manual control of port 22.
+  # ZH: 強制把 SSH (port 22) 放進 filter.private.tcp。每次載入/reload 都
+  #     檢查。user 沒寫的話會自動加入。搭配 ingress_allowlist 確保 SSH 不
+  #     會意外暴露。設 false 才會完全由 user 自行決定 22 的處置。
+  enforce_ssh_private: true
+
+  # EN: Allow SSH (port 22) to appear in filter.public.tcp. Default false —
+  #     22 in public.tcp is a fatal validation error. Set true only for
+  #     bastion hosts / honeypots / deliberate public SSH; startup emits a
+  #     loud WARNING log when this is enabled with 22 in public.
+  # ZH: 允許 SSH (port 22) 出現在 filter.public.tcp。預設 false — 放 22
+  #     在 public.tcp 會拒絕啟動。true 代表你明確知道要把 SSH 開給全網
+  #     (bastion / honeypot / 測試機)，啟動時會印三行 WARN log。
+  allow_ssh_public: false
 
 # ---------- filter rules ----------
 #
-# Inbound packet decision flow (strict model):
-#   1. non-IPv4                     → DROP
-#   2. IP fragment 2+               → PASS (no L4 header)
-#   3. return traffic               → PASS
+# EN: Inbound packet decision flow (strict model):
+#   1. non-IPv4                    → DROP
+#   2. IP fragment 2+              → PASS (no L4 header to inspect)
+#   3. return traffic              → PASS
 #        · TCP with ACK set
 #        · UDP with dst port ≥ 32768 (ephemeral range)
 #        · ICMP (always)
-#   4. src in static_blocklist      → DROP
-#   5. src in dynamic blocklist     → DROP (M6 / NATS push)
-#   6. dst port in filter.public.*  → PASS (any source)
+#   4. src in static_blocklist     → DROP
+#   5. src in dynamic blocklist    → DROP (M6 / NATS push)
+#   6. dst port in filter.public.* → PASS (any source)
 #   7. dst port in filter.private.*:
 #        · src in ingress_allowlist → PASS
 #        · otherwise                → DROP
-#   8. no rule matched              → DROP (default deny)
+#   8. no rule matched             → DROP (default deny)
 #
-# The agent's own outgoing traffic is never inspected (XDP is ingress only),
-# and the rule #3 return-traffic pass lets responses come back without any
-# extra configuration.
+# ZH: 進站封包決策流程 (strict model)：
+#   1. 非 IPv4                     → DROP
+#   2. IP 分片後續片段              → PASS (沒有 L4 header 可檢查)
+#   3. 回程流量                     → PASS
+#        · TCP 帶 ACK flag
+#        · UDP dst port ≥ 32768 (ephemeral 範圍)
+#        · ICMP (全部過)
+#   4. src 在 static_blocklist     → DROP
+#   5. src 在 dynamic blocklist    → DROP (M6 / NATS 推送)
+#   6. dst port 在 filter.public.* → PASS (任何來源)
+#   7. dst port 在 filter.private.*:
+#        · src 在 ingress_allowlist → PASS
+#        · 否則                      → DROP
+#   8. 都沒命中                     → DROP (預設拒絕)
+#
+# EN: The agent's own outgoing traffic is never inspected (XDP is ingress
+#     only); rule #3 lets the responses come back without any extra config.
+# ZH: agent 自己主動出去的連線不會被檢查 (XDP 只 hook ingress)，回程封包
+#     靠規則 3 放行，不用特別設定。
 filter:
-  # Services open to the public internet. Any source IP can connect except
-  # those matched by static_blocklist or the dynamic blocklist.
   public:
-    tcp: [80, 443]
-    udp: [53]
-
-  # Services only the allowlist can reach. Everyone else is dropped.
-  private:
-    tcp: [22]
+    # EN: Services open to the public internet. Any source IP can connect
+    #     except those in static_blocklist or the dynamic blocklist.
+    # ZH: 對外開放的服務 port。任何來源都可連，但黑名單例外。
+    tcp: []
     udp: []
 
-  # Allowlist for private ports. CIDR and single IPs both work — a bare
-  # address is treated as /32. Supports overlapping prefixes (longest match
-  # wins via LPM trie).
-  ingress_allowlist:
-    - 10.0.0.0/8
-    - 172.16.0.0/12
-    - 192.168.0.0/16
-    - 100.64.0.0/10         # Tailscale CGNAT
+  private:
+    # EN: Services only ingress_allowlist can reach. Everyone else dropped.
+    #     Port 22 is auto-added here when security.enforce_ssh_private is
+    #     true (the default).
+    # ZH: 只允許 ingress_allowlist 連線的服務 port。其他全 DROP。
+    #     security.enforce_ssh_private=true 時 22 會自動加進來。
+    tcp: []
+    udp: []
 
-  # Static blocklist. Matches on any destination port. Accepts CIDRs or
-  # single IPs. Evaluated before any allow rules.
+  # EN: Allowlist for private ports. CIDR and single IPs both work — a bare
+  #     address is treated as /32. Longest prefix match wins (LPM trie).
+  # ZH: private port 的來源白名單。CIDR 與單 IP 都可 (裸 IP 視為 /32)。
+  #     LPM trie 最長前綴匹配。
+  ingress_allowlist:
+    - 192.168.0.0/16
+
+  # EN: Static blocklist. Matches any destination port. CIDRs or single IPs.
+  #     Evaluated before any allow rules (static beats allowlist).
+  # ZH: 靜態黑名單。不管 dst port，一律 DROP。支援 CIDR 與單 IP。
+  #     在 allowlist 之前生效 (黑名單優先)。
   static_blocklist: []
     # - 203.0.113.4
     # - 198.51.100.0/24

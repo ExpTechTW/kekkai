@@ -5,8 +5,9 @@
 //     (or stay in emergency bypass).
 //   - Seed maps from config (ports, allowlist, blocklist).
 //   - Run stats reader which publishes /var/run/waf-go/stats.txt.
-//   - Reload config on SIGHUP; validate first, apply as a diff to maps.
-//   - `-check <path>` mode validates a config without attaching anything.
+//   - Reload config on SIGHUP; validate first, apply as a diff to maps,
+//     auto-backup the previous config if it differed.
+//   - Offer offline CLI modes: -check, -show, -backup.
 package main
 
 import (
@@ -28,20 +29,82 @@ import (
 func main() {
 	cfgPath := flag.String("config", "/etc/waf-go/edge.yaml", "path to edge config")
 	check := flag.Bool("check", false, "validate config and exit (non-zero on error)")
+	show := flag.Bool("show", false, "print the normalised config after migration and exit")
+	backup := flag.Bool("backup", false, "write a timestamped manual backup of -config and exit")
 	flag.Parse()
 
-	if *check {
-		if _, err := config.Load(*cfgPath); err != nil {
-			fmt.Fprintf(os.Stderr, "config invalid: %v\n", err)
-			os.Exit(1)
+	// Mutually exclusive run modes.
+	modeCount := 0
+	for _, b := range []bool{*check, *show, *backup} {
+		if b {
+			modeCount++
 		}
-		fmt.Println("config ok")
-		return
+	}
+	if modeCount > 1 {
+		fmt.Fprintln(os.Stderr, "-check, -show, and -backup are mutually exclusive")
+		os.Exit(2)
+	}
+
+	switch {
+	case *check:
+		os.Exit(runCheck(*cfgPath))
+	case *show:
+		os.Exit(runShow(*cfgPath))
+	case *backup:
+		os.Exit(runBackup(*cfgPath))
 	}
 
 	if err := run(*cfgPath); err != nil {
 		log.Fatalf("waf-edge: %v", err)
 	}
+}
+
+// runCheck validates a config file without attaching anything.
+func runCheck(path string) int {
+	res, err := config.Load(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config invalid: %v\n", err)
+		return 1
+	}
+	if res.Migrated {
+		fmt.Printf("migrated v%d → v%d (backup: %s)\n",
+			res.FromVersion, config.CurrentVersion, res.BackupPath)
+	}
+	for _, line := range res.NormalizeLog {
+		fmt.Printf("normalize: %s\n", line)
+	}
+	fmt.Println("config ok")
+	return 0
+}
+
+// runShow prints the fully normalised config (post-migrate, post-default,
+// post-normalize) to stdout. Useful for "what is the agent actually seeing".
+func runShow(path string) int {
+	res, err := config.Load(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config invalid: %v\n", err)
+		return 1
+	}
+	out, err := config.Marshal(res.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "marshal: %v\n", err)
+		return 1
+	}
+	if _, err := os.Stdout.Write(out); err != nil {
+		return 1
+	}
+	return 0
+}
+
+// runBackup writes a manual timestamped backup of the config file.
+func runBackup(path string) int {
+	dst, err := config.BackupFile(path, config.BackupKindManual)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "backup failed: %v\n", err)
+		return 1
+	}
+	fmt.Printf("backup written: %s\n", dst)
+	return 0
 }
 
 // agent bundles all the subsystems main() wires together so reload can
@@ -60,10 +123,21 @@ type agent struct {
 }
 
 func run(cfgPath string) error {
-	cfg, err := config.Load(cfgPath)
+	res, err := config.Load(cfgPath)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
+	cfg := res.Config
+
+	if res.Migrated {
+		log.Printf("config migrated v%d → v%d (backup: %s)",
+			res.FromVersion, config.CurrentVersion, res.BackupPath)
+	}
+	for _, line := range res.NormalizeLog {
+		log.Printf("normalize: %s", line)
+	}
+	warnIfSSHPublic(cfg)
+
 	log.Printf("waf-edge starting node=%s region=%s iface=%s xdp_mode=%s bypass=%v",
 		cfg.Node.ID, cfg.Node.Region, cfg.Interface.Name, cfg.Interface.XDPMode, cfg.Runtime.EmergencyBypass)
 
@@ -137,11 +211,6 @@ func run(cfgPath string) error {
 // openMaps grabs handles once; wrappers hold onto them for the lifetime of
 // the agent so reload is a pure Sync diff without reopening.
 func (a *agent) openMaps() error {
-	get := func(name string, fn func() (*wafmaps.PrefixSet, error)) (*wafmaps.PrefixSet, error) {
-		return fn()
-	}
-	_ = get // placeholder — below uses named locals for clarity
-
 	blMap, err := a.loader.BlocklistMap()
 	if err != nil {
 		return fmt.Errorf("blocklist map: %w", err)
@@ -177,7 +246,6 @@ func (a *agent) openMaps() error {
 }
 
 // applyFilter syncs all six filter maps from the given config in one shot.
-// Used both for initial seed and for reload.
 func (a *agent) applyFilter(cfg *config.Config) error {
 	allowlist, err := config.ParsePrefixes(cfg.Filter.IngressAllowlist)
 	if err != nil {
@@ -212,20 +280,21 @@ func (a *agent) applyFilter(cfg *config.Config) error {
 	return nil
 }
 
-// reload re-reads the config file, validates it, applies filter diffs, and
-// toggles emergency bypass if it changed. On any error the previous state
-// is preserved.
+// reload re-reads the config file, validates it, auto-backs up the
+// previous state if the new struct differs, applies filter diffs, and
+// toggles emergency bypass if it changed. Any error preserves the
+// previous state.
 func (a *agent) reload() error {
-	newCfg, err := config.Load(a.cfgPath)
+	res, err := config.Load(a.cfgPath)
 	if err != nil {
 		return err
 	}
+	newCfg := res.Config
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Interface.Name and Runtime.PerIPTableSize cannot hot reload — they
-	// require tearing down and recreating the collection. Reject those.
+	// Reject changes that can't hot-reload before touching anything.
 	if newCfg.Interface.Name != a.cfg.Interface.Name {
 		return fmt.Errorf("interface.name change requires restart (was %s, now %s)",
 			a.cfg.Interface.Name, newCfg.Interface.Name)
@@ -239,11 +308,23 @@ func (a *agent) reload() error {
 			a.cfg.Interface.XDPMode, newCfg.Interface.XDPMode)
 	}
 
+	// Auto-backup if the struct actually changed. Safe to run even on
+	// failure below — the backup is of the previous good state.
+	if backupPath, bErr := config.AutoBackupIfChanged(a.cfgPath, a.cfg, newCfg); bErr != nil {
+		log.Printf("auto-backup warning: %v", bErr)
+	} else if backupPath != "" {
+		log.Printf("auto-backup written: %s", backupPath)
+	}
+
+	for _, line := range res.NormalizeLog {
+		log.Printf("normalize: %s", line)
+	}
+	warnIfSSHPublic(newCfg)
+
 	if err := a.applyFilter(newCfg); err != nil {
 		return err
 	}
 
-	// Toggle emergency bypass if it changed.
 	if newCfg.Runtime.EmergencyBypass != a.cfg.Runtime.EmergencyBypass {
 		if err := a.loader.SetBypass(newCfg.Runtime.EmergencyBypass); err != nil {
 			return fmt.Errorf("bypass toggle: %w", err)
@@ -259,8 +340,23 @@ func (a *agent) reload() error {
 	return nil
 }
 
-// openStats wires the two eBPF stat maps into a decoupled reader that
-// writes the snapshot file on a fixed cadence.
+// warnIfSSHPublic shouts into the log whenever SSH is intentionally
+// exposed via security.allow_ssh_public. Three lines so nobody misses it.
+func warnIfSSHPublic(cfg *config.Config) {
+	if !cfg.Security.AllowSSHPublic {
+		return
+	}
+	for _, p := range cfg.Filter.Public.TCP {
+		if p == config.SSHPort {
+			log.Printf("=========================================================")
+			log.Printf("SECURITY WARNING: SSH (port 22) is in filter.public.tcp")
+			log.Printf("=========================================================")
+			return
+		}
+	}
+}
+
+// openStats wires the two eBPF stat maps into a decoupled reader.
 func openStats(ld *loader.Loader, cfg *config.Config) (*stats.Reader, error) {
 	globalMap, err := ld.StatsMap()
 	if err != nil {

@@ -1,7 +1,7 @@
 BINARY := waf-edge
 PKG    := ./cmd/edge
 
-.PHONY: all bpf build build-linux vet test clean run update update-check
+.PHONY: all bpf build build-linux vet test clean run update update-check config-check config-backup config-show
 
 all: bpf build
 
@@ -31,3 +31,15 @@ update:
 
 update-check:
 	@bash scripts/update.sh --check-only
+
+# ---------- config management ----------
+CFG ?= /etc/waf-go/edge.yaml
+
+config-check:
+	@/usr/local/bin/waf-edge -check $(CFG)
+
+config-backup:
+	@sudo /usr/local/bin/waf-edge -backup -config $(CFG)
+
+config-show:
+	@/usr/local/bin/waf-edge -show -config $(CFG)
