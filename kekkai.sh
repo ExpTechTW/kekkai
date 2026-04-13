@@ -149,7 +149,12 @@ fi
 # State detection — which subcommand should auto mode run?
 # ---------------------------------------------------------------------------
 detect_state() {
-  # Returns one of: install / repair / update / healthy
+  # Returns one of: install / repair / update / healthy.
+  #
+  # "update" is triggered by either:
+  #   a) the remote has commits we don't
+  #   b) the local HEAD is newer than the installed agent binary's
+  #      mtime — meaning the user already pulled but never rebuilt.
   if [[ ! -x "$AGENT_BIN" ]] || [[ ! -x "$CLI_BIN" ]]; then
     echo install
     return
@@ -168,17 +173,39 @@ detect_state() {
     echo repair
     return
   fi
-  # binaries + unit + config present → check for upstream updates
+
   if [[ "$SOURCE_MODE" == "repo" ]] && command -v git >/dev/null 2>&1; then
     git fetch origin "$BRANCH" >/dev/null 2>&1 || true
-    local before remote
-    before="$(git rev-parse HEAD 2>/dev/null || echo "")"
+
+    local head remote
+    head="$(git rev-parse HEAD 2>/dev/null || echo "")"
     remote="$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo "")"
-    if [[ -n "$before" ]] && [[ -n "$remote" ]] && [[ "$before" != "$remote" ]]; then
+
+    # (a) Remote has new commits → clearly need to update.
+    if [[ -n "$head" ]] && [[ -n "$remote" ]] && [[ "$head" != "$remote" ]]; then
       echo update
       return
     fi
+
+    # (b) Local HEAD is newer than the installed daemon binary. This
+    #     catches "user ran git pull but never rebuilt" — the repo is
+    #     caught up to origin but the binary on disk is stale.
+    if [[ -n "$head" ]]; then
+      local head_ts bin_ts
+      head_ts="$(git show -s --format=%ct "$head" 2>/dev/null || echo 0)"
+      if command -v stat >/dev/null 2>&1; then
+        # Prefer GNU stat, fall back to BSD stat.
+        bin_ts="$(stat -c %Y "$AGENT_BIN" 2>/dev/null || stat -f %m "$AGENT_BIN" 2>/dev/null || echo 0)"
+      else
+        bin_ts=0
+      fi
+      if [[ "$head_ts" != "0" ]] && [[ "$bin_ts" != "0" ]] && (( head_ts > bin_ts )); then
+        echo update
+        return
+      fi
+    fi
   fi
+
   echo healthy
 }
 
