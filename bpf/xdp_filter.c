@@ -3,7 +3,8 @@
 // WAF edge data plane — strict policy model.
 //
 // Decision flow (see readme §filter for the spec):
-//   1. non-IPv4              → DROP
+//   1. ARP                   → PASS
+//      non-IPv4/ARP          → DROP
 //   2. IP frag 2+            → PASS (no L4 header to inspect)
 //   3. return traffic        → PASS (TCP ACK, UDP ephemeral, ICMP)
 //   4. static blocklist      → DROP
@@ -232,13 +233,17 @@ int kekkai_xdp(struct xdp_md *ctx) {
     stat_add(STAT_PKTS_TOTAL, 1);
     stat_add(STAT_BYTES_TOTAL, pkt_len);
 
-    // 1. ethernet + IPv4 only
+    // 1. ethernet + IPv4 only (except ARP, which must pass for LAN liveness)
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) {
         stat_add(STAT_DROP_MALFORMED, 1);
         stat_add(STAT_PKTS_DROPPED, 1);
         stat_add(STAT_BYTES_DROPPED, pkt_len);
         return XDP_DROP;
+    }
+    if (eth->h_proto == bpf_htons(ETH_P_ARP)) {
+        stat_add(STAT_PKTS_PASSED, 1);
+        return XDP_PASS;
     }
     if (eth->h_proto != bpf_htons(ETH_P_IP)) {
         stat_add(STAT_DROP_NON_IPV4, 1);
