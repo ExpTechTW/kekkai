@@ -212,6 +212,7 @@ Kekkai 分成兩個 binary：`kekkai-agent` 是 daemon（systemd 管），`kekka
 | `kekkai help`     | 指令總表 |
 
 `check` / `show` 完全 read-only — 純 memory 驗證，不動磁碟。未來 schema 升版時 daemon 正式啟動才會真正把新版寫回並備份舊檔。
+daemon 另維護一份 last-known-good：`/etc/kekkai/kekkai.agent.yaml`，開機時優先載入這份，避免 user config 壞掉直接起不來。
 
 `reset` 範例：
 ```bash
@@ -442,7 +443,8 @@ eBPF `.o` 用 `go:embed` 打包進 binary，部署時單一檔案。
 裸機 + systemd 是唯一支援方式。XDP 在容器裡會被 netns / veth / 權限 / driver 纏住，不值得。
 
 - Binary: `/usr/local/bin/kekkai-agent`
-- Config: `/etc/kekkai/kekkai.yaml`
+- Config (user): `/etc/kekkai/kekkai.yaml`
+- Config (managed): `/etc/kekkai/kekkai.agent.yaml`
 - Stats: `/var/run/kekkai/stats.txt`
 - Map pin: `/sys/fs/bpf/kekkai/`
 

@@ -6,8 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/usr/local/bin/kekkai-agent -check /etc/kekkai/kekkai.yaml
-ExecStart=/usr/local/bin/kekkai-agent -config /etc/kekkai/kekkai.yaml
+ExecStart=/usr/local/bin/kekkai-agent -config /etc/kekkai/kekkai.yaml -managed-config /etc/kekkai/kekkai.agent.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
@@ -32,7 +31,7 @@ RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=false
 # Writable paths the agent actually needs.
-ReadWritePaths=/sys/fs/bpf /var/run /run
+ReadWritePaths=/sys/fs/bpf /var/run /run /etc/kekkai
 
 # Logging
 StandardOutput=journal

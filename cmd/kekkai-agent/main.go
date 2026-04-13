@@ -17,6 +17,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 
@@ -28,6 +29,7 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "/etc/kekkai/kekkai.yaml", "path to edge config")
+	managedCfgPath := flag.String("managed-config", "", "path to agent-managed last-known-good config (default: <config>.agent.yaml)")
 	check := flag.Bool("check", false, "validate config and exit (non-zero on error)")
 	show := flag.Bool("show", false, "print the normalised config after migration and exit")
 	backup := flag.Bool("backup", false, "write a timestamped manual backup of -config and exit")
@@ -58,9 +60,16 @@ func main() {
 		os.Exit(runReset(*cfgPath, *resetIface))
 	}
 
-	if err := run(*cfgPath); err != nil {
+	if err := run(*cfgPath, resolveManagedConfigPath(*cfgPath, *managedCfgPath)); err != nil {
 		log.Fatalf("kekkai-agent: %v", err)
 	}
+}
+
+func resolveManagedConfigPath(cfgPath, managed string) string {
+	if managed != "" {
+		return managed
+	}
+	return cfgPath + ".agent.yaml"
 }
 
 // runCheck validates a config file without touching the filesystem.
@@ -236,6 +245,7 @@ func splitFields(s string) []string {
 type agent struct {
 	cfg       *config.Config
 	cfgPath   string
+	mcfgPath  string
 	loader    *loader.Loader
 	mu        sync.Mutex
 	blocklist *kmaps.PrefixSet
@@ -247,12 +257,13 @@ type agent struct {
 	runtime   *kmaps.RuntimeCfg
 }
 
-func run(cfgPath string) error {
-	res, err := config.Load(cfgPath)
+func run(cfgPath, managedCfgPath string) error {
+	res, source, err := loadStartupConfig(cfgPath, managedCfgPath)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
 	cfg := res.Config
+	log.Printf("config source: %s", source)
 
 	if res.Migrated {
 		log.Printf("config migrated v%d → v%d (backup: %s)",
@@ -286,12 +297,17 @@ func run(cfgPath string) error {
 		log.Printf("xdp attached to %s (ifindex=%d)", cfg.Interface.Name, iface.Index)
 	}
 
-	a := &agent{cfg: cfg, cfgPath: cfgPath, loader: ld}
+	a := &agent{cfg: cfg, cfgPath: cfgPath, mcfgPath: managedCfgPath, loader: ld}
 	if err := a.openMaps(); err != nil {
 		return err
 	}
 	if err := a.applyFilter(cfg); err != nil {
 		return fmt.Errorf("apply filter: %w", err)
+	}
+	if err := persistManagedConfig(managedCfgPath, cfg); err != nil {
+		log.Printf("managed config persist warning: %v", err)
+	} else {
+		log.Printf("managed config updated: %s", managedCfgPath)
 	}
 
 	reader, err := openStats(ld, cfg)
@@ -485,7 +501,44 @@ func (a *agent) reload() error {
 	}
 
 	a.cfg = newCfg
+	if err := persistManagedConfig(a.mcfgPath, newCfg); err != nil {
+		log.Printf("managed config persist warning: %v", err)
+	} else {
+		log.Printf("managed config updated: %s", a.mcfgPath)
+	}
 	return nil
+}
+
+func loadStartupConfig(cfgPath, managedCfgPath string) (*config.LoadResult, string, error) {
+	if st, err := os.Stat(managedCfgPath); err == nil && !st.IsDir() {
+		res, mErr := config.Load(managedCfgPath)
+		if mErr == nil {
+			return res, "managed (" + managedCfgPath + ")", nil
+		}
+		log.Printf("managed config invalid (%s): %v", managedCfgPath, mErr)
+		log.Printf("falling back to user config: %s", cfgPath)
+	}
+
+	res, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, "", err
+	}
+	return res, "user (" + cfgPath + ")", nil
+}
+
+func persistManagedConfig(path string, cfg *config.Config) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	b, err := config.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // warnIfSSHPublic shouts into the log whenever SSH is intentionally

@@ -65,7 +65,7 @@ kekkai check                               # 驗 /etc/kekkai/kekkai.yaml
 kekkai check /tmp/new-kekkai.yaml          # 指定檔案
 ```
 
-非 root 也能跑 — 即使你的 `/etc/kekkai/kekkai.yaml` 是 v1 需要遷移也不會爆 permission denied。實際的遷移寫回只會在 daemon 正式啟動（`systemctl start kekkai-agent` / `ExecStartPre` 或 `kekkai-agent -config ...`）時發生，那一定是 root。
+非 root 也能跑 — 即使你的 `/etc/kekkai/kekkai.yaml` 是 v1 需要遷移也不會爆 permission denied。實際的遷移寫回只會在 daemon 正式啟動（`systemctl start kekkai-agent` 或 `kekkai-agent -config ...`）時發生，那一定是 root。
 
 Exit code：`0` 通過、`1` 驗證失敗（錯誤訊息到 stderr）。推薦每次 reload 前先跑。
 
@@ -300,6 +300,7 @@ sudo systemctl reload kekkai-agent
 ### 5.1 位置
 
 - 正式：`/etc/kekkai/kekkai.yaml`
+- agent 管理（last-known-good）：`/etc/kekkai/kekkai.agent.yaml`
 - Canonical template：`internal/config/default.yaml`（repo 內，中英註解完整）
   - 編譯時用 `go:embed` 打包進 binary；部署到目標機器不需要 repo
   - `kekkai reset` 就是把這份 template 經過 `Render(values)` 字串替換產生
@@ -606,7 +607,8 @@ journalctl -u kekkai-agent -n 30 --no-pager
 | `/usr/local/bin/kekkai` | CLI + TUI |
 | `/usr/local/bin/kekkai-agent` | Daemon |
 | `/usr/local/bin/kekkai-agent.prev` | update.sh 留的 rollback 快照 |
-| `/etc/kekkai/kekkai.yaml` | 主 config |
+| `/etc/kekkai/kekkai.yaml` | user 主 config（可手動編輯） |
+| `/etc/kekkai/kekkai.agent.yaml` | agent 管理的 last-known-good config（啟動優先使用） |
 | `/etc/kekkai/kekkai.yaml.*_backup.*` | 備份檔 |
 | `/etc/systemd/system/kekkai-agent.service` | systemd unit |
 | `/sys/fs/bpf/kekkai/` | eBPF map pin 目錄 |
