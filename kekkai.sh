@@ -14,6 +14,8 @@
 #   --no-install  skip apt dependency install
 #   --iface NAME  force a specific interface in the default config
 #   --run         launch the agent in foreground at the end (debugging)
+#   --sudo-shortcut     force enable passwordless `kekkai` sudo + shell alias
+#   --no-sudo-shortcut  disable passwordless sudo shortcut setup
 #
 # Auto-detect logic (no subcommand):
 #   - no binaries yet            → install
@@ -42,6 +44,8 @@ BPFFS_DIR=/sys/fs/bpf/kekkai
 UNIT_NAME=kekkai-agent.service
 UNIT_SRC="$ROOT/deploy/systemd/kekkai-agent.service"
 UNIT_DST="/etc/systemd/system/$UNIT_NAME"
+SUDOERS_DIR=/etc/sudoers.d
+SUDOERS_FILE_PREFIX=kekkai-cli-
 GO_MIN="1.22"
 GO_DOWNLOAD_VERSION="1.23.4"
 BRANCH=main
@@ -54,6 +58,7 @@ FORCE=0
 DO_INSTALL_DEPS=1
 IFACE_OVERRIDE=""
 DO_RUN=0
+SETUP_SUDO_SHORTCUT=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -63,6 +68,8 @@ while [[ $# -gt 0 ]]; do
     --no-install)  DO_INSTALL_DEPS=0; shift ;;
     --iface)       IFACE_OVERRIDE="$2"; shift 2 ;;
     --run)         DO_RUN=1; shift ;;
+    --sudo-shortcut) SETUP_SUDO_SHORTCUT=1; shift ;;
+    --no-sudo-shortcut) SETUP_SUDO_SHORTCUT=0; shift ;;
     -h|--help)
       sed -n '2,23p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -319,6 +326,57 @@ install_binaries() {
   log "installed: $CLI_BIN"
 }
 
+setup_sudo_shortcut() {
+  [[ $SETUP_SUDO_SHORTCUT -eq 1 ]] || return 0
+  [[ "$OS" == "linux" ]] || { warn "--sudo-shortcut is Linux-only"; return 0; }
+
+  local target_user
+  target_user="${SUDO_USER:-$USER}"
+  if [[ -z "$target_user" ]] || [[ "$target_user" == "root" ]]; then
+    warn "skip sudo shortcut setup for root user"
+    return 0
+  fi
+
+  local target_home
+  target_home="$(eval echo "~$target_user")"
+  if [[ -z "$target_home" ]] || [[ ! -d "$target_home" ]]; then
+    warn "cannot resolve home for user '$target_user'; skip sudo shortcut setup"
+    return 0
+  fi
+
+  local sudoers_file="$SUDOERS_DIR/${SUDOERS_FILE_PREFIX}${target_user}"
+  local sudoers_line="$target_user ALL=(root) NOPASSWD: $CLI_BIN *"
+  log "configuring passwordless sudo for $CLI_BIN (user=$target_user)"
+  $SUDO install -d -m 0755 "$SUDOERS_DIR"
+  printf '%s\n' "$sudoers_line" | $SUDO tee "$sudoers_file" >/dev/null
+  $SUDO chmod 0440 "$sudoers_file"
+  if ! $SUDO visudo -cf "$sudoers_file" >/dev/null; then
+    $SUDO rm -f "$sudoers_file"
+    die "invalid sudoers syntax generated; aborted --sudo-shortcut"
+  fi
+
+  local shell_name rc_file alias_line
+  shell_name="$(basename "${SHELL:-}")"
+  case "$shell_name" in
+    zsh)  rc_file="$target_home/.zshrc" ;;
+    bash) rc_file="$target_home/.bashrc" ;;
+    *)    rc_file="$target_home/.profile" ;;
+  esac
+  alias_line="alias kekkai='sudo $CLI_BIN'"
+  if [[ ! -f "$rc_file" ]]; then
+    $SUDO touch "$rc_file"
+    $SUDO chown "$target_user":"$target_user" "$rc_file" 2>/dev/null || true
+  fi
+  if ! $SUDO grep -Fq "$alias_line" "$rc_file" 2>/dev/null; then
+    printf '\n%s\n' "$alias_line" | $SUDO tee -a "$rc_file" >/dev/null
+    $SUDO chown "$target_user":"$target_user" "$rc_file" 2>/dev/null || true
+    log "added alias to $rc_file"
+  else
+    info "alias already present in $rc_file"
+  fi
+  info "open a new shell or run: source $rc_file"
+}
+
 install_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
     info "$CONFIG_FILE already exists — leaving untouched"
@@ -463,6 +521,7 @@ do_install() {
   check_kernel
   build_from_source
   install_binaries
+  setup_sudo_shortcut
   install_config
   install_systemd_unit
   enable_and_start
@@ -486,6 +545,7 @@ do_update() {
     return 0
   fi
   install_binaries
+  setup_sudo_shortcut
   enable_and_start
   log "update complete"
 }
@@ -496,6 +556,7 @@ do_repair() {
   ensure_go
   build_from_source
   install_binaries
+  setup_sudo_shortcut
   [[ -f "$CONFIG_FILE" ]] || install_config
   install_systemd_unit
   enable_and_start

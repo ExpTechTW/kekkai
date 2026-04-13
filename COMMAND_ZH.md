@@ -468,6 +468,8 @@ bash ./kekkai.sh --no-install           # 跳過 apt 依賴安裝
 bash ./kekkai.sh --iface eth1           # reset/install 時指定網卡
 bash ./kekkai.sh --run                  # 裝完前景跑 agent（debug）
 bash ./kekkai.sh --force                # 略過 dirty tree / branch 不符 / 降級保護
+bash ./kekkai.sh --sudo-shortcut        # 強制開啟 `kekkai` 免密碼 sudo + alias（預設已開）
+bash ./kekkai.sh --no-sudo-shortcut     # 關閉 sudo shortcut 設定
 ```
 
 ### 7.3 安裝完成後

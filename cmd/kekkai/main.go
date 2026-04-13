@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/ExpTechTW/kekkai/internal/config"
 	"github.com/ExpTechTW/kekkai/internal/doctor"
@@ -127,40 +128,6 @@ func runWafEdge(args ...string) int {
 	return 0
 }
 
-type colorPalette struct {
-	enable bool
-	reset  string
-	bold   string
-	dim    string
-	red    string
-	green  string
-	yellow string
-	cyan   string
-}
-
-func newColorPalette(enable bool) colorPalette {
-	if !enable {
-		return colorPalette{}
-	}
-	return colorPalette{
-		enable: true,
-		reset:  "\033[0m",
-		bold:   "\033[1m",
-		dim:    "\033[2m",
-		red:    "\033[31m",
-		green:  "\033[32m",
-		yellow: "\033[33m",
-		cyan:   "\033[36m",
-	}
-}
-
-func (p colorPalette) wrap(color, s string) string {
-	if !p.enable {
-		return s
-	}
-	return color + s + p.reset
-}
-
 // cmdPorts prints a compact, colorized view of public/private port exposure.
 func cmdPorts(args []string) int {
 	cfgPath := defaultConfigPath
@@ -174,32 +141,84 @@ func cmdPorts(args []string) int {
 		return 1
 	}
 	cfg := res.Config
-	c := newColorPalette(stdoutIsTerminal())
-
-	fmt.Printf("kekkai ports  %s\n\n", cfgPath)
-	fmt.Printf("%sPUBLIC%s  tcp: %s  udp: %s\n",
-		c.wrap(c.green+c.bold, "PUBLIC"),
-		c.reset,
-		formatPortList(cfg.Filter.Public.TCP),
-		formatPortList(cfg.Filter.Public.UDP))
-	fmt.Printf("%sPRIVATE%s tcp: %s  udp: %s\n\n",
-		c.wrap(c.yellow+c.bold, "PRIVATE"),
-		c.reset,
-		formatPortList(cfg.Filter.Private.TCP),
-		formatPortList(cfg.Filter.Private.UDP))
-
-	if hasPort(cfg.Filter.Public.TCP, config.SSHPort) {
-		fmt.Printf("%sSSH exposure%s: port 22 is in public.tcp\n",
-			c.wrap(c.red+c.bold, "SSH exposure"), c.reset)
-	} else if hasPort(cfg.Filter.Private.TCP, config.SSHPort) {
-		fmt.Printf("%sSSH exposure%s: port 22 is in private.tcp (allowlist-gated)\n",
-			c.wrap(c.cyan+c.bold, "SSH exposure"), c.reset)
-	} else {
-		fmt.Printf("%sSSH exposure%s: port 22 not present in either list\n",
-			c.wrap(c.dim+c.bold, "SSH exposure"), c.reset)
-	}
-	fmt.Printf("ingress_allowlist entries: %d\n", len(cfg.Filter.IngressAllowlist))
+	fmt.Println(renderPortsView(cfgPath, cfg, stdoutIsTerminal()))
 	return 0
+}
+
+func renderPortsView(cfgPath string, cfg *config.Config, color bool) string {
+	if !color {
+		ssh := "port 22 not present in either list"
+		if hasPort(cfg.Filter.Public.TCP, config.SSHPort) {
+			ssh = "port 22 is in public.tcp"
+		} else if hasPort(cfg.Filter.Private.TCP, config.SSHPort) {
+			ssh = "port 22 is in private.tcp (allowlist-gated)"
+		}
+		return fmt.Sprintf(
+			"kekkai ports  %s\nPUBLIC  tcp: %s  udp: %s\nPRIVATE tcp: %s  udp: %s\nSSH exposure: %s\ningress_allowlist entries: %d",
+			cfgPath,
+			formatPortList(cfg.Filter.Public.TCP),
+			formatPortList(cfg.Filter.Public.UDP),
+			formatPortList(cfg.Filter.Private.TCP),
+			formatPortList(cfg.Filter.Private.UDP),
+			ssh,
+			len(cfg.Filter.IngressAllowlist),
+		)
+	}
+
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a78bfa")).
+		Render("◈ KEKKAI PORTS")
+	pathLine := lipgloss.NewStyle().Foreground(lipgloss.Color("#64748b")).
+		Render(cfgPath)
+
+	pubTag := lipgloss.NewStyle().Bold(true).
+		Foreground(lipgloss.Color("#0b0f1a")).
+		Background(lipgloss.Color("#4ade80")).
+		Padding(0, 1).Render("PUBLIC")
+	privTag := lipgloss.NewStyle().Bold(true).
+		Foreground(lipgloss.Color("#0b0f1a")).
+		Background(lipgloss.Color("#fbbf24")).
+		Padding(0, 1).Render("PRIVATE")
+	label := lipgloss.NewStyle().Foreground(lipgloss.Color("#94a3b8")).Width(6)
+	val := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#e2e8f0"))
+
+	publicBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#4ade80")).
+		Padding(0, 1).
+		Render(strings.Join([]string{
+			pubTag,
+			label.Render("tcp") + val.Render(formatPortList(cfg.Filter.Public.TCP)),
+			label.Render("udp") + val.Render(formatPortList(cfg.Filter.Public.UDP)),
+		}, "\n"))
+
+	privateBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#fbbf24")).
+		Padding(0, 1).
+		Render(strings.Join([]string{
+			privTag,
+			label.Render("tcp") + val.Render(formatPortList(cfg.Filter.Private.TCP)),
+			label.Render("udp") + val.Render(formatPortList(cfg.Filter.Private.UDP)),
+		}, "\n"))
+
+	sshLine := "SSH exposure: port 22 not present in either list"
+	sshStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#94a3b8"))
+	if hasPort(cfg.Filter.Public.TCP, config.SSHPort) {
+		sshLine = "SSH exposure: port 22 is in public.tcp"
+		sshStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f43f5e"))
+	} else if hasPort(cfg.Filter.Private.TCP, config.SSHPort) {
+		sshLine = "SSH exposure: port 22 is in private.tcp (allowlist-gated)"
+		sshStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#22d3ee"))
+	}
+	allowLine := lipgloss.NewStyle().Foreground(lipgloss.Color("#64748b")).
+		Render(fmt.Sprintf("ingress_allowlist entries: %d", len(cfg.Filter.IngressAllowlist)))
+
+	return strings.Join([]string{
+		title + "  " + pathLine,
+		lipgloss.JoinHorizontal(lipgloss.Top, publicBox, " ", privateBox),
+		sshStyle.Render(sshLine),
+		allowLine,
+	}, "\n")
 }
 
 func formatPortList(ports []uint16) string {
