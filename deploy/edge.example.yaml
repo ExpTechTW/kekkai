@@ -1,9 +1,93 @@
-node_id: edge-01
-region: tw-tpe
-iface: eth0
+# waf-go edge agent configuration.
+#
+# Validation is strict: unknown keys, invalid ports, bad CIDRs, or rules that
+# would lock SSH out cause the agent to refuse to start. Use `waf-edge
+# -check /path/to/edge.yaml` to validate without launching.
+#
+# Reload model: SIGHUP reloads this file. `filter.*`, `static_blocklist`,
+# `ingress_allowlist`, and `runtime.emergency_bypass` hot-reload. Changes to
+# `interface.*` or `runtime.perip_table_size` require a full restart.
 
-# Static CIDR blocklist loaded at startup (IPv4 only for now).
-# Each entry can be a bare address (→ /32) or a CIDR.
-static_blocklist:
-  # - 192.0.2.0/24
-  # - 198.51.100.7
+# ---------- identity ----------
+node:
+  id: edge-01                # defaults to hostname
+  region: default            # region tag (consumed by future NATS integration)
+
+# ---------- network interface ----------
+interface:
+  name: eth0                 # REQUIRED. XDP attaches here.
+  xdp_mode: generic          # generic | driver | offload
+                             #   generic: works everywhere, slowest
+                             #   driver:  native XDP, needs driver support
+                             #            (ixgbe, i40e, mlx5, ena, bnxt_en, ...)
+                             #   offload: runs on SmartNIC hardware (rare)
+                             # If `driver` fails at attach time the loader
+                             # automatically falls back to `generic`.
+
+# ---------- runtime toggles ----------
+runtime:
+  # Emergency bypass loads the eBPF program and maps but does NOT attach
+  # the XDP hook to the interface. Toggle on via SIGHUP when rules look
+  # suspect — connectivity is restored instantly, maps stay populated, and
+  # you can re-enable once the config is fixed.
+  emergency_bypass: false
+
+  # Size of the per-source-IPv4 LRU hash used for statistics (not filtering).
+  # ~64 bytes per entry in kernel memory. Power of 2 recommended.
+  #   65 536  →  4 MiB   typical scan <5 ms   (default)
+  #   262 144 → 16 MiB
+  #  1 048 576 → 64 MiB   typical scan <50 ms on a Pi
+  perip_table_size: 65536
+
+# ---------- observability ----------
+observability:
+  # Human-readable stats snapshot. Monitor with:
+  #   watch -n 1 cat /var/run/waf-go/stats.txt
+  stats_file: /var/run/waf-go/stats.txt
+
+# ---------- filter rules ----------
+#
+# Inbound packet decision flow (strict model):
+#   1. non-IPv4                     → DROP
+#   2. IP fragment 2+               → PASS (no L4 header)
+#   3. return traffic               → PASS
+#        · TCP with ACK set
+#        · UDP with dst port ≥ 32768 (ephemeral range)
+#        · ICMP (always)
+#   4. src in static_blocklist      → DROP
+#   5. src in dynamic blocklist     → DROP (M6 / NATS push)
+#   6. dst port in filter.public.*  → PASS (any source)
+#   7. dst port in filter.private.*:
+#        · src in ingress_allowlist → PASS
+#        · otherwise                → DROP
+#   8. no rule matched              → DROP (default deny)
+#
+# The agent's own outgoing traffic is never inspected (XDP is ingress only),
+# and the rule #3 return-traffic pass lets responses come back without any
+# extra configuration.
+filter:
+  # Services open to the public internet. Any source IP can connect except
+  # those matched by static_blocklist or the dynamic blocklist.
+  public:
+    tcp: [80, 443]
+    udp: [53]
+
+  # Services only the allowlist can reach. Everyone else is dropped.
+  private:
+    tcp: [22]
+    udp: []
+
+  # Allowlist for private ports. CIDR and single IPs both work — a bare
+  # address is treated as /32. Supports overlapping prefixes (longest match
+  # wins via LPM trie).
+  ingress_allowlist:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10         # Tailscale CGNAT
+
+  # Static blocklist. Matches on any destination port. Accepts CIDRs or
+  # single IPs. Evaluated before any allow rules.
+  static_blocklist: []
+    # - 203.0.113.4
+    # - 198.51.100.0/24

@@ -9,27 +9,27 @@ import (
 )
 
 // stubImpl lets the project build on non-Linux hosts (macOS dev workflow).
-// XDP is Linux-only; calling Attach here returns a clear error.
 type stubImpl struct{}
 
 func newImpl() implementation { return &stubImpl{} }
 
-func (stubImpl) attach(ifaceIndex int) error {
+func (stubImpl) attach(ifaceIndex int, opts Options) error {
 	return fmt.Errorf("XDP is only supported on Linux; build for linux to attach")
 }
+func (stubImpl) detach() error { return nil }
+func (stubImpl) close() error  { return nil }
 
-func (stubImpl) close() error { return nil }
+const stubErr = "eBPF maps not available on non-linux builds"
 
-// BlocklistMap is a no-op on non-Linux builds.
-func (l *Loader) BlocklistMap() (*ebpf.Map, error) {
-	return nil, fmt.Errorf("blocklist map not available on non-linux builds")
-}
+func (l *Loader) BlocklistMap() (*ebpf.Map, error)    { return nil, fmt.Errorf(stubErr) }
+func (l *Loader) AllowlistMap() (*ebpf.Map, error)    { return nil, fmt.Errorf(stubErr) }
+func (l *Loader) DynBlocklistMap() (*ebpf.Map, error) { return nil, fmt.Errorf(stubErr) }
+func (l *Loader) PublicTCPMap() (*ebpf.Map, error)    { return nil, fmt.Errorf(stubErr) }
+func (l *Loader) PublicUDPMap() (*ebpf.Map, error)    { return nil, fmt.Errorf(stubErr) }
+func (l *Loader) PrivateTCPMap() (*ebpf.Map, error)   { return nil, fmt.Errorf(stubErr) }
+func (l *Loader) PrivateUDPMap() (*ebpf.Map, error)   { return nil, fmt.Errorf(stubErr) }
+func (l *Loader) StatsMap() (*ebpf.Map, error)        { return nil, fmt.Errorf(stubErr) }
+func (l *Loader) PerIPMap() (*ebpf.Map, error)        { return nil, fmt.Errorf(stubErr) }
 
-// StatsMap is a no-op on non-Linux builds.
-func (l *Loader) StatsMap() (*ebpf.Map, error) {
-	return nil, fmt.Errorf("stats map not available on non-linux builds")
-}
-
-func (l *Loader) PerIPMap() (*ebpf.Map, error) {
-	return nil, fmt.Errorf("perip map not available on non-linux builds")
-}
+func (l *Loader) SetBypass(bool) error { return nil }
+func (l *Loader) Attached() bool       { return false }

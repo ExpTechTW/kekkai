@@ -4,11 +4,13 @@
 // a human-readable snapshot to disk so operators can `watch -n 1 cat` it.
 //
 // The fast tick (writer) and the slow tick (top-N scan) run on independent
-// goroutines and exchange results through an atomic pointer so the top-N
-// computation never blocks the writer.
+// goroutines and exchange results through an atomic pointer. All hot-path
+// buffers are preallocated once at construction time so steady-state
+// operation generates zero heap allocations per tick.
 package stats
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,37 +25,55 @@ import (
 
 // Global stats slot indices — keep in sync with bpf/xdp_filter.c.
 const (
-	SlotPktsTotal     = 0
-	SlotPktsPassed    = 1
-	SlotPktsDropped   = 2
-	SlotBytesTotal    = 3
-	SlotBytesDropped  = 4
-	SlotNonIPv4       = 5
-	SlotMalformed     = 6
-	SlotPktsTCP       = 7
-	SlotPktsUDP       = 8
-	SlotPktsICMP      = 9
-	SlotPktsOtherL4   = 10
-	SlotBytesTCP      = 11
-	SlotBytesUDP      = 12
-	SlotBytesICMP     = 13
-	SlotBytesOtherL4  = 14
-	SlotDropBlocklist = 15
-	SlotDropMalformed = 16
-	SlotCount         = 32
+	SlotPktsTotal    = 0
+	SlotPktsPassed   = 1
+	SlotPktsDropped  = 2
+	SlotBytesTotal   = 3
+	SlotBytesDropped = 4
+
+	SlotPktsTCP      = 5
+	SlotPktsUDP      = 6
+	SlotPktsICMP     = 7
+	SlotPktsOtherL4  = 8
+	SlotBytesTCP     = 9
+	SlotBytesUDP     = 10
+	SlotBytesICMP    = 11
+	SlotBytesOtherL4 = 12
+
+	SlotDropNonIPv4    = 13
+	SlotDropMalformed  = 14
+	SlotDropBlocklist  = 15
+	SlotDropDynBlock   = 16
+	SlotDropNotAllowed = 17
+	SlotDropNoPolicy   = 18
+
+	SlotPassFragment   = 19
+	SlotPassReturnTCP  = 20
+	SlotPassReturnUDP  = 21
+	SlotPassReturnICMP = 22
+	SlotPassPublicTCP  = 23
+	SlotPassPublicUDP  = 24
+	SlotPassPrivateTCP = 25
+	SlotPassPrivateUDP = 26
+
+	SlotCount = 48
 )
 
-// Global mirrors struct of the aggregated stats map.
+// Global mirrors the aggregated counters.
 type Global struct {
-	PktsTotal, PktsPassed, PktsDropped uint64
-	BytesTotal, BytesDropped           uint64
-	NonIPv4, Malformed                 uint64
-	PktsTCP, PktsUDP, PktsICMP, PktsOtherL4      uint64
-	BytesTCP, BytesUDP, BytesICMP, BytesOtherL4  uint64
-	DropBlocklist, DropMalformed                 uint64
+	PktsTotal, PktsPassed, PktsDropped          uint64
+	BytesTotal, BytesDropped                    uint64
+	PktsTCP, PktsUDP, PktsICMP, PktsOtherL4     uint64
+	BytesTCP, BytesUDP, BytesICMP, BytesOtherL4 uint64
+
+	DropNonIPv4, DropMalformed, DropBlocklist uint64
+	DropDynBlock, DropNotAllowed, DropNoPolicy uint64
+
+	PassFragment, PassReturnTCP, PassReturnUDP, PassReturnICMP uint64
+	PassPublicTCP, PassPublicUDP, PassPrivateTCP, PassPrivateUDP uint64
 }
 
-// perIPStat mirrors `struct perip_stat` in the eBPF program.
+// perIPStat mirrors `struct perip_stat` in the eBPF program. Size: 48 bytes.
 type perIPStat struct {
 	Pkts         uint64
 	Bytes        uint64
@@ -65,7 +85,7 @@ type perIPStat struct {
 	_            [6]uint8
 }
 
-// TopEntry is one row of the sorted top-N table produced by the slow tick.
+// TopEntry is one row of the sorted top-N table.
 type TopEntry struct {
 	Addr         [4]byte
 	Pkts         uint64
@@ -76,6 +96,9 @@ type TopEntry struct {
 	Blocked      bool
 }
 
+// topSnapshot is what the slow goroutine hands to the fast goroutine via
+// atomic pointer swap. The Entries slice backs onto one of the two
+// preallocated buffers owned by the Reader — never allocated per tick.
 type topSnapshot struct {
 	Entries  []TopEntry
 	ScanAt   time.Time
@@ -94,50 +117,81 @@ type Reader struct {
 	fastInterval time.Duration
 	slowInterval time.Duration
 	topN         int
+	peripCap     int
 
 	startedAt time.Time
 
-	prev    Global
-	prevAt  time.Time
-	hasPrev bool
+	// ----- fast path state (touched only by runFast goroutine) -----
+	prev         Global
+	prevAt       time.Time
+	hasPrev      bool
+	txBytesPath  string
+	txPktsPath   string
+	prevTxBytes  uint64
+	prevTxPkts   uint64
+	prevTxAt     time.Time
+	hasPrevTx    bool
+	globalPerCPU []uint64 // scratch for PERCPU_ARRAY lookups
+	fileBuf      strings.Builder
 
-	// tx sysfs baseline (kernel counters are monotonic since boot)
-	txBytesPath string
-	txPktsPath  string
-	prevTxBytes uint64
-	prevTxPkts  uint64
-	prevTxAt    time.Time
-	hasPrevTx   bool
+	// ----- slow path state (touched only by runSlow goroutine) -----
+	bufA, bufB       []TopEntry  // double-buffered top-N storage
+	scanKeys         []uint32    // BatchLookup key scratch
+	scanVals         []perIPStat // BatchLookup value scratch
+	batchUnsupported bool        // fall back to Iterate if kernel rejects batch
 
-	// atomic pointer so the writer goroutine reads without locking
-	topPtr atomic.Pointer[topSnapshot]
+	// ----- cross-goroutine handoff -----
+	topPtr   atomic.Pointer[topSnapshot]
+	snapshot [2]topSnapshot // preallocated headers, one per buffer
 }
 
 func NewReader(global, perip *ebpf.Map, nodeID, iface, outPath string) *Reader {
-	return &Reader{
+	peripCap := 0
+	if perip != nil {
+		peripCap = int(perip.MaxEntries())
+	}
+	if peripCap == 0 {
+		peripCap = 65536 // fall back for stub/non-linux
+	}
+
+	// BatchLookup pulls at most `batchSize` entries per syscall. Larger
+	// batches reduce syscall overhead but need bigger scratch buffers.
+	// 4096 keeps scratch at ~200 KiB and fits the 1-iteration-per-second
+	// cadence comfortably.
+	const batchSize = 4096
+
+	r := &Reader{
 		global:       global,
 		perip:        perip,
 		nodeID:       nodeID,
 		iface:        iface,
 		outPath:      outPath,
 		fastInterval: time.Second,
-		slowInterval: time.Second, // top-N rescan cadence; can tune later
+		slowInterval: time.Second,
 		topN:         10,
+		peripCap:     peripCap,
 		startedAt:    time.Now(),
 		txBytesPath:  fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface),
 		txPktsPath:   fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface),
+		globalPerCPU: make([]uint64, 0, 128),
+		bufA:         make([]TopEntry, 0, peripCap),
+		bufB:         make([]TopEntry, 0, peripCap),
+		scanKeys:     make([]uint32, batchSize),
+		scanVals:     make([]perIPStat, batchSize),
 	}
+	r.fileBuf.Grow(4096)
+	return r
 }
 
-// Run launches two goroutines: fast (writes snapshot file) and slow (scans
-// perip map and swaps the result). Both stop when `stop` closes.
+// Run launches fast and slow goroutines and blocks until `stop` closes.
 func (r *Reader) Run(stop <-chan struct{}) error {
 	if err := os.MkdirAll(filepath.Dir(r.outPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir stats dir: %w", err)
 	}
 
-	// Seed an empty top snapshot so the writer has something to render.
-	r.topPtr.Store(&topSnapshot{})
+	// Seed an empty snapshot so the writer has something to render.
+	r.snapshot[0] = topSnapshot{Entries: r.bufA[:0]}
+	r.topPtr.Store(&r.snapshot[0])
 
 	done := make(chan struct{}, 2)
 	go func() { r.runFast(stop); done <- struct{}{} }()
@@ -176,8 +230,7 @@ func (r *Reader) fastTick() {
 	var pps, dps, bpsTotal, bpsDropped float64
 	var ppsTCP, ppsUDP, ppsICMP float64
 	if r.hasPrev {
-		dt := now.Sub(r.prevAt).Seconds()
-		if dt > 0 {
+		if dt := now.Sub(r.prevAt).Seconds(); dt > 0 {
 			pps = float64(g.PktsTotal-r.prev.PktsTotal) / dt
 			dps = float64(g.PktsDropped-r.prev.PktsDropped) / dt
 			bpsTotal = float64(g.BytesTotal-r.prev.BytesTotal) * 8 / dt
@@ -194,8 +247,7 @@ func (r *Reader) fastTick() {
 	txBytes, txPkts := r.readTx()
 	var txBps, txPps float64
 	if r.hasPrevTx {
-		dt := now.Sub(r.prevTxAt).Seconds()
-		if dt > 0 {
+		if dt := now.Sub(r.prevTxAt).Seconds(); dt > 0 {
 			txBps = float64(txBytes-r.prevTxBytes) * 8 / dt
 			txPps = float64(txPkts-r.prevTxPkts) / dt
 		}
@@ -204,8 +256,6 @@ func (r *Reader) fastTick() {
 	r.prevTxPkts = txPkts
 	r.prevTxAt = now
 	r.hasPrevTx = true
-
-	top := r.topPtr.Load()
 
 	r.writeFile(snapshotView{
 		Now:        now,
@@ -221,19 +271,21 @@ func (r *Reader) fastTick() {
 		TxPkts:     txPkts,
 		TxBps:      txBps,
 		TxPps:      txPps,
-		Top:        top,
+		Top:        r.topPtr.Load(),
 	})
 }
 
 func (r *Reader) readGlobal() (Global, error) {
 	var g Global
 	for slot := uint32(0); slot < SlotCount; slot++ {
-		var perCPU []uint64
-		if err := r.global.Lookup(&slot, &perCPU); err != nil {
+		// Reuse the scratch slice; cilium/ebpf will resize it to nCPU on
+		// first call and then keep that length.
+		r.globalPerCPU = r.globalPerCPU[:0]
+		if err := r.global.Lookup(&slot, &r.globalPerCPU); err != nil {
 			return g, fmt.Errorf("lookup slot %d: %w", slot, err)
 		}
 		var sum uint64
-		for _, v := range perCPU {
+		for _, v := range r.globalPerCPU {
 			sum += v
 		}
 		switch slot {
@@ -247,10 +299,6 @@ func (r *Reader) readGlobal() (Global, error) {
 			g.BytesTotal = sum
 		case SlotBytesDropped:
 			g.BytesDropped = sum
-		case SlotNonIPv4:
-			g.NonIPv4 = sum
-		case SlotMalformed:
-			g.Malformed = sum
 		case SlotPktsTCP:
 			g.PktsTCP = sum
 		case SlotPktsUDP:
@@ -267,10 +315,34 @@ func (r *Reader) readGlobal() (Global, error) {
 			g.BytesICMP = sum
 		case SlotBytesOtherL4:
 			g.BytesOtherL4 = sum
-		case SlotDropBlocklist:
-			g.DropBlocklist = sum
+		case SlotDropNonIPv4:
+			g.DropNonIPv4 = sum
 		case SlotDropMalformed:
 			g.DropMalformed = sum
+		case SlotDropBlocklist:
+			g.DropBlocklist = sum
+		case SlotDropDynBlock:
+			g.DropDynBlock = sum
+		case SlotDropNotAllowed:
+			g.DropNotAllowed = sum
+		case SlotDropNoPolicy:
+			g.DropNoPolicy = sum
+		case SlotPassFragment:
+			g.PassFragment = sum
+		case SlotPassReturnTCP:
+			g.PassReturnTCP = sum
+		case SlotPassReturnUDP:
+			g.PassReturnUDP = sum
+		case SlotPassReturnICMP:
+			g.PassReturnICMP = sum
+		case SlotPassPublicTCP:
+			g.PassPublicTCP = sum
+		case SlotPassPublicUDP:
+			g.PassPublicUDP = sum
+		case SlotPassPrivateTCP:
+			g.PassPrivateTCP = sum
+		case SlotPassPrivateUDP:
+			g.PassPrivateUDP = sum
 		}
 	}
 	return g, nil
@@ -308,33 +380,28 @@ func (r *Reader) runSlow(stop <-chan struct{}) {
 
 func (r *Reader) slowTick() {
 	start := time.Now()
-	var key uint32
-	var val perIPStat
-	entries := make([]TopEntry, 0, 1024)
 
-	iter := r.perip.Iterate()
-	for iter.Next(&key, &val) {
-		e := TopEntry{
-			Pkts:         val.Pkts,
-			Bytes:        val.Bytes,
-			PktsDropped:  val.PktsDropped,
-			BytesDropped: val.BytesDropped,
-			Proto:        val.LastProto,
-			Blocked:      val.Blocked != 0,
-		}
-		// key is __u32 in network byte order — bytes 0..3 already correct.
-		e.Addr[0] = byte(key)
-		e.Addr[1] = byte(key >> 8)
-		e.Addr[2] = byte(key >> 16)
-		e.Addr[3] = byte(key >> 24)
-		entries = append(entries, e)
+	// Pick the buffer that isn't currently published. The writer holds the
+	// other one read-only until we swap.
+	active := r.topPtr.Load()
+	var next *topSnapshot
+	var buf *[]TopEntry
+	if active == &r.snapshot[0] {
+		next = &r.snapshot[1]
+		buf = &r.bufB
+	} else {
+		next = &r.snapshot[0]
+		buf = &r.bufA
 	}
-	scanSize := len(entries)
-	if err := iter.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "stats perip iterate: %v\n", err)
+	*buf = (*buf)[:0]
+
+	scanSize, err := r.scanPerIP(buf)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stats perip scan: %v\n", err)
 		return
 	}
 
+	entries := *buf
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Pkts > entries[j].Pkts
 	})
@@ -342,86 +409,169 @@ func (r *Reader) slowTick() {
 		entries = entries[:r.topN]
 	}
 
-	r.topPtr.Store(&topSnapshot{
-		Entries:  entries,
-		ScanAt:   time.Now(),
-		ScanSize: scanSize,
-		ScanMS:   time.Since(start).Milliseconds(),
-	})
+	next.Entries = entries
+	next.ScanAt = time.Now()
+	next.ScanSize = scanSize
+	next.ScanMS = time.Since(start).Milliseconds()
+	r.topPtr.Store(next)
+}
+
+// scanPerIP walks the LRU hash with BatchLookup when the kernel supports it
+// (Linux 5.6+) and falls back to Iterate otherwise. Both paths append into
+// the caller-provided buffer without allocating per-entry.
+func (r *Reader) scanPerIP(buf *[]TopEntry) (int, error) {
+	if r.perip == nil {
+		return 0, nil
+	}
+	if !r.batchUnsupported {
+		n, err := r.scanPerIPBatch(buf)
+		if err == nil {
+			return n, nil
+		}
+		if !errors.Is(err, ebpf.ErrNotSupported) {
+			return n, err
+		}
+		r.batchUnsupported = true
+		// fall through to Iterate
+	}
+	return r.scanPerIPIterate(buf)
+}
+
+func (r *Reader) scanPerIPBatch(buf *[]TopEntry) (int, error) {
+	total := 0
+	cursor := ebpf.MapBatchCursor{}
+	for {
+		n, err := r.perip.BatchLookup(&cursor, r.scanKeys, r.scanVals, nil)
+		for i := 0; i < n; i++ {
+			appendEntry(buf, r.scanKeys[i], &r.scanVals[i])
+		}
+		total += n
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
+		}
+	}
+}
+
+func (r *Reader) scanPerIPIterate(buf *[]TopEntry) (int, error) {
+	var key uint32
+	var val perIPStat
+	iter := r.perip.Iterate()
+	n := 0
+	for iter.Next(&key, &val) {
+		appendEntry(buf, key, &val)
+		n++
+	}
+	return n, iter.Err()
+}
+
+// appendEntry translates one eBPF perIPStat into a TopEntry and appends to
+// the provided buffer. The buffer must have enough capacity to avoid
+// reallocation — callers guarantee this by sizing to perip_max_entries.
+func appendEntry(buf *[]TopEntry, key uint32, val *perIPStat) {
+	e := TopEntry{
+		Pkts:         val.Pkts,
+		Bytes:        val.Bytes,
+		PktsDropped:  val.PktsDropped,
+		BytesDropped: val.BytesDropped,
+		Proto:        val.LastProto,
+		Blocked:      val.Blocked != 0,
+	}
+	// key is __u32 in network byte order — bytes 0..3 already correct.
+	e.Addr[0] = byte(key)
+	e.Addr[1] = byte(key >> 8)
+	e.Addr[2] = byte(key >> 16)
+	e.Addr[3] = byte(key >> 24)
+	*buf = append(*buf, e)
 }
 
 // --- file rendering ---------------------------------------------------------
 
 type snapshotView struct {
-	Now                             time.Time
-	Global                          Global
-	PPS, DPS                        float64
-	BpsTotal, BpsDropped            float64
-	PpsTCP, PpsUDP, PpsICMP         float64
-	TxBytes, TxPkts                 uint64
-	TxBps, TxPps                    float64
-	Top                             *topSnapshot
+	Now                     time.Time
+	Global                  Global
+	PPS, DPS                float64
+	BpsTotal, BpsDropped    float64
+	PpsTCP, PpsUDP, PpsICMP float64
+	TxBytes, TxPkts         uint64
+	TxBps, TxPps            float64
+	Top                     *topSnapshot
 }
 
 func (r *Reader) writeFile(v snapshotView) {
-	var b strings.Builder
+	b := &r.fileBuf
+	b.Reset()
 	uptime := v.Now.Sub(r.startedAt).Truncate(time.Second)
 
-	fmt.Fprintf(&b, "waf-go edge stats            updated: %s\n", v.Now.Format(time.RFC3339))
-	fmt.Fprintf(&b, "node=%s  iface=%s  uptime=%s\n\n", r.nodeID, r.iface, uptime)
+	fmt.Fprintf(b, "waf-go edge stats            updated: %s\n", v.Now.Format(time.RFC3339))
+	fmt.Fprintf(b, "node=%s  iface=%s  uptime=%s\n\n", r.nodeID, r.iface, uptime)
 
-	fmt.Fprintf(&b, "traffic (rx via XDP)\n")
-	fmt.Fprintf(&b, "  pps total       : %15s\n", fmtNum(v.PPS))
-	fmt.Fprintf(&b, "  pps passed      : %15s\n", fmtNum(v.PPS-v.DPS))
-	fmt.Fprintf(&b, "  pps dropped     : %15s\n", fmtNum(v.DPS))
-	fmt.Fprintf(&b, "  rx total        : %15s\n", humanBits(v.BpsTotal))
-	fmt.Fprintf(&b, "  rx dropped      : %15s\n\n", humanBits(v.BpsDropped))
+	fmt.Fprintf(b, "traffic (rx via XDP)\n")
+	fmt.Fprintf(b, "  pps total       : %15s\n", fmtNum(v.PPS))
+	fmt.Fprintf(b, "  pps passed      : %15s\n", fmtNum(v.PPS-v.DPS))
+	fmt.Fprintf(b, "  pps dropped     : %15s\n", fmtNum(v.DPS))
+	fmt.Fprintf(b, "  rx total        : %15s\n", humanBits(v.BpsTotal))
+	fmt.Fprintf(b, "  rx dropped      : %15s\n\n", humanBits(v.BpsDropped))
 
-	fmt.Fprintf(&b, "traffic (tx via kernel, not filtered by XDP)\n")
-	fmt.Fprintf(&b, "  tx              : %15s\n", humanBits(v.TxBps))
-	fmt.Fprintf(&b, "  tx pps          : %15s\n\n", fmtNum(v.TxPps))
+	fmt.Fprintf(b, "traffic (tx via kernel, not filtered by XDP)\n")
+	fmt.Fprintf(b, "  tx              : %15s\n", humanBits(v.TxBps))
+	fmt.Fprintf(b, "  tx pps          : %15s\n\n", fmtNum(v.TxPps))
 
 	g := v.Global
-	fmt.Fprintf(&b, "protocols (since start)\n")
-	fmt.Fprintf(&b, "  tcp             :  pkts=%-14s bytes=%s\n", fmtU(g.PktsTCP), humanBytes(g.BytesTCP))
-	fmt.Fprintf(&b, "  udp             :  pkts=%-14s bytes=%s\n", fmtU(g.PktsUDP), humanBytes(g.BytesUDP))
-	fmt.Fprintf(&b, "  icmp            :  pkts=%-14s bytes=%s\n", fmtU(g.PktsICMP), humanBytes(g.BytesICMP))
-	fmt.Fprintf(&b, "  other l4        :  pkts=%-14s bytes=%s\n\n", fmtU(g.PktsOtherL4), humanBytes(g.BytesOtherL4))
+	fmt.Fprintf(b, "protocols (since start)\n")
+	fmt.Fprintf(b, "  tcp             :  pkts=%-14s bytes=%s\n", fmtU(g.PktsTCP), humanBytes(g.BytesTCP))
+	fmt.Fprintf(b, "  udp             :  pkts=%-14s bytes=%s\n", fmtU(g.PktsUDP), humanBytes(g.BytesUDP))
+	fmt.Fprintf(b, "  icmp            :  pkts=%-14s bytes=%s\n", fmtU(g.PktsICMP), humanBytes(g.BytesICMP))
+	fmt.Fprintf(b, "  other l4        :  pkts=%-14s bytes=%s\n\n", fmtU(g.PktsOtherL4), humanBytes(g.BytesOtherL4))
 
-	fmt.Fprintf(&b, "protocols (rate, last %s)\n", r.fastInterval)
-	fmt.Fprintf(&b, "  pps tcp         : %15s\n", fmtNum(v.PpsTCP))
-	fmt.Fprintf(&b, "  pps udp         : %15s\n", fmtNum(v.PpsUDP))
-	fmt.Fprintf(&b, "  pps icmp        : %15s\n\n", fmtNum(v.PpsICMP))
+	fmt.Fprintf(b, "protocols (rate, last %s)\n", r.fastInterval)
+	fmt.Fprintf(b, "  pps tcp         : %15s\n", fmtNum(v.PpsTCP))
+	fmt.Fprintf(b, "  pps udp         : %15s\n", fmtNum(v.PpsUDP))
+	fmt.Fprintf(b, "  pps icmp        : %15s\n\n", fmtNum(v.PpsICMP))
 
-	fmt.Fprintf(&b, "counters (since start)\n")
-	fmt.Fprintf(&b, "  packets total   : %15s\n", fmtU(g.PktsTotal))
-	fmt.Fprintf(&b, "  packets passed  : %15s\n", fmtU(g.PktsPassed))
-	fmt.Fprintf(&b, "  packets dropped : %15s\n", fmtU(g.PktsDropped))
-	fmt.Fprintf(&b, "  bytes total     : %15s\n", humanBytes(g.BytesTotal))
-	fmt.Fprintf(&b, "  bytes dropped   : %15s\n", humanBytes(g.BytesDropped))
-	fmt.Fprintf(&b, "  non-ipv4        : %15s\n", fmtU(g.NonIPv4))
-	fmt.Fprintf(&b, "  malformed       : %15s\n\n", fmtU(g.Malformed))
+	fmt.Fprintf(b, "counters (since start)\n")
+	fmt.Fprintf(b, "  packets total   : %15s\n", fmtU(g.PktsTotal))
+	fmt.Fprintf(b, "  packets passed  : %15s\n", fmtU(g.PktsPassed))
+	fmt.Fprintf(b, "  packets dropped : %15s\n", fmtU(g.PktsDropped))
+	fmt.Fprintf(b, "  bytes total     : %15s\n", humanBytes(g.BytesTotal))
+	fmt.Fprintf(b, "  bytes dropped   : %15s\n\n", humanBytes(g.BytesDropped))
 
-	fmt.Fprintf(&b, "drops by reason (since start)\n")
-	fmt.Fprintf(&b, "  blocklist       : %15s\n", fmtU(g.DropBlocklist))
-	fmt.Fprintf(&b, "  malformed       : %15s\n\n", fmtU(g.DropMalformed))
+	fmt.Fprintf(b, "drops by reason (since start)\n")
+	fmt.Fprintf(b, "  non-ipv4        : %15s\n", fmtU(g.DropNonIPv4))
+	fmt.Fprintf(b, "  malformed       : %15s\n", fmtU(g.DropMalformed))
+	fmt.Fprintf(b, "  blocklist       : %15s\n", fmtU(g.DropBlocklist))
+	fmt.Fprintf(b, "  dyn blocklist   : %15s\n", fmtU(g.DropDynBlock))
+	fmt.Fprintf(b, "  not allowed     : %15s\n", fmtU(g.DropNotAllowed))
+	fmt.Fprintf(b, "  no policy       : %15s\n\n", fmtU(g.DropNoPolicy))
+
+	fmt.Fprintf(b, "passes by reason (since start)\n")
+	fmt.Fprintf(b, "  return tcp (ACK): %15s\n", fmtU(g.PassReturnTCP))
+	fmt.Fprintf(b, "  return udp (eph): %15s\n", fmtU(g.PassReturnUDP))
+	fmt.Fprintf(b, "  return icmp     : %15s\n", fmtU(g.PassReturnICMP))
+	fmt.Fprintf(b, "  ip fragment     : %15s\n", fmtU(g.PassFragment))
+	fmt.Fprintf(b, "  public tcp      : %15s\n", fmtU(g.PassPublicTCP))
+	fmt.Fprintf(b, "  public udp      : %15s\n", fmtU(g.PassPublicUDP))
+	fmt.Fprintf(b, "  private tcp     : %15s\n", fmtU(g.PassPrivateTCP))
+	fmt.Fprintf(b, "  private udp     : %15s\n\n", fmtU(g.PassPrivateUDP))
 
 	top := v.Top
 	if top != nil {
-		fmt.Fprintf(&b, "top %d source IPs (scan: %d entries, %dms, at %s)\n",
-			r.topN, top.ScanSize, top.ScanMS,
+		fmt.Fprintf(b, "top %d source IPs (scan: %d entries / cap %d, %dms, at %s)\n",
+			r.topN, top.ScanSize, r.peripCap, top.ScanMS,
 			formatScanAge(v.Now, top.ScanAt))
-		fmt.Fprintf(&b, "  %-4s %-16s %-12s %-12s %-10s %-6s %s\n",
+		fmt.Fprintf(b, "  %-4s %-16s %-12s %-12s %-10s %-6s %s\n",
 			"#", "SRC_IP", "PKTS", "BYTES", "DROPPED", "PROTO", "STATUS")
 		if len(top.Entries) == 0 {
-			fmt.Fprintf(&b, "  (no traffic yet)\n")
+			fmt.Fprintf(b, "  (no traffic yet)\n")
 		}
 		for i, e := range top.Entries {
 			status := "pass"
 			if e.Blocked {
 				status = "BLOCK"
 			}
-			fmt.Fprintf(&b, "  %-4d %-16s %-12s %-12s %-10s %-6s %s\n",
+			fmt.Fprintf(b, "  %-4d %-16s %-12s %-12s %-10s %-6s %s\n",
 				i+1,
 				fmt.Sprintf("%d.%d.%d.%d", e.Addr[0], e.Addr[1], e.Addr[2], e.Addr[3]),
 				fmtU(e.Pkts),
@@ -475,7 +625,6 @@ func fmtNum(v float64) string {
 }
 
 func addCommas(s string) string {
-	// split on decimal point so we only comma the integer part
 	intPart, decPart := s, ""
 	if i := strings.IndexByte(s, '.'); i >= 0 {
 		intPart, decPart = s[:i], s[i:]

@@ -1,5 +1,6 @@
 // Package maps provides Go wrappers around the eBPF maps shared with the XDP
-// data plane. Blocklist is an LPM trie keyed on (prefixlen, ipv4 addr).
+// data plane. Each wrapper encapsulates the key/value layout for its map and
+// exposes typed Sync / Add operations.
 package maps
 
 import (
@@ -9,31 +10,85 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// lpmV4Key mirrors `struct lpm_v4_key` in bpf/xdp_filter.c.
-// prefixlen is in host byte order; addr is in network byte order.
+// lpmV4Key mirrors `struct lpm_v4_key` in bpf/xdp_filter.c. Prefixlen is in
+// host byte order; addr is in network byte order.
 type lpmV4Key struct {
 	Prefixlen uint32
 	Addr      [4]byte
 }
 
-type Blocklist struct {
-	m *ebpf.Map
+// PrefixSet is a wrapper around an LPM_TRIE map keyed on (prefixlen, IPv4).
+// Used for blocklist_v4 and allowlist_v4 — same shape, different semantics.
+type PrefixSet struct {
+	m    *ebpf.Map
+	name string
 }
 
-func NewBlocklist(m *ebpf.Map) *Blocklist {
-	return &Blocklist{m: m}
+func NewPrefixSet(m *ebpf.Map, name string) *PrefixSet {
+	return &PrefixSet{m: m, name: name}
 }
 
-// Add inserts a CIDR into the blocklist. IPv6 prefixes return an error until
-// an ipv6 trie is added.
-func (b *Blocklist) Add(prefix netip.Prefix) error {
-	key, err := keyFromPrefix(prefix)
+func (s *PrefixSet) Add(p netip.Prefix) error {
+	key, err := keyFromPrefix(p)
 	if err != nil {
 		return err
 	}
 	val := uint8(1)
-	if err := b.m.Update(key, val, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("map update %s: %w", prefix, err)
+	if err := s.m.Update(key, val, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("%s add %s: %w", s.name, p, err)
+	}
+	return nil
+}
+
+func (s *PrefixSet) Delete(p netip.Prefix) error {
+	key, err := keyFromPrefix(p)
+	if err != nil {
+		return err
+	}
+	if err := s.m.Delete(key); err != nil {
+		return fmt.Errorf("%s delete %s: %w", s.name, p, err)
+	}
+	return nil
+}
+
+// Sync reconciles the map contents with the desired set. Entries not in
+// `desired` are removed; missing entries are added. Used by config reload.
+func (s *PrefixSet) Sync(desired []netip.Prefix) error {
+	want := make(map[lpmV4Key]struct{}, len(desired))
+	for _, p := range desired {
+		key, err := keyFromPrefix(p)
+		if err != nil {
+			return err
+		}
+		want[key] = struct{}{}
+	}
+
+	// Collect current keys first so we don't mutate while iterating.
+	var current []lpmV4Key
+	{
+		var key lpmV4Key
+		var val uint8
+		iter := s.m.Iterate()
+		for iter.Next(&key, &val) {
+			current = append(current, key)
+		}
+		if err := iter.Err(); err != nil {
+			return fmt.Errorf("%s iterate: %w", s.name, err)
+		}
+	}
+
+	for _, k := range current {
+		if _, keep := want[k]; !keep {
+			if err := s.m.Delete(k); err != nil {
+				return fmt.Errorf("%s prune: %w", s.name, err)
+			}
+		}
+	}
+	val := uint8(1)
+	for k := range want {
+		if err := s.m.Update(k, val, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("%s add: %w", s.name, err)
+		}
 	}
 	return nil
 }
@@ -42,20 +97,16 @@ func keyFromPrefix(p netip.Prefix) (lpmV4Key, error) {
 	if !p.IsValid() {
 		return lpmV4Key{}, fmt.Errorf("invalid prefix")
 	}
-	addr := p.Addr()
-	if !addr.Is4() {
-		return lpmV4Key{}, fmt.Errorf("ipv6 not yet supported: %s", p)
+	if !p.Addr().Is4() {
+		return lpmV4Key{}, fmt.Errorf("ipv6 not supported: %s", p)
 	}
 	bits := p.Bits()
 	if bits < 0 || bits > 32 {
 		return lpmV4Key{}, fmt.Errorf("invalid prefix bits: %d", bits)
 	}
-	// Mask the address to the prefix length so callers can pass either
-	// "1.2.3.4/24" or "1.2.3.0/24" and get the same key.
-	// As4() returns the address in network byte order, which is what the
-	// eBPF LPM trie expects for IPv4 keys.
 	masked := p.Masked().Addr().As4()
 	key := lpmV4Key{Prefixlen: uint32(bits)}
 	copy(key.Addr[:], masked[:])
 	return key, nil
 }
+
