@@ -1,6 +1,6 @@
 # kekkai 指令手冊
 
-完整的操作指令、設定語法、疑難排解速查。涵蓋 `kekkai` CLI、`kekkai-agent` daemon、systemd、scripts/bootstrap、scripts/update、config 檔、備份機制。
+完整的操作指令、設定語法、疑難排解速查。涵蓋 `kekkai` CLI、`kekkai-agent` daemon、systemd、`./kekkai.sh` 一鍵腳本、config 檔、備份機制、doctor 健康檢查。
 
 ---
 
@@ -58,26 +58,29 @@ sudo kekkai status
 
 ### 2.2 kekkai check
 
-驗證 config 檔後退出，走完整 migration + validate + normalize 流程（但不寫回磁碟，除非有版本遷移）。
+驗證 config 檔後退出，**完全 read-only**，不動任何磁碟檔案。遇到舊版 v1 會在 memory 做一次遷移跑 validate，印 `would migrate v1 → v2 on daemon start`，但**不寫回**。
 
 ```bash
 kekkai check                               # 驗 /etc/kekkai/kekkai.yaml
-kekkai check /tmp/new-kekkai.yaml            # 指定檔案
+kekkai check /tmp/new-kekkai.yaml          # 指定檔案
 ```
+
+非 root 也能跑 — 即使你的 `/etc/kekkai/kekkai.yaml` 是 v1 需要遷移也不會爆 permission denied。實際的遷移寫回只會在 daemon 正式啟動（`systemctl start kekkai-agent` / `ExecStartPre` 或 `kekkai-agent -config ...`）時發生，那一定是 root。
 
 Exit code：`0` 通過、`1` 驗證失敗（錯誤訊息到 stderr）。推薦每次 reload 前先跑。
 
 ### 2.3 kekkai show
 
-印出正規化後的 config。輸入是舊版 v1 時會顯示遷移後的 v2。
+印出正規化後的 config（post-migrate, post-defaults, post-normalize），**read-only**。輸入是舊版 v1 時顯示遷移後的 v2，但不會寫回磁碟。
 
 ```bash
 kekkai show > /tmp/current.yaml            # 看 agent 實際在用什麼
+kekkai show /tmp/test.yaml                 # 指定檔案
 ```
 
 用途：
-- 檢查 `security.enforce_ssh_private` 是否有自動加入 22 到 `private.tcp`
-- v1 遷移時預覽新版長怎樣
+- 檢查 `security.enforce_ssh_private` 是否把 22 自動加進 `private.tcp`
+- v1 遷移時預覽新版長怎樣（但要 daemon 正式啟動才會真的寫回）
 - Diff 兩個 config 找差異
 
 ### 2.4 kekkai backup
@@ -91,7 +94,101 @@ sudo kekkai backup /etc/kekkai/kekkai.yaml   # 指定路徑
 
 需要 `sudo` 因為備份寫到 `/etc/kekkai/`。每個 kind (update/auto/backup) 各保留最新 10 份，舊的自動刪。
 
-### 2.5 kekkai version / kekkai help
+### 2.5 kekkai reset
+
+用**預設 template** 覆蓋 config。原檔會先被複製成 `kekkai.yaml.backup.<時戳>` (manual backup kind) 所以永遠可以 rollback。
+
+```bash
+sudo kekkai reset                              # 用 default route 自動偵測 iface
+sudo kekkai reset --iface eth1                 # 明確指定網卡
+sudo kekkai reset /tmp/test.yaml               # 任意路徑（測試用，不需 sudo）
+sudo kekkai reset /tmp/test.yaml --iface eth0
+```
+
+流程：
+1. 偵測或接收 iface 名稱（`--iface` 沒給就讀 `/proc/net/route` 找 default route）
+2. 如果目標檔案已存在 → 備份成 `*.backup.<時戳>`
+3. 寫出乾淨的 v2 template（node / interface / runtime / observability / security / filter 全部預設值）
+4. 印 `default config written: ...` + 提醒要補 `ingress_allowlist`
+
+**寫出來的 config 不會立即可用** — `filter.ingress_allowlist: []` 是空的，而 `security.enforce_ssh_private: true` 預設會把 22 塞進 `private.tcp`，SSH 鎖防護會拒絕啟動。你必須：
+
+```bash
+sudo kekkai reset
+sudo nano /etc/kekkai/kekkai.yaml
+# 改成:
+#   ingress_allowlist:
+#     - 192.168.88.0/24     # 你的管理網段
+kekkai check
+sudo systemctl restart kekkai-agent
+```
+
+**適用情境**
+- config 被改壞了想從頭來
+- 升級 schema 後發現遷移結果不理想，想用全新 template 重來
+- 第一次安裝不想抄 deploy/kekkai.example.yaml
+
+### 2.6 kekkai doctor
+
+**完全 read-only 健康檢查**，不寫檔、不啟停 service、不 attach/detach XDP。印出彩色報告，分七大區塊，每項標 ✓ / ⚠ / ✗：
+
+```
+  ◈ KEKKAI doctor  結界 · diagnostic report
+  ---------------------------------------------
+
+  ○ BINARIES
+    ✓  kekkai-agent (daemon)        6.3 MiB · 2026-04-14 05:20 · sha a1b2c3d4…
+    ✓  kekkai (CLI)                 4.1 MiB · 2026-04-14 05:20 · sha 9f8e7d6c…
+
+  ○ CONFIG
+    ✓  config file                  /etc/kekkai/kekkai.yaml
+    ✓  schema version               v2 (current)
+    ✓  validation                   schema ok, ports unique, CIDRs parse
+    ✓  SSH allowlist                2 allowlist entries gate port 22
+    ✓  interface                    eth0 (xdp_mode=generic)
+
+  ○ SYSTEMD
+    ✓  unit file                    /etc/systemd/system/kekkai-agent.service
+    ✓  enabled at boot              yes
+    ✓  runtime                      running · since Mon 2026-04-14 04:50:23
+
+  ○ KERNEL / EBPF
+    ✓  kernel version               Linux version 6.12.47+rpt-rpi-2712 (…)
+    ✓  BTF                          not available (OK — kekkai doesn't need CO-RE)
+    ✓  bpffs                        mounted at /sys/fs/bpf
+    ✓  pinned maps                  9 entries in /sys/fs/bpf/kekkai
+
+  ○ NETWORK
+    ⚠  NIC driver                   macb — native XDP not supported, using generic mode
+    ✓  XDP attachment               program attached to eth0
+    ✓  sysfs counters               tx_bytes readable
+
+  ○ PERMISSIONS
+    ⚠  effective uid                501 (non-root)
+    ✓  /sys/fs/bpf                  accessible
+    ✓  pin root readable            /sys/fs/bpf/kekkai
+
+  ○ RUNTIME
+    ✓  stats file                   /var/run/kekkai/stats.txt · updated 400ms ago
+    ✓  packets dropped              1,234
+
+  ---------------------------------------------
+  healthy  18 checks · 16 ok · 2 warn · 0 error
+```
+
+Exit code：`0` 為 healthy 或只有 warning、`1` 為任何 error。設計上 warning 不算失敗（對應 `docker info` 慣例）。
+
+**使用情境**
+- 安裝後確認全部綠燈
+- service 沒起來時快速指出問題與修法建議
+- 升級前後 sanity check
+- SSH 進機器後第一個要跑的指令
+
+**和 `kekkai check` 的差別**
+- `kekkai check` 只驗 config 語法
+- `kekkai doctor` 驗**整個系統**：binary 在不在、systemd 啟沒啟、pinned map 存不存在、網卡 driver 支不支援、stats 檔有沒有在更新
+
+### 2.7 kekkai version / kekkai help
 
 ```bash
 kekkai version        # 印 kekkai 版本 + 偵測 kekkai-agent 是否存在
@@ -117,12 +214,13 @@ sudo /usr/local/bin/kekkai-agent -config /etc/kekkai/kekkai.yaml
 這些模式 `kekkai` CLI 都有 wrapper，底下只是說明它們在 `kekkai-agent` 層做了什麼。
 
 ```bash
-kekkai-agent -check  -config <path>    # 驗證
-kekkai-agent -show   -config <path>    # 印出正規化後 YAML
-kekkai-agent -backup -config <path>    # 寫一份 backup.<ts>
+kekkai-agent -check  -config <path>              # 驗證 (read-only)
+kekkai-agent -show   -config <path>              # 印出正規化後 YAML (read-only)
+kekkai-agent -backup -config <path>              # 寫一份 backup.<ts>
+kekkai-agent -reset  -config <path> -iface eth0  # 覆蓋成預設 template (原檔自動備份)
 ```
 
-三個 flag 互斥。
+四個 flag 互斥。`-check` / `-show` 完全不動磁碟（v2 之後的行為，之前的版本會寫回遷移）；`-backup` / `-reset` 會寫檔，所以目標在 `/etc/kekkai/` 時要 sudo。
 
 ---
 
@@ -321,51 +419,66 @@ sudo systemctl reload kekkai-agent
 
 ## 七、安裝 / 更新 / 建置
 
-### 7.1 初次安裝
+所有生命週期動作統一走 `./kekkai.sh`（或 `make` 別名）。單一腳本會自動偵測當前狀態並執行對應 subcommand。
+
+### 7.1 一鍵安裝（推薦）
 
 ```bash
 cd /path/to/kekkai
-bash scripts/bootstrap.sh                    # 裝依賴 + 編譯 + 安裝 binary + 寫預設 config + 裝 systemd unit
-sudo nano /etc/kekkai/kekkai.yaml              # 改 iface 和 allowlist
-kekkai check                                    # 驗證
-sudo systemctl enable --now kekkai-agent         # 啟動 + 開機啟動
+bash ./kekkai.sh                        # 自動偵測狀態
 ```
 
-bootstrap.sh 的旗標：
+決策流程：
+1. binary 都不存在 → `install`（裝依賴、編譯、安裝、寫 config、裝 systemd、啟動 service）
+2. binary 有但 systemd unit 缺 → `repair`
+3. 全部都在、git 有新 commit → `update`
+4. 全部都在、沒新 commit → `doctor`（只報告不改）
+
+顯式 subcommand：
 
 ```bash
-bash scripts/bootstrap.sh --no-install       # 跳過 apt
-bash scripts/bootstrap.sh --iface eth1       # 指定網卡
-bash scripts/bootstrap.sh --run              # 編譯完前景執行（測試用）
+bash ./kekkai.sh install                # 強制走 install
+bash ./kekkai.sh update                 # 強制走 update（git pull + 重編 + 重啟）
+bash ./kekkai.sh repair                 # 補裝缺失的 binary / unit
+bash ./kekkai.sh doctor                 # read-only 健康檢查
+bash ./kekkai.sh uninstall              # 移除 binary + unit，config 保留
 ```
 
-### 7.2 更新
+或用 Makefile 別名：`make install` / `make update` / `make repair` / `make doctor` / `make uninstall`
+
+### 7.2 腳本旗標
 
 ```bash
-cd /path/to/kekkai
-make update                                  # = bash scripts/update.sh
+bash ./kekkai.sh --no-install           # 跳過 apt 依賴安裝
+bash ./kekkai.sh --iface eth1           # reset/install 時指定網卡
+bash ./kekkai.sh --run                  # 裝完前景跑 agent（debug）
+bash ./kekkai.sh --force                # 略過 dirty tree / branch 不符 / 降級保護
 ```
 
-流程：
-1. 檢查 working tree 乾淨（`--force` 跳過）
-2. `git fetch` + 顯示即將套用的 commit
-3. 拒絕降級（遠端 commit 時間比本地舊）
-4. `git merge --ff-only`
-5. `make bpf && make build`
-6. 用新 binary 跑 `kekkai-agent -check` 驗當前 config（失敗就中止，不動安裝）
-7. 舊 binary 備份到 `/usr/local/bin/kekkai-agent.prev`
-8. 安裝新 binary（`kekkai-agent` 和 `kekkai` 都裝）
-9. `systemctl restart kekkai-agent`
-10. 1 秒後檢查 service 狀態，沒起來自動 rollback
-
-其他旗標：
+### 7.3 安裝完成後
 
 ```bash
-make update-check                            # 只看有沒有新 commit
-bash scripts/update.sh --branch dev          # 從別的 branch
-bash scripts/update.sh --no-restart          # 安裝但不重啟 service
-bash scripts/update.sh --force               # 忽略 dirty tree / allow 降級
+sudo nano /etc/kekkai/kekkai.yaml             # 填 ingress_allowlist
+kekkai check                                   # 驗證
+sudo systemctl restart kekkai-agent             # 套用
+kekkai doctor                                   # 確認全綠
+sudo kekkai status                              # 看 TUI
 ```
+
+### 7.4 更新流程內部細節
+
+`bash ./kekkai.sh update` 做這些事（含自動 rollback）：
+1. 還原 `internal/loader/bpf/xdp_filter.o`（go:embed placeholder，避免上次 build 殘留 dirty）
+2. 檢查 working tree 乾淨，不乾淨列 `git status --short` 後終止
+3. `git fetch origin main` 比對 commit
+4. 遠端 commit 時間比本地舊 → 拒絕降級
+5. `git merge --ff-only`
+6. `make bpf && make build`
+7. 用新 binary 跑 `kekkai-agent -check` 驗當前 config（失敗中止）
+8. 舊 binary 備份到 `/usr/local/bin/kekkai-agent.prev`
+9. 安裝新 `kekkai-agent` + `kekkai`
+10. `systemctl restart kekkai-agent`
+11. 1 秒後確認 active；沒起來就自動 rollback 舊 binary 再重啟
 
 ### 7.3 手動建置
 
@@ -525,23 +638,48 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 
 - `rm -rf /sys/fs/bpf/kekkai/` — 強拆 pin 會讓 agent 重啟時混亂
 - `systemctl kill -s 9 kekkai-agent` — SIGKILL 不會 detach XDP，留下孤兒 program（要手動 `ip link set eth0 xdpgeneric off`）
-- `git reset --hard` + `make update` — update.sh 會拒絕 dirty tree，但 hard reset 之後會變成 ff-only 失敗
+- `git reset --hard` + `make update` — `kekkai.sh update` 會拒絕 dirty tree，且 hard reset 之後 ff-only merge 會失敗
 - 同時跑兩個 `kekkai-agent` 進程 — 第二個會嘗試 attach 相同 iface 失敗，浪費時間
 
 ---
 
-## 十四、未來會加的指令（路線圖）
+## 十四、目前可用的指令總表
+
+### `kekkai` CLI
+
+| 指令 | 實作 | 說明 |
+|---|---|---|
+| `kekkai status [path]`          | ✅ | 互動式 TUI |
+| `kekkai doctor`                 | ✅ | 全系統健康檢查（read-only） |
+| `kekkai check [path]`           | ✅ | 驗證 config (read-only) |
+| `kekkai show [path]`            | ✅ | 印出正規化 config (read-only) |
+| `kekkai backup [path]`          | ✅ | 手動時戳備份 |
+| `kekkai reset [path] [--iface]` | ✅ | 覆蓋成預設 template，原檔自動備份 |
+| `kekkai version`                | ✅ | 版本資訊 |
+| `kekkai help`                   | ✅ | 指令總表 |
+
+### `./kekkai.sh` 一鍵腳本
+
+| 指令 | 實作 | 說明 |
+|---|---|---|
+| `kekkai.sh` (無參數)      | ✅ | 自動偵測狀態並執行對應動作 |
+| `kekkai.sh install`       | ✅ | 強制初次安裝 |
+| `kekkai.sh update`        | ✅ | 強制從 git 更新 |
+| `kekkai.sh repair`        | ✅ | 補齊缺失的 binary / systemd unit |
+| `kekkai.sh doctor`        | ✅ | delegate 到 `kekkai doctor` |
+| `kekkai.sh uninstall`     | ✅ | 移除 binary + systemd，config 保留 |
+
+## 十五、未來會加的指令（路線圖）
 
 這些目前**還沒**實作，規劃在後續 milestone：
 
-```bash
-kekkai block <ip>          # 寫入 dyn_blocklist_v4，TTL 指定
-kekkai unblock <ip>        # 從 dyn_blocklist_v4 移除
-kekkai logs [-f]           # journalctl -u kekkai-agent 包裝
-kekkai update              # scripts/update.sh 包裝
-kekkai bypass on|off       # 切換 emergency_bypass 並 reload
-kekkai top                 # 純 text top-N（TUI 外的 script 友善版本）
-kekkai stats               # 印 stats.txt 一次
-```
+| 指令 | 規劃 milestone | 說明 |
+|---|---|---|
+| `kekkai block <ip> [--ttl]`   | M6 | 寫入 `dyn_blocklist_v4` 即時封鎖 |
+| `kekkai unblock <ip>`         | M6 | 從動態黑名單移除 |
+| `kekkai bypass on\|off`       | M7 | 切 `runtime.emergency_bypass` + reload |
+| `kekkai logs [-f] [-n N]`     | M7 | `journalctl -u kekkai-agent` 包裝 |
+| `kekkai start/stop/restart/reload/enable/disable` | M7 | systemctl 包裝 |
+| `kekkai stats`                | M7 | 印 `stats.txt` 一次（script 友善） |
 
-M5 / M6 / M7 會陸續補齊。這次 (Phase 1) 先有 `status` / `check` / `show` / `backup` / `version` / `help`。
+`kekkai update` 目前由 `./kekkai.sh update`（或 `make update`）提供，未來 M7 會把它整進 `kekkai` CLI。M4 / M5 / M6 / M7 會陸續補齊上表。

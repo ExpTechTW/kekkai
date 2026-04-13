@@ -6,8 +6,9 @@ CLI_PKG   := ./cmd/kekkai
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 
-.PHONY: all bpf build build-agent build-cli build-linux vet test clean run \
-        update update-check config-check config-backup config-show status
+.PHONY: all bpf build build-agent build-cli build-linux vet test clean run status \
+        install update repair doctor uninstall \
+        config-check config-backup config-show
 
 all: bpf build
 
@@ -41,11 +42,24 @@ status: build-cli
 clean:
 	rm -rf bin internal/loader/bpf/xdp_filter.o
 
-update:
-	@bash scripts/update.sh
+# ---------- one-script installer wrappers ----------
+# Every lifecycle action goes through ./kekkai.sh so there is one
+# source of truth for install / update / repair / doctor / uninstall.
 
-update-check:
-	@bash scripts/update.sh --check-only
+install:
+	@bash ./kekkai.sh install
+
+update:
+	@bash ./kekkai.sh update
+
+repair:
+	@bash ./kekkai.sh repair
+
+doctor:
+	@bash ./kekkai.sh doctor
+
+uninstall:
+	@bash ./kekkai.sh uninstall
 
 # ---------- config management ----------
 CFG ?= /etc/kekkai/kekkai.yaml

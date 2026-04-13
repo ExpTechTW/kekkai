@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/ExpTechTW/kekkai/internal/config"
+	"github.com/ExpTechTW/kekkai/internal/doctor"
 	"github.com/ExpTechTW/kekkai/internal/tui"
 )
 
@@ -46,6 +47,8 @@ func main() {
 		os.Exit(runWafEdge(append([]string{"-backup"}, resolveConfigArg(args)...)...))
 	case "reset":
 		os.Exit(runWafEdge(buildResetArgs(args)...))
+	case "doctor":
+		os.Exit(cmdDoctor())
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -147,6 +150,27 @@ func cmdStatus(args []string) int {
 	return 0
 }
 
+// cmdDoctor runs every health check and prints a coloured report.
+// Exit code 0 = healthy or warnings only, 1 = at least one error.
+func cmdDoctor() int {
+	r := doctor.Run()
+	r.Render(os.Stdout, stdoutIsTerminal())
+	return r.ExitCode()
+}
+
+// stdoutIsTerminal returns true if stdout looks like a TTY and NO_COLOR
+// is not set. Kept local so the doctor package stays stdlib-only.
+func stdoutIsTerminal() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 func cmdVersion() {
 	fmt.Printf("kekkai %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
 	// Also print kekkai-agent's version if available.
@@ -175,10 +199,12 @@ Commands:
   backup [config]            write a timestamped manual backup of the config file
   reset  [config] [--iface]  overwrite config with a fresh default template
                              (existing file is backed up first; auto-detects iface)
+  doctor                     run read-only health checks and print a report
   version                    show version information
   help                       show this message
 
 Run reset via sudo when the config lives under /etc/kekkai.
+Run doctor to diagnose common installation/runtime problems.
 
 See COMMAND_ZH.md for the full operator handbook (in Chinese).`)
 }
