@@ -44,6 +44,8 @@ func main() {
 		os.Exit(runWafEdge(append([]string{"-show"}, resolveConfigArg(args)...)...))
 	case "backup":
 		os.Exit(runWafEdge(append([]string{"-backup"}, resolveConfigArg(args)...)...))
+	case "reset":
+		os.Exit(runWafEdge(buildResetArgs(args)...))
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -62,6 +64,33 @@ func resolveConfigArg(args []string) []string {
 		path = args[0]
 	}
 	return []string{"-config", path}
+}
+
+// buildResetArgs parses `kekkai reset [path] [--iface name]` into the flag
+// list consumed by `kekkai-agent -reset`. Positional arguments are
+// accepted in either order as long as non-flag tokens are the config
+// path.
+func buildResetArgs(args []string) []string {
+	path := defaultConfigPath
+	iface := ""
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch a {
+		case "--iface", "-iface", "-i":
+			if i+1 < len(args) {
+				iface = args[i+1]
+				i++
+			}
+		default:
+			// first non-flag arg is the config path
+			path = a
+		}
+	}
+	out := []string{"-reset", "-config", path}
+	if iface != "" {
+		out = append(out, "-iface", iface)
+	}
+	return out
 }
 
 // runWafEdge execs the daemon binary with the given flags and forwards
@@ -140,12 +169,16 @@ Usage:
   kekkai <command> [args]
 
 Commands:
-  status [config]     launch the live TUI (default: /etc/kekkai/kekkai.yaml)
-  check  [config]     validate a config file (wrapper for kekkai-agent -check)
-  show   [config]     print the normalised config (wrapper for kekkai-agent -show)
-  backup [config]     write a timestamped manual backup of the config file
-  version             show version information
-  help                show this message
+  status [config]            launch the live TUI (default: /etc/kekkai/kekkai.yaml)
+  check  [config]            validate a config file (read-only; safe as non-root)
+  show   [config]            print the normalised config after migration
+  backup [config]            write a timestamped manual backup of the config file
+  reset  [config] [--iface]  overwrite config with a fresh default template
+                             (existing file is backed up first; auto-detects iface)
+  version                    show version information
+  help                       show this message
+
+Run reset via sudo when the config lives under /etc/kekkai.
 
 See COMMAND_ZH.md for the full operator handbook (in Chinese).`)
 }

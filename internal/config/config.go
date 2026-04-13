@@ -113,13 +113,35 @@ type LoadResult struct {
 	NormalizeLog []string
 }
 
-// Load is the high-level entry point. It reads the file, parses the
-// version, migrates if needed (writing a backup first), applies defaults,
-// validates, normalizes, and returns the result.
+// LoadOptions tune the loader for different CLI entry points.
+type LoadOptions struct {
+	// ReadOnly skips both the migration backup and the on-disk rewrite.
+	// Validation and normalisation still run against the migrated value
+	// in memory, so a bad config still surfaces as an error — but the
+	// filesystem is never touched. Used by -check and -show.
+	ReadOnly bool
+}
+
+// Load is the high-level entry point for the running daemon. It reads
+// the file, parses the version, migrates if needed (writing a backup
+// first), applies defaults, validates, normalizes, and returns the result.
 //
 // On migration the on-disk file is rewritten to the new schema and the
-// previous contents are saved to edge.yaml.update_backup.<ts>.
+// previous contents are saved to <path>.update_backup.<ts>.
 func Load(path string) (*LoadResult, error) {
+	return LoadWith(path, LoadOptions{})
+}
+
+// LoadReadOnly is like Load but never touches the filesystem. Intended
+// for `kekkai check` / `kekkai show` where we don't want non-root users
+// (or strict systemd sandboxes) to choke on a missing write permission
+// when the config happens to need migration.
+func LoadReadOnly(path string) (*LoadResult, error) {
+	return LoadWith(path, LoadOptions{ReadOnly: true})
+}
+
+// LoadWith is the underlying implementation shared by Load and LoadReadOnly.
+func LoadWith(path string, opts LoadOptions) (*LoadResult, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
@@ -141,8 +163,9 @@ func Load(path string) (*LoadResult, error) {
 		FromVersion: fromVersion,
 	}
 
-	// If we migrated, persist the new form and back up the original.
-	if migrated {
+	// Persist migration only in read/write mode. Read-only mode keeps
+	// the in-memory migrated value for validation but never writes.
+	if migrated && !opts.ReadOnly {
 		backupPath, err := backupFile(path, BackupKindUpdate)
 		if err != nil {
 			return nil, fmt.Errorf("migration backup: %w", err)

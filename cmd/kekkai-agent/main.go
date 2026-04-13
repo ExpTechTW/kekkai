@@ -31,17 +31,19 @@ func main() {
 	check := flag.Bool("check", false, "validate config and exit (non-zero on error)")
 	show := flag.Bool("show", false, "print the normalised config after migration and exit")
 	backup := flag.Bool("backup", false, "write a timestamped manual backup of -config and exit")
+	reset := flag.Bool("reset", false, "overwrite -config with a fresh default template (backs up any existing file)")
+	resetIface := flag.String("iface", "", "network interface for -reset (auto-detected if empty)")
 	flag.Parse()
 
 	// Mutually exclusive run modes.
 	modeCount := 0
-	for _, b := range []bool{*check, *show, *backup} {
+	for _, b := range []bool{*check, *show, *backup, *reset} {
 		if b {
 			modeCount++
 		}
 	}
 	if modeCount > 1 {
-		fmt.Fprintln(os.Stderr, "-check, -show, and -backup are mutually exclusive")
+		fmt.Fprintln(os.Stderr, "-check, -show, -backup, and -reset are mutually exclusive")
 		os.Exit(2)
 	}
 
@@ -52,6 +54,8 @@ func main() {
 		os.Exit(runShow(*cfgPath))
 	case *backup:
 		os.Exit(runBackup(*cfgPath))
+	case *reset:
+		os.Exit(runReset(*cfgPath, *resetIface))
 	}
 
 	if err := run(*cfgPath); err != nil {
@@ -59,16 +63,18 @@ func main() {
 	}
 }
 
-// runCheck validates a config file without attaching anything.
+// runCheck validates a config file without touching the filesystem.
+// Uses LoadReadOnly so a v1→v2 migration is simulated in memory and the
+// on-disk file is never rewritten — non-root users can check safely.
 func runCheck(path string) int {
-	res, err := config.Load(path)
+	res, err := config.LoadReadOnly(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config invalid: %v\n", err)
 		return 1
 	}
 	if res.Migrated {
-		fmt.Printf("migrated v%d → v%d (backup: %s)\n",
-			res.FromVersion, config.CurrentVersion, res.BackupPath)
+		fmt.Printf("would migrate v%d → v%d on daemon start\n",
+			res.FromVersion, config.CurrentVersion)
 	}
 	for _, line := range res.NormalizeLog {
 		fmt.Printf("normalize: %s\n", line)
@@ -78,9 +84,9 @@ func runCheck(path string) int {
 }
 
 // runShow prints the fully normalised config (post-migrate, post-default,
-// post-normalize) to stdout. Useful for "what is the agent actually seeing".
+// post-normalize) to stdout. Read-only — never writes the filesystem.
 func runShow(path string) int {
-	res, err := config.Load(path)
+	res, err := config.LoadReadOnly(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config invalid: %v\n", err)
 		return 1
@@ -105,6 +111,161 @@ func runBackup(path string) int {
 	}
 	fmt.Printf("backup written: %s\n", dst)
 	return 0
+}
+
+// runReset writes a fresh default config template to path. Any existing
+// file is first copied to <path>.backup.<ts> (manual backup kind) so the
+// user can always roll back. Requires root to write under /etc/kekkai.
+//
+// If iface is empty we try to auto-detect the default-route interface so
+// the template is immediately useful; callers can still override with
+// -iface at the command line.
+func runReset(path, iface string) int {
+	if iface == "" {
+		iface = detectDefaultIface()
+	}
+	if iface == "" {
+		fmt.Fprintln(os.Stderr, "reset: could not auto-detect interface; pass -iface <name>")
+		return 1
+	}
+
+	// Backup existing file (if any) before overwriting.
+	if _, err := os.Stat(path); err == nil {
+		dst, err := config.BackupFile(path, config.BackupKindManual)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reset: failed to back up existing config: %v\n", err)
+			return 1
+		}
+		fmt.Printf("existing config backed up: %s\n", dst)
+	}
+
+	if err := os.MkdirAll(filepathDir(path), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "reset: mkdir: %v\n", err)
+		return 1
+	}
+
+	hostname, _ := os.Hostname()
+	template := defaultConfigTemplate(hostname, iface)
+	if err := os.WriteFile(path, []byte(template), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "reset: write: %v\n", err)
+		return 1
+	}
+	fmt.Printf("default config written: %s\n", path)
+	fmt.Printf("iface=%s — review filter.ingress_allowlist before starting the agent\n", iface)
+	return 0
+}
+
+// detectDefaultIface reads /proc/net/route and returns the interface the
+// default route uses, or "" on failure.
+func detectDefaultIface() string {
+	data, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return ""
+	}
+	for _, line := range splitLines(string(data)) {
+		fields := splitFields(line)
+		// Iface Destination Gateway Flags ...
+		// Destination == 00000000 means default route.
+		if len(fields) >= 2 && fields[1] == "00000000" {
+			return fields[0]
+		}
+	}
+	return ""
+}
+
+// defaultConfigTemplate renders the same default config shape that
+// bootstrap.sh writes for a fresh install. Kept in the binary so `reset`
+// works even when the repo isn't checked out on the host.
+func defaultConfigTemplate(hostname, iface string) string {
+	if hostname == "" {
+		hostname = "edge-01"
+	}
+	return `version: 2
+
+node:
+  id: ` + hostname + `
+  region: default
+
+interface:
+  name: ` + iface + `
+  xdp_mode: generic
+
+runtime:
+  emergency_bypass: false
+  perip_table_size: 65536
+
+observability:
+  stats_file: /var/run/kekkai/stats.txt
+
+security:
+  enforce_ssh_private: true
+  allow_ssh_public: false
+
+filter:
+  public:
+    tcp: [80, 443]
+    udp: []
+  private:
+    tcp: []
+    udp: []
+  # REQUIRED: add your management network here before restarting the agent,
+  # or enforce_ssh_private will lock SSH out when port 22 is auto-added to
+  # private.tcp.
+  ingress_allowlist: []
+  static_blocklist: []
+`
+}
+
+// filepathDir is a trivial split to avoid importing path/filepath for
+// one call. Kept local so the rest of this file can stay small.
+func filepathDir(p string) string {
+	i := len(p) - 1
+	for i >= 0 && p[i] != '/' {
+		i--
+	}
+	if i < 0 {
+		return "."
+	}
+	if i == 0 {
+		return "/"
+	}
+	return p[:i]
+}
+
+func splitLines(s string) []string {
+	out := []string{}
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		out = append(out, s[start:])
+	}
+	return out
+}
+
+func splitFields(s string) []string {
+	out := []string{}
+	start := -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		space := c == ' ' || c == '\t'
+		if space {
+			if start >= 0 {
+				out = append(out, s[start:i])
+				start = -1
+			}
+		} else if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 {
+		out = append(out, s[start:])
+	}
+	return out
 }
 
 // agent bundles all the subsystems main() wires together so reload can
