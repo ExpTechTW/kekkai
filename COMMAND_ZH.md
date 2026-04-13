@@ -34,19 +34,20 @@ kekkai status /path/to/kekkai.yaml           # 指定 config 路徑
 sudo kekkai status
 ```
 
-**畫面分三頁**
+**畫面分四頁**
 
 | 頁 | 內容 |
 |---|---|
 | 1. Overview | RX / TX、協定速率、drop 原因摘要、top 5 IP |
 | 2. Detail | 完整計數、每個 drop/pass reason 的 slot 值 |
 | 3. Top-N | 整張 perip_v4 map 的 src IP 排行，支援上下捲動 |
+| 4. Charts | 最近 120 秒 PPS/DPS/TCP/UDP/ICMP 走勢圖 |
 
 **鍵盤**
 
 | 鍵 | 動作 |
 |---|---|
-| `1` / `2` / `3` | 切到對應頁 |
+| `1` / `2` / `3` / `4` | 切到對應頁 |
 | `Tab` / `Shift+Tab` | 前/後循環切頁 |
 | `p` | 暫停刷新（再按一次恢復） |
 | `↑` / `↓` / `j` / `k` | Top-N 頁上下選列 |

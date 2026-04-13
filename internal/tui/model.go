@@ -14,6 +14,8 @@ const (
 	PageOverview Page = iota
 	PageDetail
 	PageTopN
+	PageCharts
+	pageCount
 )
 
 // Model is the Bubble Tea state machine. It polls the Source on a fixed
@@ -31,6 +33,11 @@ type Model struct {
 	width, height int
 	topCursor     int  // selected row index on PageTopN
 	paused        bool // `p` freezes the display
+	ppsHist       []float64
+	dpsHist       []float64
+	tcpHist       []float64
+	udpHist       []float64
+	icmpHist      []float64
 
 	// startup metadata
 	startedAt time.Time
@@ -50,6 +57,11 @@ func NewModel(src *Source, nodeID, iface, xdpMode string) *Model {
 		nodeID:    nodeID,
 		iface:     iface,
 		xdpMode:   xdpMode,
+		ppsHist:   make([]float64, 0, 120),
+		dpsHist:   make([]float64, 0, 120),
+		tcpHist:   make([]float64, 0, 120),
+		udpHist:   make([]float64, 0, 120),
+		icmpHist:  make([]float64, 0, 120),
 	}
 }
 
@@ -113,6 +125,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		s := msg.snap
 		m.cur = &s
+		m.pushHistory(s)
 		// Clamp top cursor after data changes.
 		if m.cur != nil && m.topCursor >= len(m.cur.Top) {
 			m.topCursor = len(m.cur.Top) - 1
@@ -136,10 +149,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.page = PageDetail
 	case "3":
 		m.page = PageTopN
+	case "4":
+		m.page = PageCharts
 	case "tab":
-		m.page = (m.page + 1) % 3
+		m.page = (m.page + 1) % pageCount
 	case "shift+tab":
-		m.page = (m.page + 2) % 3
+		m.page = (m.page + pageCount - 1) % pageCount
 
 	case "p":
 		m.paused = !m.paused
@@ -165,6 +180,26 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *Model) pushHistory(s Snapshot) {
+	m.ppsHist = pushSeries(m.ppsHist, s.PPS, 120)
+	m.dpsHist = pushSeries(m.dpsHist, s.DPS, 120)
+	m.tcpHist = pushSeries(m.tcpHist, s.PpsTCP, 120)
+	m.udpHist = pushSeries(m.udpHist, s.PpsUDP, 120)
+	m.icmpHist = pushSeries(m.icmpHist, s.PpsICMP, 120)
+}
+
+func pushSeries(series []float64, v float64, max int) []float64 {
+	if v < 0 {
+		v = 0
+	}
+	series = append(series, v)
+	if len(series) > max {
+		copy(series, series[len(series)-max:])
+		series = series[:max]
+	}
+	return series
 }
 
 // uptime formats how long the TUI itself has been running. The agent

@@ -185,7 +185,7 @@ Makefile alias：`make install` / `make update` / `make repair` / `make doctor` 
 
 即時監控（TUI，取代 `watch -n 1 cat`）：
 ```bash
-sudo kekkai status                     # 彩色 TUI，1/2/3 切頁，q 退出
+sudo kekkai status                     # 彩色 TUI，1/2/3/4 切頁，q 退出
 ```
 
 重載規則（不中斷過濾）：
@@ -200,7 +200,7 @@ Kekkai 分成兩個 binary：`kekkai-agent` 是 daemon（systemd 管），`kekka
 
 | 指令 | 用途 |
 |---|---|
-| `kekkai status`   | 啟動互動式 TUI（3 頁：Overview / Detail / Top-N） |
+| `kekkai status`   | 啟動互動式 TUI（4 頁：Overview / Detail / Top-N / Charts） |
 | `kekkai doctor`   | 跑全套健康檢查並印彩色報告（read-only） |
 | `kekkai check`    | 驗證 config，**read-only** 非 root 也能跑 |
 | `kekkai ports`    | 彩色列出 public/private port 與 SSH 暴露狀態 |

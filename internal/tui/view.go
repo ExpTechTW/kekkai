@@ -109,6 +109,8 @@ func (m *Model) View() string {
 		body = m.viewDetail()
 	case PageTopN:
 		body = m.viewTopN()
+	case PageCharts:
+		body = m.viewCharts()
 	}
 
 	return strings.Join([]string{
@@ -173,8 +175,8 @@ func (m *Model) viewHeader() string {
 }
 
 func (m *Model) viewTabs() string {
-	tabs := []string{"[1] Overview", "[2] Detail", "[3] Top-N"}
-	out := make([]string, 3)
+	tabs := []string{"[1] Overview", "[2] Detail", "[3] Top-N", "[4] Charts"}
+	out := make([]string, len(tabs))
 	for i, t := range tabs {
 		if Page(i) == m.page {
 			out[i] = tabActive.Render(t)
@@ -186,7 +188,7 @@ func (m *Model) viewTabs() string {
 }
 
 func (m *Model) viewFooter() string {
-	help := "[1/2/3] page  [Tab] cycle  [p] pause  [↑↓] scroll  [q] quit"
+	help := "[1/2/3/4] page  [Tab] cycle  [p] pause  [↑↓] scroll  [q] quit"
 	if m.errMsg != "" {
 		help = criticalStyle.Render("⚠ "+m.errMsg) + "   " + help
 	}
@@ -398,6 +400,37 @@ func (m *Model) viewTopN() string {
 	return "\n" + box + "\n" + hint + "\n"
 }
 
+func (m *Model) viewCharts() string {
+	s := m.cur
+	if s == nil {
+		return "\n"
+	}
+	w := m.width - 28
+	if w < 32 {
+		w = 32
+	}
+	if w > 96 {
+		w = 96
+	}
+
+	trafficBox := boxStyle.Render(strings.Join([]string{
+		titleStyle.Render("◈ Traffic trend (last 120s)"),
+		renderSeriesLine("pps total ", m.ppsHist, w, cCyan, s.PPS),
+		renderSeriesLine("pps drop  ", m.dpsHist, w, cDanger, s.DPS),
+		dimStyle.Render("left=old  right=now"),
+	}, "\n"))
+
+	protoBox := boxStyle.Render(strings.Join([]string{
+		titleStyle.Render("◈ Protocol trend (last 120s)"),
+		renderSeriesLine("tcp pps   ", m.tcpHist, w, cPass, s.PpsTCP),
+		renderSeriesLine("udp pps   ", m.udpHist, w, cWarn, s.PpsUDP),
+		renderSeriesLine("icmp pps  ", m.icmpHist, w, cMagenta, s.PpsICMP),
+		dimStyle.Render("adaptive scale per line"),
+	}, "\n"))
+
+	return "\n" + trafficBox + "\n" + protoBox + "\n"
+}
+
 // ---------- helpers -------------------------------------------------------
 
 func renderTopBox(s *Snapshot, limit, cursor int) string {
@@ -451,3 +484,54 @@ func fmtNum(v float64) string    { return stats.FormatRate(v) }
 func humanBits(v float64) string { return stats.HumanBits(v) }
 func humanBytes(v uint64) string { return stats.HumanBytes(v) }
 func protoName(p uint8) string   { return stats.ProtoName(p) }
+
+func renderSeriesLine(label string, series []float64, width int, color lipgloss.Color, latest float64) string {
+	graph := sparkline(series, width, color)
+	val := valueStyle.Render(fmtNum(latest))
+	return labelStyle.Width(10).Render(label) + graph + "  " + val
+}
+
+func sparkline(series []float64, width int, color lipgloss.Color) string {
+	if width <= 0 {
+		return ""
+	}
+	if len(series) == 0 {
+		return dimStyle.Render(strings.Repeat("·", width))
+	}
+	blocks := []rune("▁▂▃▄▅▆▇█")
+	// Downsample to requested width.
+	sampled := make([]float64, width)
+	if len(series) <= width {
+		start := width - len(series)
+		for i := 0; i < start; i++ {
+			sampled[i] = 0
+		}
+		copy(sampled[start:], series)
+	} else {
+		for i := 0; i < width; i++ {
+			src := int(float64(i) * float64(len(series)-1) / float64(width-1))
+			sampled[i] = series[src]
+		}
+	}
+	maxV := 0.0
+	for _, v := range sampled {
+		if v > maxV {
+			maxV = v
+		}
+	}
+	if maxV <= 0 {
+		return dimStyle.Render(strings.Repeat("·", width))
+	}
+	var b strings.Builder
+	for _, v := range sampled {
+		level := int((v / maxV) * float64(len(blocks)-1))
+		if level < 0 {
+			level = 0
+		}
+		if level >= len(blocks) {
+			level = len(blocks) - 1
+		}
+		b.WriteRune(blocks[level])
+	}
+	return lipgloss.NewStyle().Foreground(color).Render(b.String())
+}
