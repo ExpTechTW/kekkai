@@ -34,7 +34,9 @@ test:
 	go test ./...
 
 run: build-agent
-	sudo ./bin/$(AGENT_BIN) -config ./deploy/kekkai.example.yaml
+	@mkdir -p /tmp/kekkai-run
+	@./bin/$(AGENT_BIN) -config /tmp/kekkai-run/kekkai.yaml -reset -iface lo >/dev/null 2>&1 || true
+	sudo ./bin/$(AGENT_BIN) -config /tmp/kekkai-run/kekkai.yaml
 
 status: build-cli
 	./bin/$(CLI_BIN) status

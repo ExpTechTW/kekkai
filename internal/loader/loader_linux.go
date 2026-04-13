@@ -24,7 +24,6 @@ const (
 
 	mapBlocklistV4     = "blocklist_v4"
 	mapAllowlistV4     = "allowlist_v4"
-	mapDynBlocklistV4  = "dyn_blocklist_v4"
 	mapPublicTCPPorts  = "public_tcp_ports"
 	mapPublicUDPPorts  = "public_udp_ports"
 	mapPrivateTCPPorts = "private_tcp_ports"
@@ -189,15 +188,14 @@ func (l *Loader) mapByName(name string) (*ebpf.Map, error) {
 	return m, nil
 }
 
-func (l *Loader) BlocklistMap() (*ebpf.Map, error)    { return l.mapByName(mapBlocklistV4) }
-func (l *Loader) AllowlistMap() (*ebpf.Map, error)    { return l.mapByName(mapAllowlistV4) }
-func (l *Loader) DynBlocklistMap() (*ebpf.Map, error) { return l.mapByName(mapDynBlocklistV4) }
-func (l *Loader) PublicTCPMap() (*ebpf.Map, error)    { return l.mapByName(mapPublicTCPPorts) }
-func (l *Loader) PublicUDPMap() (*ebpf.Map, error)    { return l.mapByName(mapPublicUDPPorts) }
-func (l *Loader) PrivateTCPMap() (*ebpf.Map, error)   { return l.mapByName(mapPrivateTCPPorts) }
-func (l *Loader) PrivateUDPMap() (*ebpf.Map, error)   { return l.mapByName(mapPrivateUDPPorts) }
-func (l *Loader) StatsMap() (*ebpf.Map, error)        { return l.mapByName(mapStats) }
-func (l *Loader) PerIPMap() (*ebpf.Map, error)        { return l.mapByName(mapPerIPv4) }
+func (l *Loader) BlocklistMap() (*ebpf.Map, error)  { return l.mapByName(mapBlocklistV4) }
+func (l *Loader) AllowlistMap() (*ebpf.Map, error)  { return l.mapByName(mapAllowlistV4) }
+func (l *Loader) PublicTCPMap() (*ebpf.Map, error)  { return l.mapByName(mapPublicTCPPorts) }
+func (l *Loader) PublicUDPMap() (*ebpf.Map, error)  { return l.mapByName(mapPublicUDPPorts) }
+func (l *Loader) PrivateTCPMap() (*ebpf.Map, error) { return l.mapByName(mapPrivateTCPPorts) }
+func (l *Loader) PrivateUDPMap() (*ebpf.Map, error) { return l.mapByName(mapPrivateUDPPorts) }
+func (l *Loader) StatsMap() (*ebpf.Map, error)      { return l.mapByName(mapStats) }
+func (l *Loader) PerIPMap() (*ebpf.Map, error)      { return l.mapByName(mapPerIPv4) }
 
 // SetBypass transitions the running agent between attached and bypassed
 // states without tearing down the eBPF collection.
@@ -215,13 +213,4 @@ func (l *Loader) SetBypass(bypass bool) error {
 		return fmt.Errorf("program %s not found", progName)
 	}
 	return li.attachLink(prog)
-}
-
-// Attached reports whether the XDP link is currently installed on the iface.
-func (l *Loader) Attached() bool {
-	li, ok := l.impl.(*linuxImpl)
-	if !ok {
-		return false
-	}
-	return li.lnk != nil && !li.bypassed
 }

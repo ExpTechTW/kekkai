@@ -58,7 +58,7 @@ sudo kekkai status
 
 ### 2.2 kekkai check
 
-驗證 config 檔後退出，**完全 read-only**，不動任何磁碟檔案。遇到舊版 v1 會在 memory 做一次遷移跑 validate，印 `would migrate v1 → v2 on daemon start`，但**不寫回**。
+驗證 config 檔後退出，**完全 read-only**，不動任何磁碟檔案。純 memory 驗證，非 root 也能跑。未來 schema 升版時這裡會印「would migrate on daemon start」但仍不寫回。
 
 ```bash
 kekkai check                               # 驗 /etc/kekkai/kekkai.yaml
@@ -126,7 +126,7 @@ sudo systemctl restart kekkai-agent
 **適用情境**
 - config 被改壞了想從頭來
 - 升級 schema 後發現遷移結果不理想，想用全新 template 重來
-- 第一次安裝不想抄 deploy/kekkai.example.yaml
+- 第一次安裝不想抄 internal/config/default.yaml
 
 ### 2.6 kekkai doctor
 
@@ -286,31 +286,29 @@ sudo systemctl reload kekkai-agent
 ### 5.1 位置
 
 - 正式：`/etc/kekkai/kekkai.yaml`
-- 範例：`deploy/kekkai.example.yaml`（repo 內，中英註解完整）
+- Canonical template：`internal/config/default.yaml`（repo 內，中英註解完整）
+  - 編譯時用 `go:embed` 打包進 binary；部署到目標機器不需要 repo
+  - `kekkai reset` 就是把這份 template 經過 `Render(values)` 字串替換產生
 
 ### 5.2 Schema 版本
 
-頂層必有 `version: 2`。載入舊版（`version: 1` 或沒寫 version）會自動遷移並寫回，原檔備份成 `kekkai.yaml.update_backup.<時戳>`。
+頂層必有 `version: 1`。這是初版 schema，還沒有發生過 breaking change，所以**目前沒有實際的 migration 發生**。載入 `version: 2+` 的檔案會直接拒絕啟動。
 
-v1 (M3 平坦) → v2 (巢狀) 對照：
+未來第一次要改 schema 時，`internal/config/migrate.go` 會加一個新的 case：
 
-```
-v1                          →  v2
-node_id                        node.id
-region                         node.region
-iface                          interface.name
-stats_path                     observability.stats_file
-perip_max_entries              runtime.perip_table_size
-static_blocklist               filter.static_blocklist
-(無)                           filter.public / private / ingress_allowlist / security.*
+```go
+case 1:  // v1 → v2
+    oldDoc := parseV1(data)
+    values := translateValuesToV2(oldDoc)
+    return parseCurrent([]byte(Render(values)))
 ```
 
-v1 沒有 `filter.public/private/ingress_allowlist`，遷移用保守預設：`public.tcp: [80,443]`、其他空。結果 SSH 會被擋，agent 拒絕啟動，強迫你看 migration log。
+因為 template 是共用的，migration 輸出**自動帶完整註解**。舊檔會備份成 `kekkai.yaml.update_backup.<時戳>` 再寫回。
 
 ### 5.3 完整結構
 
 ```yaml
-version: 2
+version: 1
 
 node:
   id: edge-01                # 預設 hostname
@@ -333,16 +331,17 @@ security:
 
 filter:
   public:
-    tcp: [80, 443]           # 任何來源可連
-    udp: [53]
+    tcp:
+      - 80
+      - 443
+    udp:
   private:
-    tcp: []                  # 22 會被 normalize 自動加
-    udp: []
+    tcp:                     # 22 會被 normalize 自動加
+    udp:
   ingress_allowlist:         # private 服務的來源白名單
     - 10.0.0.0/8
     - 192.168.0.0/16
-    - 100.64.0.0/10
-  static_blocklist: []       # 靜態黑名單，不管 port
+  static_blocklist:          # 靜態黑名單，不管 port
 ```
 
 ### 5.4 過濾流程
@@ -392,7 +391,7 @@ Load / reload 都會跑：
 
 | Kind | 觸發 | 檔名範例 |
 |---|---|---|
-| `update_backup` | 自動遷移（版本升級） | `kekkai.yaml.update_backup.20260414T052301` |
+| `update_backup` | 未來 schema migration 時自動寫 | `kekkai.yaml.update_backup.20260414T052301` |
 | `auto_backup` | Reload 且 config struct 有變（DeepEqual 比對） | `kekkai.yaml.auto_backup.20260414T052450` |
 | `backup` | 手動 `kekkai backup` | `kekkai.yaml.backup.20260414T052733` |
 
@@ -582,7 +581,7 @@ journalctl -u kekkai-agent -n 30 --no-pager
 
 ### 9.6 Config 遷移後拒絕啟動
 
-v1 → v2 遷移完 agent 故意拒絕啟動（保守預設 + SSH 防護），強迫你確認新 config。照 log 訊息改 `filter.*` 和 `ingress_allowlist`，`kekkai check` 驗證後 `systemctl start kekkai-agent`。
+目前 schema 是 v1，沒有實際的 migration 發生。如果看到 `unsupported config version: N` 代表手上這份 config 是用更新的 binary 寫出的 — 可能剛降級了 binary。修法是把 binary 升回去，或跑 `sudo kekkai reset` 重置成現行 schema。
 
 ---
 

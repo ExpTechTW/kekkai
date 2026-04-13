@@ -6,27 +6,25 @@
 # ZH: 驗證採嚴格模式。未知欄位、非法 port、壞 CIDR、或會鎖掉 SSH 的規則
 #     都會讓 agent 拒絕啟動。可用 `kekkai check <path>` 離線驗證。
 #
-# EN: Schema version. On load, older versions are auto-migrated and the
-#     previous file is copied to kekkai.yaml.update_backup.<timestamp>.
-# ZH: Schema 版本號。載入時舊版會自動升級，原始檔案會備份到
-#     kekkai.yaml.update_backup.<時戳>，總共保留最新 10 份。
-version: 2
+# EN: Schema version. Reserved for future migrations.
+# ZH: Schema 版本號。保留給未來的 migration 機制使用。
+version: 1
 
 # ---------- identity ----------
 node:
   # EN: Node identifier. Defaults to hostname if empty.
   # ZH: 節點識別。留空自動用 hostname。
-  id: edge-01
+  id: __NODE_ID__
 
   # EN: Region label consumed by future NATS integration.
   # ZH: 區域標籤，供未來 NATS 整合使用。
-  region: default
+  region: __NODE_REGION__
 
 # ---------- network interface ----------
 interface:
   # EN: REQUIRED. XDP attaches here.
   # ZH: 必填。XDP 會 attach 到這張網卡。
-  name: eth0
+  name: __INTERFACE_NAME__
 
   # EN: generic | driver | offload
   #     - generic: works everywhere, slowest (RPi macb/bcmgenet are here)
@@ -39,7 +37,7 @@ interface:
   #     - driver:  native XDP，要網卡 driver 支援
   #     - offload: 用 SmartNIC 硬體 (很少見)
   #     driver 失敗時會自動降級回 generic。
-  xdp_mode: generic
+  xdp_mode: __INTERFACE_XDP_MODE__
 
 # ---------- runtime toggles ----------
 runtime:
@@ -49,7 +47,7 @@ runtime:
   #     re-enable once the config is fixed.
   # ZH: 緊急旁路。true = 載入 eBPF 但不 attach 到網卡。規則懷疑有問題時
   #     透過 SIGHUP 切 true 快速恢復網路，不必 stop service。
-  emergency_bypass: false
+  emergency_bypass: __RUNTIME_EMERGENCY_BYPASS__
 
   # EN: Size of the per-source-IPv4 LRU hash used for statistics (not
   #     filtering). ~64 bytes per entry kernel memory. Power of 2 recommended.
@@ -59,14 +57,14 @@ runtime:
   #     Changing this value requires a full restart.
   # ZH: per-source-IPv4 LRU hash 容量 (統計用，不是過濾用)。每筆 ~64 B
   #     kernel 記憶體。建議用 2 的次方。修改需重啟 agent。
-  perip_table_size: 65536
+  perip_table_size: __RUNTIME_PERIP_TABLE_SIZE__
 
 # ---------- observability ----------
 observability:
   # EN: Human-readable stats snapshot. Monitor with:
   #       watch -n 1 cat /var/run/kekkai/stats.txt
   # ZH: 人類可讀的統計快照檔。用 `watch -n 1 cat <path>` 監看。
-  stats_file: /var/run/kekkai/stats.txt
+  stats_file: __OBSERVABILITY_STATS_FILE__
 
 # ---------- security ----------
 security:
@@ -77,7 +75,7 @@ security:
   # ZH: 強制把 SSH (port 22) 放進 filter.private.tcp。每次載入/reload 都
   #     檢查。user 沒寫的話會自動加入。搭配 ingress_allowlist 確保 SSH 不
   #     會意外暴露。設 false 才會完全由 user 自行決定 22 的處置。
-  enforce_ssh_private: true
+  enforce_ssh_private: __SECURITY_ENFORCE_SSH_PRIVATE__
 
   # EN: Allow SSH (port 22) to appear in filter.public.tcp. Default false —
   #     22 in public.tcp is a fatal validation error. Set true only for
@@ -86,7 +84,7 @@ security:
   # ZH: 允許 SSH (port 22) 出現在 filter.public.tcp。預設 false — 放 22
   #     在 public.tcp 會拒絕啟動。true 代表你明確知道要把 SSH 開給全網
   #     (bastion / honeypot / 測試機)，啟動時會印三行 WARN log。
-  allow_ssh_public: false
+  allow_ssh_public: __SECURITY_ALLOW_SSH_PUBLIC__
 
 # ---------- filter rules ----------
 #
@@ -129,8 +127,10 @@ filter:
     # EN: Services open to the public internet. Any source IP can connect
     #     except those in static_blocklist or the dynamic blocklist.
     # ZH: 對外開放的服務 port。任何來源都可連，但黑名單例外。
-    tcp: []
-    udp: []
+    tcp:
+__FILTER_PUBLIC_TCP__
+    udp:
+__FILTER_PUBLIC_UDP__
 
   private:
     # EN: Services only ingress_allowlist can reach. Everyone else dropped.
@@ -138,20 +138,26 @@ filter:
     #     true (the default).
     # ZH: 只允許 ingress_allowlist 連線的服務 port。其他全 DROP。
     #     security.enforce_ssh_private=true 時 22 會自動加進來。
-    tcp: []
-    udp: []
+    tcp:
+__FILTER_PRIVATE_TCP__
+    udp:
+__FILTER_PRIVATE_UDP__
 
   # EN: Allowlist for private ports. CIDR and single IPs both work — a bare
   #     address is treated as /32. Longest prefix match wins (LPM trie).
   # ZH: private port 的來源白名單。CIDR 與單 IP 都可 (裸 IP 視為 /32)。
   #     LPM trie 最長前綴匹配。
   ingress_allowlist:
-    - 192.168.0.0/16
+__FILTER_INGRESS_ALLOWLIST__
+    # - 192.168.0.0/16
+    # - 10.0.0.0/8
+    # - 100.64.0.0/10      # Tailscale
 
   # EN: Static blocklist. Matches any destination port. CIDRs or single IPs.
   #     Evaluated before any allow rules (static beats allowlist).
   # ZH: 靜態黑名單。不管 dst port，一律 DROP。支援 CIDR 與單 IP。
   #     在 allowlist 之前生效 (黑名單優先)。
-  static_blocklist: []
+  static_blocklist:
+__FILTER_STATIC_BLOCKLIST__
     # - 203.0.113.4
     # - 198.51.100.0/24

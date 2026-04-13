@@ -145,8 +145,14 @@ func runReset(path, iface string) int {
 	}
 
 	hostname, _ := os.Hostname()
-	template := defaultConfigTemplate(hostname, iface)
-	if err := os.WriteFile(path, []byte(template), 0o644); err != nil {
+	values := config.DefaultValues()
+	values.NodeID = hostname
+	if values.NodeID == "" {
+		values.NodeID = "edge-01"
+	}
+	values.InterfaceName = iface
+	rendered := config.Render(values)
+	if err := os.WriteFile(path, []byte(rendered), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "reset: write: %v\n", err)
 		return 1
 	}
@@ -171,49 +177,6 @@ func detectDefaultIface() string {
 		}
 	}
 	return ""
-}
-
-// defaultConfigTemplate renders the same default config shape that
-// bootstrap.sh writes for a fresh install. Kept in the binary so `reset`
-// works even when the repo isn't checked out on the host.
-func defaultConfigTemplate(hostname, iface string) string {
-	if hostname == "" {
-		hostname = "edge-01"
-	}
-	return `version: 2
-
-node:
-  id: ` + hostname + `
-  region: default
-
-interface:
-  name: ` + iface + `
-  xdp_mode: generic
-
-runtime:
-  emergency_bypass: false
-  perip_table_size: 65536
-
-observability:
-  stats_file: /var/run/kekkai/stats.txt
-
-security:
-  enforce_ssh_private: true
-  allow_ssh_public: false
-
-filter:
-  public:
-    tcp: [80, 443]
-    udp: []
-  private:
-    tcp: []
-    udp: []
-  # REQUIRED: add your management network here before restarting the agent,
-  # or enforce_ssh_private will lock SSH out when port 22 is auto-added to
-  # private.tcp.
-  ingress_allowlist: []
-  static_blocklist: []
-`
 }
 
 // filepathDir is a trivial split to avoid importing path/filepath for

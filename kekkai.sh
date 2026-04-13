@@ -431,8 +431,23 @@ validate_config_against_new_binary() {
   [[ -f "$CONFIG_FILE" ]] || return 0
   log "validating $CONFIG_FILE against new binary"
   if ! "$ROOT/bin/kekkai-agent" -check "$CONFIG_FILE" >/tmp/kekkai-check.log 2>&1; then
-    cat /tmp/kekkai-check.log >&2
-    die "new binary rejects current config — aborting install"
+    echo
+    err "new binary rejects current config:"
+    sed 's/^/    /' /tmp/kekkai-check.log >&2
+    echo
+    err "the installed config is incompatible with the new binary."
+    err "the old binary and service are still running untouched."
+    echo
+    info "to fix, one of:"
+    info "  1. edit the config:        sudo nano $CONFIG_FILE"
+    info "  2. reset to a clean template (backs up the broken file first):"
+    info "       sudo $ROOT/bin/kekkai-agent -reset -config $CONFIG_FILE"
+    info "     then edit to add filter.ingress_allowlist, and re-run:"
+    info "       bash ./kekkai.sh update"
+    info "  3. restore from an earlier backup:"
+    info "       ls /etc/kekkai/kekkai.yaml.*"
+    info "       sudo cp /etc/kekkai/kekkai.yaml.<kind>.<ts> $CONFIG_FILE"
+    exit 1
   fi
   log "config ok"
 }

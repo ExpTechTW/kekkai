@@ -18,13 +18,15 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 // CurrentVersion is the schema version this build writes and expects.
-const CurrentVersion = 2
+// Not yet bumped — the project has not shipped a breaking schema change.
+// The field is reserved so older agents can refuse to load future formats
+// and future agents know when to run migration.
+const CurrentVersion = 1
 
 const (
 	DefaultStatsFile      = "/var/run/kekkai/stats.txt"
@@ -227,27 +229,46 @@ func Parse(data []byte) (*Config, error) {
 	return cfg, nil
 }
 
-// Marshal serialises a Config back to YAML. The output is always in the
-// current schema version with stable field ordering.
+// Marshal serialises a Config back to YAML via the commented template.
+// This keeps the bilingual documentation attached to every field so users
+// who open the file after a reload see the same canonical shape they get
+// from `kekkai reset`. Callers typically use this after a successful
+// migration to write the migrated document back to disk.
 func Marshal(cfg *Config) ([]byte, error) {
-	out := *cfg
-	out.Version = CurrentVersion
-	var buf strings.Builder
-	enc := yaml.NewEncoder(stringBuilderWriter{&buf})
-	enc.SetIndent(2)
-	if err := enc.Encode(&out); err != nil {
-		return nil, err
-	}
-	if err := enc.Close(); err != nil {
-		return nil, err
-	}
-	return []byte(buf.String()), nil
+	return []byte(Render(ValuesFromConfig(cfg))), nil
 }
 
-type stringBuilderWriter struct{ sb *strings.Builder }
-
-func (w stringBuilderWriter) Write(p []byte) (int, error) {
-	return w.sb.Write(p)
+// ValuesFromConfig projects a validated Config onto the Values struct
+// that the template renderer understands. Defaults are applied to any
+// zero-valued fields so an in-memory Config built from partial YAML still
+// renders cleanly.
+func ValuesFromConfig(cfg *Config) Values {
+	enforce := true
+	if cfg.Security.EnforceSSHPrivate != nil {
+		enforce = *cfg.Security.EnforceSSHPrivate
+	}
+	hostname, _ := os.Hostname()
+	nodeID := cfg.Node.ID
+	if nodeID == "" {
+		nodeID = hostname
+	}
+	return Values{
+		NodeID:            nodeID,
+		NodeRegion:        cfg.Node.Region,
+		InterfaceName:     cfg.Interface.Name,
+		InterfaceXDPMode:  cfg.Interface.XDPMode,
+		EmergencyBypass:   cfg.Runtime.EmergencyBypass,
+		PerIPTableSize:    cfg.Runtime.PerIPTableSize,
+		StatsFile:         cfg.Observability.StatsFile,
+		EnforceSSHPrivate: enforce,
+		AllowSSHPublic:    cfg.Security.AllowSSHPublic,
+		PublicTCP:         cfg.Filter.Public.TCP,
+		PublicUDP:         cfg.Filter.Public.UDP,
+		PrivateTCP:        cfg.Filter.Private.TCP,
+		PrivateUDP:        cfg.Filter.Private.UDP,
+		IngressAllowlist:  cfg.Filter.IngressAllowlist,
+		StaticBlocklist:   cfg.Filter.StaticBlocklist,
+	}
 }
 
 // peekVersion extracts just the top-level `version:` field so we know what
