@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -62,13 +63,28 @@ func (l *linuxImpl) attach(ifaceIndex int, opts Options) error {
 		return fmt.Errorf("mkdir bpffs: %w", err)
 	}
 
-	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{PinPath: bpffsRoot},
-	})
+	// Clear any stale pins from a previous crash. We don't reuse pinned
+	// maps across restarts yet (future work for zero-downtime reload);
+	// for now a fresh collection owns fresh bpffs entries.
+	if err := clearStalePins(bpffsRoot); err != nil {
+		return fmt.Errorf("clear stale pins: %w", err)
+	}
+
+	// `ebpf.MapOptions{PinPath: ...}` only auto-pins maps whose spec
+	// carries a `Pinning: LIBBPF_PIN_BY_NAME` flag, which ours do not.
+	// We pin explicitly after the collection is built so operator tools
+	// (kekkai status, kekkai doctor) can read the maps via bpffs.
+	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
 		return fmt.Errorf("new collection: %w", err)
 	}
 	l.coll = coll
+
+	if err := pinMaps(coll, bpffsRoot); err != nil {
+		coll.Close()
+		l.coll = nil
+		return fmt.Errorf("pin maps: %w", err)
+	}
 
 	prog := coll.Programs[progName]
 	if prog == nil {
@@ -138,6 +154,42 @@ func (l *linuxImpl) close() error {
 		l.coll = nil
 	}
 	return firstErr
+}
+
+// pinMaps walks every map in the collection and pins it to bpffs under
+// <root>/<map-name>. Called right after NewCollection so subsequent
+// LoadPinnedMap() calls from CLI / TUI processes succeed.
+func pinMaps(coll *ebpf.Collection, root string) error {
+	for name, m := range coll.Maps {
+		path := filepath.Join(root, name)
+		if err := m.Pin(path); err != nil {
+			return fmt.Errorf("pin %s → %s: %w", name, path, err)
+		}
+	}
+	return nil
+}
+
+// clearStalePins removes leftover pin files from a previous run before
+// we create new ones. The cilium/ebpf Pin() call errors out if the path
+// already exists, so we wipe first. Only touches regular files directly
+// under root — doesn't recurse.
+func clearStalePins(root string) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(root, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func xdpFlags(mode string) link.XDPAttachFlags {
