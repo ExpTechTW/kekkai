@@ -95,6 +95,9 @@ func (s SecurityConfig) EnforceSSHPrivateValue() bool {
 type FilterConfig struct {
 	Public           PortGroup `yaml:"public"`
 	Private          PortGroup `yaml:"private"`
+	AllowICMP        *bool     `yaml:"allow_icmp"`
+	AllowARP         *bool     `yaml:"allow_arp"`
+	UDPEphemeralMin  uint16    `yaml:"udp_ephemeral_min"`
 	IngressAllowlist []string  `yaml:"ingress_allowlist"`
 	StaticBlocklist  []string  `yaml:"static_blocklist"`
 }
@@ -247,6 +250,14 @@ func ValuesFromConfig(cfg *Config) Values {
 	if cfg.Security.EnforceSSHPrivate != nil {
 		enforce = *cfg.Security.EnforceSSHPrivate
 	}
+	allowICMP := true
+	if cfg.Filter.AllowICMP != nil {
+		allowICMP = *cfg.Filter.AllowICMP
+	}
+	allowARP := true
+	if cfg.Filter.AllowARP != nil {
+		allowARP = *cfg.Filter.AllowARP
+	}
 	hostname, _ := os.Hostname()
 	nodeID := cfg.Node.ID
 	if nodeID == "" {
@@ -266,6 +277,9 @@ func ValuesFromConfig(cfg *Config) Values {
 		PublicUDP:         cfg.Filter.Public.UDP,
 		PrivateTCP:        cfg.Filter.Private.TCP,
 		PrivateUDP:        cfg.Filter.Private.UDP,
+		AllowICMP:         allowICMP,
+		AllowARP:          allowARP,
+		UDPEphemeralMin:   cfg.Filter.UDPEphemeralMin,
 		IngressAllowlist:  cfg.Filter.IngressAllowlist,
 		StaticBlocklist:   cfg.Filter.StaticBlocklist,
 	}
@@ -304,6 +318,17 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Observability.StatsFile == "" {
 		c.Observability.StatsFile = DefaultStatsFile
+	}
+	if c.Filter.AllowICMP == nil {
+		v := true
+		c.Filter.AllowICMP = &v
+	}
+	if c.Filter.AllowARP == nil {
+		v := true
+		c.Filter.AllowARP = &v
+	}
+	if c.Filter.UDPEphemeralMin == 0 {
+		c.Filter.UDPEphemeralMin = EPHEMERALPortMin
 	}
 }
 
@@ -353,6 +378,9 @@ func (c *Config) Validate() error {
 	}
 	if _, err := ParsePrefixes(c.Filter.StaticBlocklist); err != nil {
 		return fmt.Errorf("filter.static_blocklist: %w", err)
+	}
+	if c.Filter.UDPEphemeralMin < 1024 {
+		return fmt.Errorf("filter.udp_ephemeral_min: invalid %d (want >= 1024)", c.Filter.UDPEphemeralMin)
 	}
 
 	// --- SSH safety rules -------------------------------------------------
@@ -436,6 +464,9 @@ func containsPort(list []uint16, p uint16) bool {
 	}
 	return false
 }
+
+// EPHEMERALPortMin matches the data-plane default in bpf/headers.h.
+const EPHEMERALPortMin = uint16(32768)
 
 // writeAtomic writes `data` to `path` via a temporary sibling file and
 // rename, so readers never observe a partial file.

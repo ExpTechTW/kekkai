@@ -29,6 +29,7 @@ const (
 	mapPublicUDPPorts  = "public_udp_ports"
 	mapPrivateTCPPorts = "private_tcp_ports"
 	mapPrivateUDPPorts = "private_udp_ports"
+	mapRuntimeCfgV4    = "runtime_cfg_v4"
 	mapStats           = "stats"
 	mapPerIPv4         = "perip_v4"
 )
@@ -246,6 +247,7 @@ func (l *Loader) PublicTCPMap() (*ebpf.Map, error)  { return l.mapByName(mapPubl
 func (l *Loader) PublicUDPMap() (*ebpf.Map, error)  { return l.mapByName(mapPublicUDPPorts) }
 func (l *Loader) PrivateTCPMap() (*ebpf.Map, error) { return l.mapByName(mapPrivateTCPPorts) }
 func (l *Loader) PrivateUDPMap() (*ebpf.Map, error) { return l.mapByName(mapPrivateUDPPorts) }
+func (l *Loader) RuntimeCfgMap() (*ebpf.Map, error) { return l.mapByName(mapRuntimeCfgV4) }
 func (l *Loader) StatsMap() (*ebpf.Map, error)      { return l.mapByName(mapStats) }
 func (l *Loader) PerIPMap() (*ebpf.Map, error)      { return l.mapByName(mapPerIPv4) }
 

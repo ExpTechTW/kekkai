@@ -36,6 +36,9 @@ type Values struct {
 	PublicUDP        []uint16
 	PrivateTCP       []uint16
 	PrivateUDP       []uint16
+	AllowICMP        bool
+	AllowARP         bool
+	UDPEphemeralMin  uint16
 	IngressAllowlist []string
 	StaticBlocklist  []string
 }
@@ -52,6 +55,9 @@ func DefaultValues() Values {
 		StatsFile:         DefaultStatsFile,
 		EnforceSSHPrivate: true,
 		AllowSSHPublic:    false,
+		AllowICMP:         true,
+		AllowARP:          true,
+		UDPEphemeralMin:   EPHEMERALPortMin,
 		PublicTCP:         []uint16{80, 443},
 	}
 }
@@ -71,6 +77,9 @@ func Render(v Values) string {
 	}
 	if v.StatsFile == "" {
 		v.StatsFile = DefaultStatsFile
+	}
+	if v.UDPEphemeralMin == 0 {
+		v.UDPEphemeralMin = EPHEMERALPortMin
 	}
 
 	out := defaultTemplate
@@ -98,6 +107,9 @@ func Render(v Values) string {
 	replace("__OBSERVABILITY_STATS_FILE__", v.StatsFile)
 	replace("__SECURITY_ENFORCE_SSH_PRIVATE__", boolYAML(v.EnforceSSHPrivate))
 	replace("__SECURITY_ALLOW_SSH_PUBLIC__", boolYAML(v.AllowSSHPublic))
+	replace("__FILTER_ALLOW_ICMP__", boolYAML(v.AllowICMP))
+	replace("__FILTER_ALLOW_ARP__", boolYAML(v.AllowARP))
+	replace("__FILTER_UDP_EPHEMERAL_MIN__", strconv.FormatUint(uint64(v.UDPEphemeralMin), 10))
 
 	// List placeholders sit on their own line. Render each as a block
 	// sequence with 6 spaces of indent (4 for the key's indent + 2 for

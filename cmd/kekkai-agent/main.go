@@ -244,6 +244,7 @@ type agent struct {
 	pubUDP    *kmaps.PortSet
 	privTCP   *kmaps.PortSet
 	privUDP   *kmaps.PortSet
+	runtime   *kmaps.RuntimeCfg
 }
 
 func run(cfgPath string) error {
@@ -359,6 +360,10 @@ func (a *agent) openMaps() error {
 	if err != nil {
 		return fmt.Errorf("private udp map: %w", err)
 	}
+	rcfg, err := a.loader.RuntimeCfgMap()
+	if err != nil {
+		return fmt.Errorf("runtime cfg map: %w", err)
+	}
 
 	a.blocklist = kmaps.NewPrefixSet(blMap, "blocklist")
 	a.allowlist = kmaps.NewPrefixSet(alMap, "allowlist")
@@ -366,6 +371,7 @@ func (a *agent) openMaps() error {
 	a.pubUDP = kmaps.NewPortSet(pudp, "public_udp")
 	a.privTCP = kmaps.NewPortSet(prtcp, "private_tcp")
 	a.privUDP = kmaps.NewPortSet(prudp, "private_udp")
+	a.runtime = kmaps.NewRuntimeCfg(rcfg)
 	return nil
 }
 
@@ -397,10 +403,28 @@ func (a *agent) applyFilter(cfg *config.Config) error {
 	if err := a.privUDP.Sync(cfg.Filter.Private.UDP); err != nil {
 		return err
 	}
+	flags := uint32(0)
+	if cfg.Filter.AllowICMP != nil && *cfg.Filter.AllowICMP {
+		flags |= kmaps.RuntimeFlagAllowICMP
+	}
+	if cfg.Filter.AllowARP != nil && *cfg.Filter.AllowARP {
+		flags |= kmaps.RuntimeFlagAllowARP
+	}
+	if err := a.runtime.Sync(kmaps.RuntimeCfgValue{
+		Initialized:     1,
+		Flags:           flags,
+		UDPEphemeralMin: cfg.Filter.UDPEphemeralMin,
+	}); err != nil {
+		return err
+	}
 	log.Printf("filter applied: public tcp=%v udp=%v  private tcp=%v udp=%v  allowlist=%d  blocklist=%d",
 		cfg.Filter.Public.TCP, cfg.Filter.Public.UDP,
 		cfg.Filter.Private.TCP, cfg.Filter.Private.UDP,
 		len(cfg.Filter.IngressAllowlist), len(cfg.Filter.StaticBlocklist))
+	log.Printf("runtime policy: allow_icmp=%v allow_arp=%v udp_ephemeral_min=%d",
+		cfg.Filter.AllowICMP != nil && *cfg.Filter.AllowICMP,
+		cfg.Filter.AllowARP != nil && *cfg.Filter.AllowARP,
+		cfg.Filter.UDPEphemeralMin)
 	return nil
 }
 

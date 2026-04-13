@@ -89,12 +89,13 @@ security:
 # ---------- filter rules ----------
 #
 # EN: Inbound packet decision flow (strict model):
-#   1. non-IPv4                    → DROP
+#   1. ARP                         → PASS (toggle: filter.allow_arp)
+#      non-IPv4/ARP                → DROP
 #   2. IP fragment 2+              → PASS (no L4 header to inspect)
 #   3. return traffic              → PASS
 #        · TCP with ACK set
-#        · UDP with dst port ≥ 32768 (ephemeral range)
-#        · ICMP (always)
+#        · UDP with dst port ≥ filter.udp_ephemeral_min
+#        · ICMP (toggle: filter.allow_icmp)
 #   4. src in static_blocklist     → DROP
 #   5. src in dynamic blocklist    → DROP (M6 / NATS push)
 #   6. dst port in filter.public.* → PASS (any source)
@@ -104,12 +105,13 @@ security:
 #   8. no rule matched             → DROP (default deny)
 #
 # ZH: 進站封包決策流程 (strict model)：
-#   1. 非 IPv4                     → DROP
+#   1. ARP                         → PASS (可由 filter.allow_arp 控制)
+#      非 IPv4/ARP                 → DROP
 #   2. IP 分片後續片段              → PASS (沒有 L4 header 可檢查)
 #   3. 回程流量                     → PASS
 #        · TCP 帶 ACK flag
-#        · UDP dst port ≥ 32768 (ephemeral 範圍)
-#        · ICMP (全部過)
+#        · UDP dst port ≥ filter.udp_ephemeral_min
+#        · ICMP (由 filter.allow_icmp 控制)
 #   4. src 在 static_blocklist     → DROP
 #   5. src 在 dynamic blocklist    → DROP (M6 / NATS 推送)
 #   6. dst port 在 filter.public.* → PASS (任何來源)
@@ -123,6 +125,19 @@ security:
 # ZH: agent 自己主動出去的連線不會被檢查 (XDP 只 hook ingress)，回程封包
 #     靠規則 3 放行，不用特別設定。
 filter:
+  # EN: allow_icmp controls whether ICMP is treated as return traffic.
+  # ZH: 控制 ICMP 是否視為回程流量直接放行。
+  allow_icmp: __FILTER_ALLOW_ICMP__
+
+  # EN: allow_arp controls L2 ARP pass-through. Turning this off can make the
+  #     host appear down when ARP cache expires.
+  # ZH: 控制 L2 ARP 是否放行。關閉後 ARP cache 過期時可能出現主機離線。
+  allow_arp: __FILTER_ALLOW_ARP__
+
+  # EN: Lower bound for UDP return-traffic classification.
+  # ZH: UDP 回程流量判定門檻下限。
+  udp_ephemeral_min: __FILTER_UDP_EPHEMERAL_MIN__
+
   public:
     # EN: Services open to the public internet. Any source IP can connect
     #     except those in static_blocklist or the dynamic blocklist.

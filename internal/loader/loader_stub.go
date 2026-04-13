@@ -27,6 +27,7 @@ func (l *Loader) PublicTCPMap() (*ebpf.Map, error)  { return nil, fmt.Errorf(stu
 func (l *Loader) PublicUDPMap() (*ebpf.Map, error)  { return nil, fmt.Errorf(stubErr) }
 func (l *Loader) PrivateTCPMap() (*ebpf.Map, error) { return nil, fmt.Errorf(stubErr) }
 func (l *Loader) PrivateUDPMap() (*ebpf.Map, error) { return nil, fmt.Errorf(stubErr) }
+func (l *Loader) RuntimeCfgMap() (*ebpf.Map, error) { return nil, fmt.Errorf(stubErr) }
 func (l *Loader) StatsMap() (*ebpf.Map, error)      { return nil, fmt.Errorf(stubErr) }
 func (l *Loader) PerIPMap() (*ebpf.Map, error)      { return nil, fmt.Errorf(stubErr) }
 

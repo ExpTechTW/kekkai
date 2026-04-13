@@ -3,10 +3,10 @@
 // WAF edge data plane — strict policy model.
 //
 // Decision flow (see readme §filter for the spec):
-//   1. ARP                   → PASS
+//   1. ARP                   → PASS (if enabled)
 //      non-IPv4/ARP          → DROP
 //   2. IP frag 2+            → PASS (no L4 header to inspect)
-//   3. return traffic        → PASS (TCP ACK, UDP ephemeral, ICMP)
+//   3. return traffic        → PASS (TCP ACK, UDP ephemeral, ICMP-if-enabled)
 //   4. static blocklist      → DROP
 //   5. dynamic blocklist     → DROP (if not expired)
 //   6. public port           → PASS (any source)
@@ -98,6 +98,18 @@ struct dyn_block_val {
     __u8  _pad[7];
 };
 
+struct runtime_cfg_v4 {
+    __u32 initialized;
+    __u32 flags;
+    __u16 udp_ephemeral_min;
+    __u16 _pad;
+};
+
+enum {
+    RUNTIME_FLAG_ALLOW_ICMP = 1u << 0,
+    RUNTIME_FLAG_ALLOW_ARP  = 1u << 1,
+};
+
 // Reserved for M4+: anomaly event layout locked in now.
 struct event {
     __u64 ts_ns;
@@ -177,6 +189,13 @@ struct {
     __uint(max_entries, PERIP_MAX_ENTRIES);
 } perip_v4 SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, struct runtime_cfg_v4);
+    __uint(max_entries, 1);
+} runtime_cfg_v4 SEC(".maps");
+
 // Reserved for M4+.
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -222,6 +241,23 @@ static __always_inline int port_in(void *map, __u16 port_be) {
     return bpf_map_lookup_elem(map, &port_be) != NULL;
 }
 
+static __always_inline void runtime_cfg_get(__u8 *allow_arp, __u8 *allow_icmp,
+                                            __u16 *udp_ephemeral_min) {
+    *allow_arp = 1;
+    *allow_icmp = 1;
+    *udp_ephemeral_min = EPHEMERAL_PORT_MIN;
+
+    __u32 k = 0;
+    struct runtime_cfg_v4 *cfg = bpf_map_lookup_elem(&runtime_cfg_v4, &k);
+    if (!cfg || cfg->initialized != 1)
+        return;
+
+    *allow_arp = (cfg->flags & RUNTIME_FLAG_ALLOW_ARP) ? 1 : 0;
+    *allow_icmp = (cfg->flags & RUNTIME_FLAG_ALLOW_ICMP) ? 1 : 0;
+    if (cfg->udp_ephemeral_min >= 1024)
+        *udp_ephemeral_min = cfg->udp_ephemeral_min;
+}
+
 // --- main --------------------------------------------------------------------
 
 SEC("xdp")
@@ -233,7 +269,11 @@ int kekkai_xdp(struct xdp_md *ctx) {
     stat_add(STAT_PKTS_TOTAL, 1);
     stat_add(STAT_BYTES_TOTAL, pkt_len);
 
-    // 1. ethernet + IPv4 only (except ARP, which must pass for LAN liveness)
+    __u8 allow_arp = 1, allow_icmp = 1;
+    __u16 udp_ephemeral_min = EPHEMERAL_PORT_MIN;
+    runtime_cfg_get(&allow_arp, &allow_icmp, &udp_ephemeral_min);
+
+    // 1. ethernet + IPv4 only (ARP may be toggled at runtime)
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) {
         stat_add(STAT_DROP_MALFORMED, 1);
@@ -241,7 +281,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         stat_add(STAT_BYTES_DROPPED, pkt_len);
         return XDP_DROP;
     }
-    if (eth->h_proto == bpf_htons(ETH_P_ARP)) {
+    if (allow_arp && eth->h_proto == bpf_htons(ETH_P_ARP)) {
         stat_add(STAT_PKTS_PASSED, 1);
         return XDP_PASS;
     }
@@ -308,7 +348,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
     //    - UDP: dst port in ephemeral range (matches responses to
     //      agent-initiated DNS/NTP/etc without conntrack).
     __u16 dport_be = 0;
-    if (proto == IPPROTO_ICMP) {
+    if (proto == IPPROTO_ICMP && allow_icmp) {
         stat_add(STAT_PASS_RETURN_ICMP, 1);
         stat_add(STAT_PKTS_PASSED, 1);
         perip_touch(saddr, pkt_len, proto, 0);
@@ -340,7 +380,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
             return XDP_DROP;
         }
         dport_be = udp->dest;
-        if (bpf_ntohs(dport_be) >= EPHEMERAL_PORT_MIN) {
+        if (bpf_ntohs(dport_be) >= udp_ephemeral_min) {
             stat_add(STAT_PASS_RETURN_UDP, 1);
             stat_add(STAT_PKTS_PASSED, 1);
             perip_touch(saddr, pkt_len, proto, 0);
