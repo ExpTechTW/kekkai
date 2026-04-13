@@ -224,7 +224,7 @@ static __always_inline int port_in(void *map, __u16 port_be) {
 // --- main --------------------------------------------------------------------
 
 SEC("xdp")
-int waf_xdp(struct xdp_md *ctx) {
+int kekkai_xdp(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
     __u64 pkt_len  = (__u64)(data_end - data);

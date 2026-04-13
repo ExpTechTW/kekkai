@@ -24,7 +24,7 @@ const (
 	// differs from the one currently in memory.
 	BackupKindAuto BackupKind = "auto_backup"
 
-	// BackupKindManual is written by the operator via `waf-edge -backup`.
+	// BackupKindManual is written by the operator via `kekkai-agent -backup`.
 	BackupKindManual BackupKind = "backup"
 
 	// BackupRetention is the number of files per kind retained on disk.

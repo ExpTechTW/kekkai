@@ -27,7 +27,7 @@ import (
 const CurrentVersion = 2
 
 const (
-	DefaultStatsFile      = "/var/run/waf-go/stats.txt"
+	DefaultStatsFile      = "/var/run/kekkai/stats.txt"
 	DefaultPerIPTableSize = 65536
 	DefaultXDPMode        = "generic"
 	SSHPort               = uint16(22)

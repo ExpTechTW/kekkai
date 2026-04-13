@@ -505,7 +505,7 @@ func (r *Reader) writeFile(v snapshotView) {
 	b.Reset()
 	uptime := v.Now.Sub(r.startedAt).Truncate(time.Second)
 
-	fmt.Fprintf(b, "waf-go edge stats            updated: %s\n", v.Now.Format(time.RFC3339))
+	fmt.Fprintf(b, "kekkai edge stats            updated: %s\n", v.Now.Format(time.RFC3339))
 	fmt.Fprintf(b, "node=%s  iface=%s  uptime=%s\n\n", r.nodeID, r.iface, uptime)
 
 	fmt.Fprintf(b, "traffic (rx via XDP)\n")
@@ -690,3 +690,22 @@ func humanBytes(v uint64) string {
 		return fmt.Sprintf("%8d B  ", v)
 	}
 }
+
+// Exported aliases for use by other packages (e.g. internal/tui).
+// Kept as thin wrappers so the existing call-sites in this file keep
+// their short, lower-case names.
+
+// FormatCount renders an integer counter with thousands separators.
+func FormatCount(v uint64) string { return fmtU(v) }
+
+// FormatRate renders a floating-point rate with 2 decimals and commas.
+func FormatRate(v float64) string { return fmtNum(v) }
+
+// HumanBits renders bits-per-second with the appropriate unit suffix.
+func HumanBits(v float64) string { return humanBits(v) }
+
+// HumanBytes renders a byte count with the appropriate binary unit.
+func HumanBytes(v uint64) string { return humanBytes(v) }
+
+// ProtoName maps an IP protocol number to its short name.
+func ProtoName(p uint8) string { return protoName(p) }

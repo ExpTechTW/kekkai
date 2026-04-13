@@ -1,15 +1,15 @@
-# waf-go edge agent configuration.
+# kekkai edge agent configuration.
 #
 # EN: Validation is strict. Unknown keys, invalid ports, bad CIDRs, or rules
 #     that would lock SSH out cause the agent to refuse to start. Use
-#     `waf-edge -check /path/to/edge.yaml` to validate without launching.
+#     `kekkai check /path/to/kekkai.yaml` to validate without launching.
 # ZH: 驗證採嚴格模式。未知欄位、非法 port、壞 CIDR、或會鎖掉 SSH 的規則
-#     都會讓 agent 拒絕啟動。可用 `waf-edge -check <path>` 離線驗證。
+#     都會讓 agent 拒絕啟動。可用 `kekkai check <path>` 離線驗證。
 #
 # EN: Schema version. On load, older versions are auto-migrated and the
-#     previous file is copied to edge.yaml.update_backup.<timestamp>.
+#     previous file is copied to kekkai.yaml.update_backup.<timestamp>.
 # ZH: Schema 版本號。載入時舊版會自動升級，原始檔案會備份到
-#     edge.yaml.update_backup.<時戳>，總共保留最新 10 份。
+#     kekkai.yaml.update_backup.<時戳>，總共保留最新 10 份。
 version: 2
 
 # ---------- identity ----------
@@ -64,9 +64,9 @@ runtime:
 # ---------- observability ----------
 observability:
   # EN: Human-readable stats snapshot. Monitor with:
-  #       watch -n 1 cat /var/run/waf-go/stats.txt
+  #       watch -n 1 cat /var/run/kekkai/stats.txt
   # ZH: 人類可讀的統計快照檔。用 `watch -n 1 cat <path>` 監看。
-  stats_file: /var/run/waf-go/stats.txt
+  stats_file: /var/run/kekkai/stats.txt
 
 # ---------- security ----------
 security:

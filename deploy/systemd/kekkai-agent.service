@@ -1,13 +1,13 @@
 [Unit]
-Description=waf-go edge XDP firewall agent
-Documentation=https://github.com/ExpTechTW/waf-go
+Description=kekkai edge XDP firewall agent
+Documentation=https://github.com/ExpTechTW/kekkai
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/usr/local/bin/waf-edge -check /etc/waf-go/edge.yaml
-ExecStart=/usr/local/bin/waf-edge -config /etc/waf-go/edge.yaml
+ExecStartPre=/usr/local/bin/kekkai-agent -check /etc/kekkai/kekkai.yaml
+ExecStart=/usr/local/bin/kekkai-agent -config /etc/kekkai/kekkai.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
@@ -15,7 +15,7 @@ RestartSec=2s
 # Capabilities — run as root (needed for bpffs + XDP attach on most kernels)
 # but drop every capability except what XDP actually needs. CAP_SYS_ADMIN is
 # required because cilium/ebpf uses bpf() syscall paths that check for it on
-# kernels where CAP_BPF is not sufficient (pre-5.8 gated everything on admin).
+# kernels where CAP_BPF is not sufficient.
 User=root
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
@@ -37,7 +37,7 @@ ReadWritePaths=/sys/fs/bpf /var/run /run
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=waf-edge
+SyslogIdentifier=kekkai-agent
 
 [Install]
 WantedBy=multi-user.target

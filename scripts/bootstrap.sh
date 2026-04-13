@@ -4,7 +4,7 @@
 # - verifies kernel features (BTF, bpffs)
 # - picks a default network interface
 # - compiles eBPF object and Go binary
-# - writes /etc/waf-go/edge.yaml (if absent)
+# - writes /etc/kekkai/kekkai.yaml (if absent)
 #
 # Usage:  bash scripts/bootstrap.sh [--iface eth0] [--no-install] [--no-run]
 set -euo pipefail
@@ -113,7 +113,7 @@ if ! mount | grep -q 'type bpf '; then
 else
   log "bpffs already mounted"
 fi
-$SUDO mkdir -p /sys/fs/bpf/waf-go
+$SUDO mkdir -p /sys/fs/bpf/kekkai
 
 # --- 5. pick default iface --------------------------------------------------
 if [[ -z "$IFACE" ]]; then
@@ -143,14 +143,19 @@ make bpf
 log "compiling Go binary"
 make build
 
-$SUDO install -D -m 0755 "$ROOT/bin/waf-edge" /usr/local/bin/waf-edge
-log "installed binary: /usr/local/bin/waf-edge"
+$SUDO install -D -m 0755 "$ROOT/bin/kekkai-agent" /usr/local/bin/kekkai-agent
+log "installed binary: /usr/local/bin/kekkai-agent"
+
+if [[ -x "$ROOT/bin/kekkai" ]]; then
+  $SUDO install -D -m 0755 "$ROOT/bin/kekkai" /usr/local/bin/kekkai
+  log "installed binary: /usr/local/bin/kekkai"
+fi
 
 # --- 7. config --------------------------------------------------------------
-CFG=/etc/waf-go/edge.yaml
+CFG=/etc/kekkai/kekkai.yaml
 if [[ ! -f "$CFG" ]]; then
   log "writing default config to $CFG"
-  $SUDO mkdir -p /etc/waf-go
+  $SUDO mkdir -p /etc/kekkai
   $SUDO tee "$CFG" >/dev/null <<EOF
 version: 2
 
@@ -167,7 +172,7 @@ runtime:
   perip_table_size: 65536
 
 observability:
-  stats_file: /var/run/waf-go/stats.txt
+  stats_file: /var/run/kekkai/stats.txt
 
 security:
   # Auto-add port 22 to filter.private.tcp on every load. Protects SSH.
@@ -193,17 +198,17 @@ fi
 
 # --- 8. systemd unit -------------------------------------------------------
 if command -v systemctl >/dev/null 2>&1; then
-  UNIT_SRC="$ROOT/deploy/systemd/waf-edge.service"
-  UNIT_DST=/etc/systemd/system/waf-edge.service
+  UNIT_SRC="$ROOT/deploy/systemd/kekkai-agent.service"
+  UNIT_DST=/etc/systemd/system/kekkai-agent.service
   if [[ -f "$UNIT_SRC" ]]; then
     log "installing systemd unit to $UNIT_DST"
     $SUDO install -D -m 0644 "$UNIT_SRC" "$UNIT_DST"
     $SUDO systemctl daemon-reload
-    if $SUDO systemctl is-enabled --quiet waf-edge.service; then
-      log "waf-edge already enabled — restarting"
-      $SUDO systemctl restart waf-edge.service || warn "restart failed; check: journalctl -u waf-edge -n 50"
+    if $SUDO systemctl is-enabled --quiet kekkai-agent.service; then
+      log "kekkai-agent already enabled — restarting"
+      $SUDO systemctl restart kekkai-agent.service || warn "restart failed; check: journalctl -u kekkai-agent -n 50"
     else
-      log "enable with:  sudo systemctl enable --now waf-edge"
+      log "enable with:  sudo systemctl enable --now kekkai-agent"
     fi
   fi
 fi
@@ -212,15 +217,15 @@ log "bootstrap complete"
 echo
 echo "next steps:"
 echo "  1. review config:       sudo nano $CFG"
-echo "  2. validate:            /usr/local/bin/waf-edge -check $CFG"
-echo "  3. enable at boot:      sudo systemctl enable --now waf-edge"
-echo "  4. check status:        systemctl status waf-edge"
-echo "  5. follow logs:         journalctl -u waf-edge -f"
-echo "  6. watch stats:         watch -n 1 cat /var/run/waf-go/stats.txt"
-echo "  7. reload after edit:   sudo systemctl reload waf-edge"
+echo "  2. validate:            /usr/local/bin/kekkai-agent -check $CFG"
+echo "  3. enable at boot:      sudo systemctl enable --now kekkai-agent"
+echo "  4. check status:        systemctl status kekkai-agent"
+echo "  5. follow logs:         journalctl -u kekkai-agent -f"
+echo "  6. watch stats:         watch -n 1 cat /var/run/kekkai/stats.txt"
+echo "  7. reload after edit:   sudo systemctl reload kekkai-agent"
 echo
 
 if [[ $DO_RUN -eq 1 ]]; then
-  log "launching waf-edge (Ctrl+C to stop)"
-  exec $SUDO /usr/local/bin/waf-edge -config "$CFG"
+  log "launching kekkai-agent (Ctrl+C to stop)"
+  exec $SUDO /usr/local/bin/kekkai-agent -config "$CFG"
 fi

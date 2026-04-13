@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# In-place updater for waf-go edge.
+# In-place updater for kekkai edge.
 #
 #   git fetch → inspect incoming changes → rebuild eBPF + Go → validate
 #   the installed config against the new binary → reinstall → restart
@@ -9,9 +9,9 @@
 #   * refuses to run if the working tree has uncommitted changes (override
 #     with --force; useful in dev)
 #   * refuses to downgrade if HEAD would move backwards in time
-#   * dry-runs `waf-edge -check` against the NEW binary before committing
+#   * dry-runs `kekkai-agent -check` against the NEW binary before committing
 #     to the install step; bad config never reaches the running service
-#   * keeps a rollback binary at /usr/local/bin/waf-edge.prev
+#   * keeps a rollback binary at /usr/local/bin/kekkai-agent.prev
 #
 # Usage:
 #   bash scripts/update.sh                 # fetch main, update if new commits
@@ -112,15 +112,15 @@ make bpf
 log "compiling Go binary"
 make build
 
-NEW_BIN="$ROOT/bin/waf-edge"
+NEW_BIN="$ROOT/bin/kekkai-agent"
 [[ -x "$NEW_BIN" ]] || die "build did not produce $NEW_BIN"
 
 # --- 6. validate NEW binary against installed config -----------------------
-CFG=/etc/waf-go/edge.yaml
+CFG=/etc/kekkai/kekkai.yaml
 if [[ -f "$CFG" ]]; then
   log "validating $CFG against new binary"
-  if ! "$NEW_BIN" -check "$CFG" >/tmp/waf-edge-check.log 2>&1; then
-    cat /tmp/waf-edge-check.log >&2
+  if ! "$NEW_BIN" -check "$CFG" >/tmp/kekkai-agent-check.log 2>&1; then
+    cat /tmp/kekkai-agent-check.log >&2
     die "new binary rejects current config — aborting install"
   fi
   log "config ok"
@@ -129,8 +129,8 @@ else
 fi
 
 # --- 7. install + rollback snapshot ----------------------------------------
-INSTALL_PATH=/usr/local/bin/waf-edge
-ROLLBACK_PATH=/usr/local/bin/waf-edge.prev
+INSTALL_PATH=/usr/local/bin/kekkai-agent
+ROLLBACK_PATH=/usr/local/bin/kekkai-agent.prev
 
 OLD_SHA=""
 if [[ -f "$INSTALL_PATH" ]]; then
@@ -150,10 +150,25 @@ if [[ -f "$INSTALL_PATH" ]]; then
 fi
 $SUDO install -m 0755 "$NEW_BIN" "$INSTALL_PATH"
 
+# Also install the kekkai CLI front-end if the build produced it. No
+# rollback for this one — it's interactive and failure is not runtime
+# critical; worst case the operator reinstalls via bootstrap.sh.
+CLI_NEW_BIN="$ROOT/bin/kekkai"
+CLI_INSTALL_PATH=/usr/local/bin/kekkai
+if [[ -x "$CLI_NEW_BIN" ]]; then
+  CLI_OLD_SHA=""
+  [[ -f "$CLI_INSTALL_PATH" ]] && CLI_OLD_SHA="$(sha256sum "$CLI_INSTALL_PATH" | awk '{print $1}')"
+  CLI_NEW_SHA="$(sha256sum "$CLI_NEW_BIN" | awk '{print $1}')"
+  if [[ "$CLI_OLD_SHA" != "$CLI_NEW_SHA" ]]; then
+    log "installing kekkai CLI (sha256: ${CLI_NEW_SHA:0:16}...)"
+    $SUDO install -m 0755 "$CLI_NEW_BIN" "$CLI_INSTALL_PATH"
+  fi
+fi
+
 # --- 8. restart systemd service --------------------------------------------
 if [[ $RESTART -eq 0 ]]; then
   warn "skipping restart (--no-restart)"
-  log "update complete; restart later with:  sudo systemctl restart waf-edge"
+  log "update complete; restart later with:  sudo systemctl restart kekkai-agent"
   exit 0
 fi
 
@@ -162,34 +177,34 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 0
 fi
 
-if ! $SUDO systemctl list-unit-files waf-edge.service >/dev/null 2>&1; then
-  warn "waf-edge.service not installed — run bootstrap.sh to install unit"
+if ! $SUDO systemctl list-unit-files kekkai-agent.service >/dev/null 2>&1; then
+  warn "kekkai-agent.service not installed — run bootstrap.sh to install unit"
   exit 0
 fi
 
-log "restarting waf-edge.service"
-if ! $SUDO systemctl restart waf-edge.service; then
+log "restarting kekkai-agent.service"
+if ! $SUDO systemctl restart kekkai-agent.service; then
   warn "restart failed — rolling back"
   if [[ -f "$ROLLBACK_PATH" ]]; then
     $SUDO install -m 0755 "$ROLLBACK_PATH" "$INSTALL_PATH"
-    $SUDO systemctl restart waf-edge.service || true
-    die "rollback installed. check: journalctl -u waf-edge -n 50"
+    $SUDO systemctl restart kekkai-agent.service || true
+    die "rollback installed. check: journalctl -u kekkai-agent -n 50"
   fi
-  die "no rollback available. check: journalctl -u waf-edge -n 50"
+  die "no rollback available. check: journalctl -u kekkai-agent -n 50"
 fi
 
 # Give the service a moment to come up, then confirm.
 sleep 1
-if ! $SUDO systemctl is-active --quiet waf-edge.service; then
+if ! $SUDO systemctl is-active --quiet kekkai-agent.service; then
   warn "service did not stay active — rolling back"
   if [[ -f "$ROLLBACK_PATH" ]]; then
     $SUDO install -m 0755 "$ROLLBACK_PATH" "$INSTALL_PATH"
-    $SUDO systemctl restart waf-edge.service || true
+    $SUDO systemctl restart kekkai-agent.service || true
   fi
-  $SUDO journalctl -u waf-edge -n 30 --no-pager >&2 || true
+  $SUDO journalctl -u kekkai-agent -n 30 --no-pager >&2 || true
   die "rolled back to previous binary"
 fi
 
-log "update complete; waf-edge is running the new binary"
-log "logs:   journalctl -u waf-edge -f"
-log "status: systemctl status waf-edge"
+log "update complete; kekkai-agent is running the new binary"
+log "logs:   journalctl -u kekkai-agent -f"
+log "status: systemctl status kekkai-agent"

@@ -1,10 +1,10 @@
-// Command waf-edge is the edge agent binary.
+// Command kekkai-agent is the edge agent binary.
 //
 // Responsibilities:
 //   - Load XDP program, install maps, attach to configured interface
 //     (or stay in emergency bypass).
 //   - Seed maps from config (ports, allowlist, blocklist).
-//   - Run stats reader which publishes /var/run/waf-go/stats.txt.
+//   - Run stats reader which publishes /var/run/kekkai/stats.txt.
 //   - Reload config on SIGHUP; validate first, apply as a diff to maps,
 //     auto-backup the previous config if it differed.
 //   - Offer offline CLI modes: -check, -show, -backup.
@@ -20,14 +20,14 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/YuYu1015/waf-go/internal/config"
-	"github.com/YuYu1015/waf-go/internal/loader"
-	wafmaps "github.com/YuYu1015/waf-go/internal/maps"
-	"github.com/YuYu1015/waf-go/internal/stats"
+	"github.com/ExpTechTW/kekkai/internal/config"
+	"github.com/ExpTechTW/kekkai/internal/loader"
+	kmaps "github.com/ExpTechTW/kekkai/internal/maps"
+	"github.com/ExpTechTW/kekkai/internal/stats"
 )
 
 func main() {
-	cfgPath := flag.String("config", "/etc/waf-go/edge.yaml", "path to edge config")
+	cfgPath := flag.String("config", "/etc/kekkai/kekkai.yaml", "path to edge config")
 	check := flag.Bool("check", false, "validate config and exit (non-zero on error)")
 	show := flag.Bool("show", false, "print the normalised config after migration and exit")
 	backup := flag.Bool("backup", false, "write a timestamped manual backup of -config and exit")
@@ -55,7 +55,7 @@ func main() {
 	}
 
 	if err := run(*cfgPath); err != nil {
-		log.Fatalf("waf-edge: %v", err)
+		log.Fatalf("kekkai-agent: %v", err)
 	}
 }
 
@@ -114,12 +114,12 @@ type agent struct {
 	cfgPath   string
 	loader    *loader.Loader
 	mu        sync.Mutex
-	blocklist *wafmaps.PrefixSet
-	allowlist *wafmaps.PrefixSet
-	pubTCP    *wafmaps.PortSet
-	pubUDP    *wafmaps.PortSet
-	privTCP   *wafmaps.PortSet
-	privUDP   *wafmaps.PortSet
+	blocklist *kmaps.PrefixSet
+	allowlist *kmaps.PrefixSet
+	pubTCP    *kmaps.PortSet
+	pubUDP    *kmaps.PortSet
+	privTCP   *kmaps.PortSet
+	privUDP   *kmaps.PortSet
 }
 
 func run(cfgPath string) error {
@@ -138,7 +138,7 @@ func run(cfgPath string) error {
 	}
 	warnIfSSHPublic(cfg)
 
-	log.Printf("waf-edge starting node=%s region=%s iface=%s xdp_mode=%s bypass=%v",
+	log.Printf("kekkai-agent starting node=%s region=%s iface=%s xdp_mode=%s bypass=%v",
 		cfg.Node.ID, cfg.Node.Region, cfg.Interface.Name, cfg.Interface.XDPMode, cfg.Runtime.EmergencyBypass)
 
 	iface, err := cfg.ResolveInterface()
@@ -236,12 +236,12 @@ func (a *agent) openMaps() error {
 		return fmt.Errorf("private udp map: %w", err)
 	}
 
-	a.blocklist = wafmaps.NewPrefixSet(blMap, "blocklist")
-	a.allowlist = wafmaps.NewPrefixSet(alMap, "allowlist")
-	a.pubTCP = wafmaps.NewPortSet(ptcp, "public_tcp")
-	a.pubUDP = wafmaps.NewPortSet(pudp, "public_udp")
-	a.privTCP = wafmaps.NewPortSet(prtcp, "private_tcp")
-	a.privUDP = wafmaps.NewPortSet(prudp, "private_udp")
+	a.blocklist = kmaps.NewPrefixSet(blMap, "blocklist")
+	a.allowlist = kmaps.NewPrefixSet(alMap, "allowlist")
+	a.pubTCP = kmaps.NewPortSet(ptcp, "public_tcp")
+	a.pubUDP = kmaps.NewPortSet(pudp, "public_udp")
+	a.privTCP = kmaps.NewPortSet(prtcp, "private_tcp")
+	a.privUDP = kmaps.NewPortSet(prudp, "private_udp")
 	return nil
 }
 

@@ -18,9 +18,9 @@ import (
 var programBytes []byte
 
 const (
-	bpffsRoot = "/sys/fs/bpf/waf-go"
+	bpffsRoot = "/sys/fs/bpf/kekkai"
 
-	progName = "waf_xdp"
+	progName = "kekkai_xdp"
 
 	mapBlocklistV4     = "blocklist_v4"
 	mapAllowlistV4     = "allowlist_v4"
