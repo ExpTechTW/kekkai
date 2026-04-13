@@ -291,7 +291,17 @@ int kekkai_xdp(struct xdp_md *ctx) {
     void *l4 = (void *)ip + ihl * 4;
 
     // 3. return traffic → PASS
-    //    ICMP always, TCP with ACK set, UDP with dst port in ephemeral range.
+    //    - ICMP: always (ping replies, PMTU, etc)
+    //    - TCP: packets that are part of an established session. In
+    //      stateless terms this is the classic "tcp-established" match
+    //      used by AWS NACLs and Juniper filters: any segment where
+    //      ACK, RST or FIN is set. A brand-new connection is SYN-only,
+    //      which is the single case that falls through to port checks.
+    //      Matching RST/FIN is essential — otherwise the server-side
+    //      session dies the moment the peer sends a reset or starts a
+    //      graceful close, because those packets carry no payload ACK.
+    //    - UDP: dst port in ephemeral range (matches responses to
+    //      agent-initiated DNS/NTP/etc without conntrack).
     __u16 dport_be = 0;
     if (proto == IPPROTO_ICMP) {
         stat_add(STAT_PASS_RETURN_ICMP, 1);
@@ -309,7 +319,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
             return XDP_DROP;
         }
         dport_be = tcp->dest;
-        if (tcp->flags & TCP_FLAG_ACK) {
+        if (tcp->flags & (TCP_FLAG_ACK | TCP_FLAG_RST | TCP_FLAG_FIN)) {
             stat_add(STAT_PASS_RETURN_TCP, 1);
             stat_add(STAT_PKTS_PASSED, 1);
             perip_touch(saddr, pkt_len, proto, 0);
