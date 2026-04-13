@@ -1,0 +1,43 @@
+[Unit]
+Description=waf-go edge XDP firewall agent
+Documentation=https://github.com/ExpTechTW/waf-go
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/waf-edge -check /etc/waf-go/edge.yaml
+ExecStart=/usr/local/bin/waf-edge -config /etc/waf-go/edge.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+# Capabilities — run as root (needed for bpffs + XDP attach on most kernels)
+# but drop every capability except what XDP actually needs. CAP_SYS_ADMIN is
+# required because cilium/ebpf uses bpf() syscall paths that check for it on
+# kernels where CAP_BPF is not sufficient (pre-5.8 gated everything on admin).
+User=root
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
+
+# Hardening — keep the agent's blast radius small.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# Writable paths the agent actually needs.
+ReadWritePaths=/sys/fs/bpf /var/run /run
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=waf-edge
+
+[Install]
+WantedBy=multi-user.target

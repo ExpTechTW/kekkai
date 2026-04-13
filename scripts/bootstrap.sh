@@ -152,18 +152,62 @@ if [[ ! -f "$CFG" ]]; then
   log "writing default config to $CFG"
   $SUDO mkdir -p /etc/waf-go
   $SUDO tee "$CFG" >/dev/null <<EOF
-node_id: $(hostname)
-region: default
-iface: $IFACE
+node:
+  id: $(hostname)
+  region: default
+
+interface:
+  name: $IFACE
+  xdp_mode: generic
+
+runtime:
+  emergency_bypass: false
+  perip_table_size: 65536
+
+observability:
+  stats_file: /var/run/waf-go/stats.txt
+
+filter:
+  public:
+    tcp: [80, 443]
+    udp: []
+  private:
+    tcp: []
+    udp: []
+  ingress_allowlist: []
+  static_blocklist: []
 EOF
 else
   warn "$CFG already exists — leaving untouched"
 fi
 
+# --- 8. systemd unit -------------------------------------------------------
+if command -v systemctl >/dev/null 2>&1; then
+  UNIT_SRC="$ROOT/deploy/systemd/waf-edge.service"
+  UNIT_DST=/etc/systemd/system/waf-edge.service
+  if [[ -f "$UNIT_SRC" ]]; then
+    log "installing systemd unit to $UNIT_DST"
+    $SUDO install -D -m 0644 "$UNIT_SRC" "$UNIT_DST"
+    $SUDO systemctl daemon-reload
+    if $SUDO systemctl is-enabled --quiet waf-edge.service; then
+      log "waf-edge already enabled — restarting"
+      $SUDO systemctl restart waf-edge.service || warn "restart failed; check: journalctl -u waf-edge -n 50"
+    else
+      log "enable with:  sudo systemctl enable --now waf-edge"
+    fi
+  fi
+fi
+
 log "bootstrap complete"
 echo
 echo "next steps:"
-echo "  sudo /usr/local/bin/waf-edge -config $CFG"
+echo "  1. review config:       sudo nano $CFG"
+echo "  2. validate:            /usr/local/bin/waf-edge -check $CFG"
+echo "  3. enable at boot:      sudo systemctl enable --now waf-edge"
+echo "  4. check status:        systemctl status waf-edge"
+echo "  5. follow logs:         journalctl -u waf-edge -f"
+echo "  6. watch stats:         watch -n 1 cat /var/run/waf-go/stats.txt"
+echo "  7. reload after edit:   sudo systemctl reload waf-edge"
 echo
 
 if [[ $DO_RUN -eq 1 ]]; then

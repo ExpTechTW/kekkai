@@ -153,7 +153,30 @@ watch -n 1 cat /var/run/waf-go/stats.txt
 ```bash
 sudo nano /etc/waf-go/edge.yaml
 waf-edge -check /etc/waf-go/edge.yaml   # 建議先驗
-sudo kill -HUP $(pgrep waf-edge)
+sudo systemctl reload waf-edge          # 或 sudo kill -HUP $(pgrep waf-edge)
+```
+
+更新 binary（pull → build → 驗證 → 安裝 → restart，帶自動 rollback）：
+```bash
+make update
+# 或： bash scripts/update.sh
+```
+
+更新流程的保護：
+1. Working tree 有 uncommitted 改動 → 拒絕（`--force` 覆寫）
+2. `git fetch` 後比對 commit；上游沒變 → 直接退出
+3. 遠端 commit 時間比本地舊 → 拒絕降級（`--force` 覆寫）
+4. 重新編譯 eBPF + Go binary
+5. 用**新 binary** 驗證 `/etc/waf-go/edge.yaml`，失敗就中止安裝
+6. 舊 binary 備份到 `/usr/local/bin/waf-edge.prev`
+7. 安裝新 binary 並 `systemctl restart`
+8. 1 秒後檢查 service 狀態，沒起來就自動 rollback 舊 binary 並重啟
+
+其他旗標：
+```bash
+make update-check                    # 只看有沒有新 commit，不實際更新
+bash scripts/update.sh --branch dev  # 從別的 branch 更新
+bash scripts/update.sh --no-restart  # 安裝但不重啟 service
 ```
 
 **bootstrap.sh 旗標**

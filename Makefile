@@ -1,7 +1,7 @@
 BINARY := waf-edge
 PKG    := ./cmd/edge
 
-.PHONY: all bpf build build-linux vet test clean run
+.PHONY: all bpf build build-linux vet test clean run update update-check
 
 all: bpf build
 
@@ -25,3 +25,9 @@ run: build
 
 clean:
 	rm -rf bin internal/loader/bpf/xdp_filter.o
+
+update:
+	@bash scripts/update.sh
+
+update-check:
+	@bash scripts/update.sh --check-only
