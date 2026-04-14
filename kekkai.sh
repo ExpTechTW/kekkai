@@ -270,7 +270,7 @@ install_deps() {
   $SUDO apt-get update -y
   $SUDO apt-get install -y --no-install-recommends \
     clang llvm libbpf-dev "linux-headers-$(uname -r)" \
-    make gcc pkg-config ca-certificates curl
+    make gcc pkg-config ca-certificates curl libcap2-bin
 }
 
 install_go() {
@@ -441,6 +441,8 @@ install_binaries_from() {
 
   $SUDO install -D -m 0755 "$src_cli" "$CLI_BIN"
   log "installed: $CLI_BIN"
+
+  setup_status_capabilities
 }
 
 install_binaries() {
@@ -511,6 +513,22 @@ setup_sudo_shortcut() {
     info "alias already present in $rc_file"
   fi
   info "open a new shell or run: source $rc_file"
+}
+
+setup_status_capabilities() {
+  [[ "$OS" == "linux" ]] || return 0
+  if ! command -v setcap >/dev/null 2>&1; then
+    warn "setcap not found; install libcap2-bin to allow non-root 'kekkai status'"
+    return 0
+  fi
+
+  # Some kernels still gate BPF object read behind CAP_SYS_ADMIN.
+  local caps="cap_bpf,cap_perfmon,cap_sys_admin+ep"
+  if $SUDO setcap "$caps" "$CLI_BIN"; then
+    log "granted $caps on $CLI_BIN (non-root status support)"
+  else
+    warn "setcap failed for $CLI_BIN; 'kekkai status' may still require sudo"
+  fi
 }
 
 install_config() {
@@ -771,7 +789,8 @@ download_release_binary() {
   local archive="$tmpdir/$(basename "${url%%\?*}")"
   [[ -n "$archive" ]] || die "invalid asset url: $url"
 
-  curl -fsSL "$url" -o "$archive"
+  curl -fL --retry 4 --retry-delay 1 --retry-all-errors --connect-timeout 10 \
+    "$url" -o "$archive" || return 1
 
   local out="$tmpdir/$want_name"
   case "$archive" in
@@ -800,6 +819,15 @@ download_release_binary() {
   esac
 
   chmod +x "$out"
+  # Quick sanity check: broken/partial downloads often crash immediately.
+  # We treat signal exits as corrupted binary and abort update early.
+  "$out" -h >/dev/null 2>&1 || {
+    local rc=$?
+    if (( rc >= 128 )); then
+      err "downloaded $want_name looks corrupted (exit=$rc)"
+      return 1
+    fi
+  }
   echo "$out"
 }
 
@@ -829,8 +857,8 @@ release_update() {
   tmpdir="$(mktemp -d)"
 
   local new_agent new_cli
-  new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")"
-  new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")"
+  new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")" || die "failed to download/verify kekkai-agent binary"
+  new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")" || die "failed to download/verify kekkai binary"
   local new_ver
   new_ver="$(read_cli_version "$new_cli")"
 
@@ -877,8 +905,8 @@ fetch_release_binaries_to_root_bin() {
   local tmpdir
   tmpdir="$(mktemp -d)"
   local new_agent new_cli
-  new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")"
-  new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")"
+  new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")" || die "failed to download/verify kekkai-agent binary"
+  new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")" || die "failed to download/verify kekkai binary"
 
   mkdir -p "$ROOT/bin"
   cp "$new_agent" "$ROOT/bin/kekkai-agent"
@@ -891,11 +919,26 @@ validate_config_against_new_binary() {
   local candidate_bin="${1:-$ROOT/bin/kekkai-agent}"
   [[ -f "$CONFIG_FILE" ]] || return 0
   log "validating $CONFIG_FILE against new binary"
-  if ! "$candidate_bin" -check "$CONFIG_FILE" >/tmp/kekkai-check.log 2>&1; then
+  local rc=0
+  if "$candidate_bin" -check "$CONFIG_FILE" >/tmp/kekkai-check.log 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if (( rc != 0 )); then
     echo
-    err "new binary rejects current config:"
+    err "new binary validation failed:"
     sed 's/^/    /' /tmp/kekkai-check.log >&2
     echo
+    if (( rc >= 128 )); then
+      err "the new binary crashed during check (exit=$rc), likely corrupted download or bad artifact."
+      err "the installed config was NOT applied; old binary/service stay untouched."
+      echo
+      info "retry update first:"
+      info "  bash ./kekkai.sh update"
+      info "if it repeats, pin previous tag or check release artifact health."
+      exit 1
+    fi
     err "the installed config is incompatible with the new binary."
     err "the old binary and service are still running untouched."
     echo
@@ -1022,7 +1065,7 @@ post_install_hints() {
   printf '  %s1.%s edit config:      sudo nano %s\n' "$C_BOLD" "$C_RESET" "$CONFIG_FILE"
   printf '  %s2.%s validate:         kekkai check\n' "$C_BOLD" "$C_RESET"
   printf '  %s3.%s restart:          sudo systemctl restart kekkai-agent\n' "$C_BOLD" "$C_RESET"
-  printf '  %s4.%s watch live:       sudo kekkai status\n' "$C_BOLD" "$C_RESET"
+  printf '  %s4.%s watch live:       kekkai status\n' "$C_BOLD" "$C_RESET"
   printf '  %s5.%s diagnose:         kekkai doctor\n' "$C_BOLD" "$C_RESET"
   echo
 

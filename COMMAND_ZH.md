@@ -630,6 +630,13 @@ ls /sys/fs/bpf/kekkai/                    # 確認 pin 路徑有檔案
 
 bpffs 沒掛：`sudo mount -t bpf bpf /sys/fs/bpf`。
 若一般使用者仍 permission denied：先試 `sudo kekkai status` 驗證是否純權限問題。
+若 `sudo` 能看、一般使用者不能看，可直接補能力：
+
+```bash
+sudo apt-get install -y libcap2-bin
+sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep /usr/local/bin/kekkai
+getcap /usr/local/bin/kekkai
+```
 
 ### 9.5 `kekkai.sh update` 中止且 rollback
 
