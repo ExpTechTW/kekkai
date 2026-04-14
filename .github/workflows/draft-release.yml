@@ -69,6 +69,18 @@ jobs:
             ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ matrix.goos }}-${{ matrix.goarch }}-
             ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-
 
+      - name: Install eBPF build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libbpf-dev libelf-dev linux-headers-$(uname -r) \
+            make gcc pkg-config
+
+      - name: Build embedded eBPF object
+        run: |
+          make bpf
+          test -s internal/loader/bpf/xdp_filter.o
+
       - name: Build binaries
         env:
           GOOS: ${{ matrix.goos }}
