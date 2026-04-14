@@ -61,10 +61,6 @@ func parseBypassArgs(args []string) (parsedBypassArgs, error) {
 }
 
 func cmdBypassTemporary(wantBypass bool) int {
-	if os.Geteuid() != 0 {
-		fmt.Fprintln(os.Stderr, uiErr("bypass toggle requires root (run: sudo kekkai bypass on|off)"))
-		return 1
-	}
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		fmt.Fprintln(os.Stderr, uiErr("systemctl not found: cannot signal kekkai-agent"))
 		return 1
@@ -87,11 +83,6 @@ func cmdBypassTemporary(wantBypass bool) int {
 }
 
 func cmdBypassSave(wantBypass bool, cfgPath string) int {
-	if os.Geteuid() != 0 {
-		fmt.Fprintln(os.Stderr, uiErr("bypass --save requires root (run: sudo kekkai bypass on|off --save)"))
-		return 1
-	}
-
 	res, err := config.Load(cfgPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("config: %v", err)))
