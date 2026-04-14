@@ -337,6 +337,14 @@ func resolveUpdateScript() (string, []string) {
 	if repo := strings.TrimSpace(os.Getenv("KEKKAI_REPO")); repo != "" {
 		candidates = append(candidates, filepath.Join(repo, "kekkai.sh"))
 	}
+	// Common default clone location.
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		candidates = append(candidates, filepath.Join(home, "kekkai", "kekkai.sh"))
+	}
+	// When launched via sudo alias, prefer the original user's home.
+	if sudoUser := strings.TrimSpace(os.Getenv("SUDO_USER")); sudoUser != "" {
+		candidates = append(candidates, filepath.Join("/home", sudoUser, "kekkai", "kekkai.sh"))
+	}
 	if wd, err := os.Getwd(); err == nil {
 		candidates = append(candidates, filepath.Join(wd, "kekkai.sh"))
 	}
