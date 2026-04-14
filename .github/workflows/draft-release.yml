@@ -1,4 +1,4 @@
-name: Draft Release Artifacts
+name: Release Artifacts
 
 on:
   push:
@@ -9,8 +9,32 @@ permissions:
   contents: write
 
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: Compute release version
+        id: ver
+        run: |
+          VERSION="$(date -u +%Y%m%d)+b${GITHUB_RUN_NUMBER}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Decide release mode by commit message
+        id: mode
+        env:
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          if printf '%s\n' "$HEAD_MSG" | grep -qi 'build:'; then
+            echo "mode=draft" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=pre-release" >> "$GITHUB_OUTPUT"
+          fi
+
   build-artifacts:
     runs-on: ubuntu-latest
+    needs: meta
     strategy:
       fail-fast: false
       matrix:
@@ -45,21 +69,11 @@ jobs:
             ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ matrix.goos }}-${{ matrix.goarch }}-
             ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-
 
-      - name: Read version
-        id: read-version
-        run: |
-          VERSION="$(tr -d ' \n\r' < internal/buildinfo/VERSION)"
-          if [ -z "$VERSION" ]; then
-            echo "VERSION is empty" >&2
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Build binaries
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          VERSION: ${{ steps.read-version.outputs.version }}
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           mkdir -p dist
           go build -ldflags "-s -w -X main.version=${VERSION}" -o "dist/kekkai-${GOOS}-${GOARCH}" ./cmd/kekkai
@@ -73,20 +87,12 @@ jobs:
 
   publish-draft:
     runs-on: ubuntu-latest
-    needs: build-artifacts
+    needs: [meta, build-artifacts]
     steps:
-      - name: Checkout
+      - name: Checkout (for commit notes)
         uses: actions/checkout@v4
-
-      - name: Read version
-        id: read-version
-        run: |
-          VERSION="$(tr -d ' \n\r' < internal/buildinfo/VERSION)"
-          if [ -z "$VERSION" ]; then
-            echo "VERSION is empty" >&2
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -94,17 +100,145 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Prepare release notes
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          from collections import OrderedDict
+
+          repo_url = "https://github.com/ExpTechTW/kekkai"
+          mode = "${{ needs.meta.outputs.mode }}"
+          version = "${{ needs.meta.outputs.version }}"
+          before = os.getenv("BEFORE_SHA", "").strip()
+          after = os.getenv("AFTER_SHA", "").strip()
+
+          zero = "0000000000000000000000000000000000000000"
+          if before and before != zero:
+              rev_range = f"{before}..{after}"
+          else:
+              rev_range = after
+
+          proc = subprocess.run(
+              ["git", "log", "--pretty=format:%H%x1f%s", rev_range],
+              check=True,
+              text=True,
+              capture_output=True,
+          )
+          raw = [line for line in proc.stdout.splitlines() if line.strip()]
+
+          buckets = OrderedDict([
+              ("feat", "Features"),
+              ("fix", "Fixes"),
+              ("refactor", "Refactors"),
+              ("perf", "Performance"),
+              ("docs", "Docs"),
+              ("test", "Tests"),
+              ("chore", "Chores"),
+              ("ci", "CI"),
+              ("build", "Build"),
+              ("other", "Other"),
+          ])
+          grouped = {k: [] for k in buckets}
+          prs = OrderedDict()
+
+          type_re = re.compile(r"^([A-Za-z]+)(\([^)]+\))?:\s+")
+          pr_re = re.compile(r"#(\d+)")
+          merge_pr_re = re.compile(r"merge pull request #(\d+)", re.IGNORECASE)
+
+          for line in raw:
+              full_sha, subject = line.split("\x1f", 1)
+              short_sha = full_sha[:8]
+              subject = subject.strip()
+
+              m = type_re.match(subject)
+              ctype = m.group(1).lower() if m else "other"
+              if ctype not in grouped:
+                  ctype = "other"
+
+              pr_nums = pr_re.findall(subject)
+              m_merge = merge_pr_re.search(subject)
+              if m_merge and m_merge.group(1) not in pr_nums:
+                  pr_nums.append(m_merge.group(1))
+              for n in pr_nums:
+                  prs[n] = f"{repo_url}/pull/{n}"
+
+              pr_suffix = ""
+              if pr_nums:
+                  links = ", ".join(f"[#{n}]({repo_url}/pull/{n})" for n in pr_nums)
+                  pr_suffix = f" ({links})"
+
+              grouped[ctype].append(
+                  f"- {subject}{pr_suffix} ([`{short_sha}`]({repo_url}/commit/{full_sha}))"
+              )
+
+          lines = []
+          lines.append("## Release guide")
+          lines.append(f"- Mode: `{mode}`")
+          lines.append(f"- Version: `v{version}`")
+          lines.append(f"- Commit: `{after}`")
+          lines.append("")
+          lines.append("## Commit record guide")
+          lines.append(f"- Main history: {repo_url}/commits/main")
+          lines.append(f"- This commit: {repo_url}/commit/{after}")
+          if before and before != zero:
+              lines.append(f"- Compare: {repo_url}/compare/{before}...{after}")
+          lines.append("")
+
+          lines.append("## Changes by type")
+          has_changes = False
+          for key, title in buckets.items():
+              items = grouped[key]
+              if not items:
+                  continue
+              has_changes = True
+              lines.append(f"### {title}")
+              lines.extend(items)
+              lines.append("")
+          if not has_changes:
+              lines.append("- No commits found in this range.")
+              lines.append("")
+
+          lines.append("## Pull requests")
+          if prs:
+              for n, link in prs.items():
+                  lines.append(f"- [#{n}]({link})")
+          else:
+              lines.append("- No PR reference found in commit subjects.")
+          lines.append("")
+
+          with open("release-notes.md", "w", encoding="utf-8") as f:
+              f.write("\n".join(lines))
+          PY
+
       - name: Publish / update draft release
+        if: needs.meta.outputs.mode == 'draft'
         uses: ncipollo/release-action@v1
         with:
-          tag: v${{ steps.read-version.outputs.version }}-draft
-          name: v${{ steps.read-version.outputs.version }} Draft (auto)
-          body: |
-            Auto-generated draft release from `main`.
-            Version: v${{ steps.read-version.outputs.version }}
-            Commit: ${{ github.sha }}
+          tag: v${{ needs.meta.outputs.version }}-draft
+          name: v${{ needs.meta.outputs.version }} Draft (auto)
+          bodyFile: release-notes.md
           draft: true
           prerelease: false
+          allowUpdates: true
+          replacesArtifacts: true
+          removeArtifacts: true
+          artifactErrorsFailBuild: true
+          artifacts: "dist/*"
+
+      - name: Publish / update pre-release
+        if: needs.meta.outputs.mode == 'pre-release'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ needs.meta.outputs.version }}
+          name: v${{ needs.meta.outputs.version }} Pre-release (auto)
+          bodyFile: release-notes.md
+          draft: false
+          prerelease: true
           allowUpdates: true
           replacesArtifacts: true
           removeArtifacts: true

@@ -509,6 +509,11 @@ kekkai doctor                                   # 確認全綠
 sudo kekkai status                              # 看 TUI
 ```
 
+補充：
+- 預設 template 會先帶 `ingress_allowlist: 192.168.0.0/16` 作為「首次啟動保底」。
+- `kekkai.sh` 安裝時若偵測到管理介面 IP 不在 `192.168.0.0/16`，會印警告。
+- 實際上線前請務必改成你的管理網段（例如 `10.0.0.0/8`、`172.16.0.0/12`、Tailscale 網段）。
+
 ### 7.4 更新流程內部細節
 
 `bash ./kekkai.sh update` 會依 `update.channel` 走不同路徑（都含 rollback）：

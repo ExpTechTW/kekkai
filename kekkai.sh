@@ -409,6 +409,21 @@ install_binaries() {
   install_binaries_from "$ROOT/bin/kekkai-agent" "$ROOT/bin/kekkai"
 }
 
+read_cli_version() {
+  local bin="$1"
+  [[ -x "$bin" ]] || { echo "(none)"; return 0; }
+  local v
+  v="$("$bin" version 2>/dev/null | awk 'NR==1{print $2}' || true)"
+  [[ -n "$v" ]] || v="unknown"
+  echo "$v"
+}
+
+print_version_transition() {
+  local old_v="$1"
+  local new_v="$2"
+  info "version: ${old_v} -> ${new_v}"
+}
+
 setup_sudo_shortcut() {
   [[ $SETUP_SUDO_SHORTCUT -eq 1 ]] || return 0
   [[ "$OS" == "linux" ]] || { warn "--sudo-shortcut is Linux-only"; return 0; }
@@ -711,6 +726,8 @@ download_release_binary() {
 
 release_update() {
   local channel="$1"
+  local old_ver
+  old_ver="$(read_cli_version "$CLI_BIN")"
   command -v curl >/dev/null 2>&1 || die "curl not found"
   command -v python3 >/dev/null 2>&1 || die "python3 not found (required for release metadata parsing)"
 
@@ -735,6 +752,8 @@ release_update() {
   local new_agent new_cli
   new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")"
   new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")"
+  local new_ver
+  new_ver="$(read_cli_version "$new_cli")"
 
   validate_config_against_new_binary "$new_agent"
 
@@ -743,6 +762,7 @@ release_update() {
   new_sha="$(sha256sum "$new_agent" | awk '{print $1}')"
   if [[ "$old_sha" == "$new_sha" ]]; then
     log "binary unchanged — nothing to restart"
+    print_version_transition "$old_ver" "$new_ver"
     rm -rf "$tmpdir"
     return 0
   fi
@@ -752,6 +772,7 @@ release_update() {
   setup_sudo_shortcut
   enable_and_start
   log "update complete (channel=$channel, tag=$tag)"
+  print_version_transition "$old_ver" "$new_ver"
 }
 
 fetch_release_binaries_to_root_bin() {
@@ -834,6 +855,8 @@ do_install() {
 do_update() {
   banner
   step "update · $OS/$ARCH"
+  local old_ver
+  old_ver="$(read_cli_version "$CLI_BIN")"
   local channel
   channel="$(resolve_update_channel)"
   log "update channel: $channel"
@@ -844,18 +867,22 @@ do_update() {
       git_update
       build_from_source
       validate_config_against_new_binary "$ROOT/bin/kekkai-agent"
+      local new_ver
+      new_ver="$(read_cli_version "$ROOT/bin/kekkai")"
 
       local old_sha new_sha
       old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
       new_sha="$(sha256sum "$ROOT/bin/kekkai-agent" | awk '{print $1}')"
       if [[ "$old_sha" == "$new_sha" ]]; then
         log "binary unchanged — nothing to restart"
+        print_version_transition "$old_ver" "$new_ver"
         return 0
       fi
       install_binaries
       setup_sudo_shortcut
       enable_and_start
       log "update complete (channel=git:main)"
+      print_version_transition "$old_ver" "$new_ver"
       ;;
     release|pre-release)
       release_update "$channel"

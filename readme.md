@@ -58,6 +58,10 @@ GitHub Releases 會提供各平台檔案（`kekkai-*` 與 `kekkai-agent-*`）：
 - `darwin-amd64`
 - `darwin-arm64`
 
+版本字串規則：
+- git 模式（本地/repo build）：`YYYYMMDD+<shortSHA>`
+- release / draft CI build：`YYYYMMDD+b<build_number>`
+
 ## 過濾模型（Ingress）
 
 目前預設是 strict model，封包判斷順序：
