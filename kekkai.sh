@@ -80,6 +80,7 @@ persist_self_script
 AGENT_BIN=/usr/local/bin/kekkai-agent
 CLI_BIN=/usr/local/bin/kekkai
 ROLLBACK_BIN=/usr/local/bin/kekkai-agent.prev
+SCRIPT_INSTALL_PATH=/usr/local/bin/kekkai.sh
 CONFIG_DIR=/etc/kekkai
 CONFIG_FILE="$CONFIG_DIR/kekkai.yaml"
 STATS_DIR=/var/run/kekkai
@@ -89,12 +90,15 @@ UNIT_SRC="$ROOT/deploy/systemd/kekkai-agent.service"
 UNIT_DST="/etc/systemd/system/$UNIT_NAME"
 SUDOERS_DIR=/etc/sudoers.d
 SUDOERS_FILE_PREFIX=kekkai-cli-
+LOCAL_AGENT_BIN="$ROOT/bin/kekkai-agent"
+LOCAL_CLI_BIN="$ROOT/bin/kekkai"
 GO_MIN="1.22"
 GO_DOWNLOAD_VERSION="1.23.4"
 BRANCH=main
 REPO_OWNER=ExpTechTW
 REPO_NAME=kekkai
 RELEASES_API_BASE="https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases"
+RAW_BASE="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME"
 
 # ---------------------------------------------------------------------------
 # CLI parsing
@@ -422,8 +426,8 @@ build_from_source() {
 
   log "compiling Go binaries (kekkai-agent + kekkai)"
   make build
-  [[ -x "$ROOT/bin/kekkai-agent" ]] || die "build failed: bin/kekkai-agent missing"
-  [[ -x "$ROOT/bin/kekkai" ]]       || die "build failed: bin/kekkai missing"
+  [[ -x "$LOCAL_AGENT_BIN" ]] || die "build failed: $LOCAL_AGENT_BIN missing"
+  [[ -x "$LOCAL_CLI_BIN" ]]   || die "build failed: $LOCAL_CLI_BIN missing"
 }
 
 install_binaries_from() {
@@ -443,10 +447,53 @@ install_binaries_from() {
 
   $SUDO install -D -m 0755 "$src_cli" "$CLI_BIN"
   log "installed: $CLI_BIN"
+
+  persist_script_for_updates
+}
+
+# persist_script_for_updates puts a copy of kekkai.sh at /usr/local/bin/kekkai.sh
+# so future `sudo kekkai update` calls can find it via resolveUpdateScript().
+#
+# Three sources, in priority order:
+#   1. $ROOT/kekkai.sh (repo clone or persist_self_script() already worked)
+#   2. $0 itself, if it's a readable regular file (not /dev/fd/*)
+#   3. curl from the main branch on GitHub (last resort for one-shot
+#      `curl | bash` installs where $0 is /dev/fd/* and $ROOT is empty)
+persist_script_for_updates() {
+  [[ "$OS" == "linux" ]] || return 0
+
+  local src=""
+  if [[ -f "$ROOT/kekkai.sh" ]] && [[ -s "$ROOT/kekkai.sh" ]]; then
+    src="$ROOT/kekkai.sh"
+  elif [[ -r "$0" ]] && [[ -f "$0" ]]; then
+    src="$0"
+  fi
+
+  if [[ -n "$src" ]]; then
+    $SUDO install -D -m 0755 "$src" "$SCRIPT_INSTALL_PATH"
+    log "installed: $SCRIPT_INSTALL_PATH (for future 'sudo kekkai update')"
+    return 0
+  fi
+
+  # Fallback: fetch from GitHub. Acceptable here because we're already
+  # mid-install from curl|bash — the user has implicitly trusted main.
+  if command -v curl >/dev/null 2>&1; then
+    local tmp
+    tmp="$(mktemp)"
+    if curl -fsSL "$RAW_BASE/$BRANCH/kekkai.sh" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      $SUDO install -D -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"
+      rm -f "$tmp"
+      log "installed: $SCRIPT_INSTALL_PATH (fetched from $BRANCH — for future 'sudo kekkai update')"
+      return 0
+    fi
+    rm -f "$tmp"
+  fi
+
+  warn "could not persist kekkai.sh to $SCRIPT_INSTALL_PATH — 'sudo kekkai update' will need KEKKAI_SCRIPT set"
 }
 
 install_binaries() {
-  install_binaries_from "$ROOT/bin/kekkai-agent" "$ROOT/bin/kekkai"
+  install_binaries_from "$LOCAL_AGENT_BIN" "$LOCAL_CLI_BIN"
 }
 
 read_cli_version() {
@@ -793,92 +840,97 @@ download_release_binary() {
   echo "$out"
 }
 
+require_release_tools() {
+  command -v curl    >/dev/null 2>&1 || die "curl not found"
+  command -v python3 >/dev/null 2>&1 || die "python3 not found (required for release metadata parsing)"
+}
+
+# fetch_release_artifacts: shared release fetch/parse/download.
+# Inputs:  channel, tmpdir
+# Outputs (via globals): REL_TAG, REL_NEW_AGENT, REL_NEW_CLI
+#
+# Using globals keeps the caller simple (vs. parsing stdout). A trailing
+# `unset` in each caller is unnecessary — install is a one-shot script.
+fetch_release_artifacts() {
+  local channel="$1"
+  local tmpdir="$2"
+
+  require_release_tools
+
+  local meta parsed
+  meta="$(fetch_release_metadata "$channel")" || die "failed to fetch GitHub release metadata"
+  parsed="$(printf '%s' "$meta" | select_release_assets "$channel" "$OS" "$ARCH")" \
+    || die "failed to resolve release assets for $OS/$ARCH"
+
+  REL_TAG="$(printf '%s\n' "$parsed" | sed -n '1p')"
+  local agent_url cli_url
+  agent_url="$(printf '%s\n' "$parsed" | sed -n '2p')"
+  cli_url="$(printf '%s\n' "$parsed"   | sed -n '3p')"
+  [[ -n "$agent_url" && -n "$cli_url" ]] || die "release metadata incomplete"
+
+  log "selected release: $REL_TAG ($channel)"
+  info "agent asset: $(basename "${agent_url%%\?*}")"
+  info "cli asset:   $(basename "${cli_url%%\?*}")"
+
+  REL_NEW_AGENT="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")" \
+    || die "failed to download/verify kekkai-agent binary"
+  REL_NEW_CLI="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")" \
+    || die "failed to download/verify kekkai binary"
+}
+
+# agent_unchanged: 0 (true) if the candidate agent binary matches the
+# currently installed one byte-for-byte — used to short-circuit restart.
+agent_unchanged() {
+  local candidate="$1"
+  [[ -f "$AGENT_BIN" ]] || return 1
+  local old_sha new_sha
+  old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
+  new_sha="$(sha256sum "$candidate" | awk '{print $1}')"
+  [[ "$old_sha" == "$new_sha" ]]
+}
+
 release_update() {
   local channel="$1"
   local old_ver
   old_ver="$(read_cli_version "$CLI_BIN")"
-  command -v curl >/dev/null 2>&1 || die "curl not found"
-  command -v python3 >/dev/null 2>&1 || die "python3 not found (required for release metadata parsing)"
-
-  local meta
-  meta="$(fetch_release_metadata "$channel")" || die "failed to fetch GitHub release metadata"
-
-  local parsed
-  parsed="$(printf '%s' "$meta" | select_release_assets "$channel" "$OS" "$ARCH")" || die "failed to resolve release assets for $OS/$ARCH"
-  local tag agent_url cli_url
-  tag="$(printf '%s\n' "$parsed" | sed -n '1p')"
-  agent_url="$(printf '%s\n' "$parsed" | sed -n '2p')"
-  cli_url="$(printf '%s\n' "$parsed" | sed -n '3p')"
-  [[ -n "$agent_url" && -n "$cli_url" ]] || die "release metadata incomplete"
-
-  log "selected release: $tag ($channel)"
-  info "agent asset: $(basename "${agent_url%%\?*}")"
-  info "cli asset:   $(basename "${cli_url%%\?*}")"
 
   local tmpdir
   tmpdir="$(mktemp -d)"
-
-  local new_agent new_cli
-  new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")" || die "failed to download/verify kekkai-agent binary"
-  new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")" || die "failed to download/verify kekkai binary"
+  fetch_release_artifacts "$channel" "$tmpdir"
   local new_ver
-  new_ver="$(read_cli_version "$new_cli")"
+  new_ver="$(read_cli_version "$REL_NEW_CLI")"
 
-  validate_config_against_new_binary "$new_agent"
+  validate_config_against_new_binary "$REL_NEW_AGENT"
 
-  local old_sha new_sha
-  old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
-  new_sha="$(sha256sum "$new_agent" | awk '{print $1}')"
-  if [[ "$old_sha" == "$new_sha" ]]; then
+  if agent_unchanged "$REL_NEW_AGENT"; then
     log "up-to-date (binary unchanged — nothing to restart)"
     print_version_transition "$old_ver" "$new_ver"
     rm -rf "$tmpdir"
     return 0
   fi
 
-  install_binaries_from "$new_agent" "$new_cli"
+  install_binaries_from "$REL_NEW_AGENT" "$REL_NEW_CLI"
   rm -rf "$tmpdir"
   setup_passwordless_sudo
   enable_and_start
-  log "update complete (channel=$channel, tag=$tag)"
+  log "update complete (channel=$channel, tag=$REL_TAG)"
   print_version_transition "$old_ver" "$new_ver"
 }
 
 fetch_release_binaries_to_root_bin() {
   local channel="$1"
-  command -v curl >/dev/null 2>&1 || die "curl not found"
-  command -v python3 >/dev/null 2>&1 || die "python3 not found (required for release metadata parsing)"
-
-  local meta
-  meta="$(fetch_release_metadata "$channel")" || die "failed to fetch GitHub release metadata"
-
-  local parsed
-  parsed="$(printf '%s' "$meta" | select_release_assets "$channel" "$OS" "$ARCH")" || die "failed to resolve release assets for $OS/$ARCH"
-  local tag agent_url cli_url
-  tag="$(printf '%s\n' "$parsed" | sed -n '1p')"
-  agent_url="$(printf '%s\n' "$parsed" | sed -n '2p')"
-  cli_url="$(printf '%s\n' "$parsed" | sed -n '3p')"
-  [[ -n "$agent_url" && -n "$cli_url" ]] || die "release metadata incomplete"
-
-  log "selected release: $tag ($channel)"
-  info "agent asset: $(basename "${agent_url%%\?*}")"
-  info "cli asset:   $(basename "${cli_url%%\?*}")"
-
   local tmpdir
   tmpdir="$(mktemp -d)"
-  local new_agent new_cli
-  new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")" || die "failed to download/verify kekkai-agent binary"
-  new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")" || die "failed to download/verify kekkai binary"
+  fetch_release_artifacts "$channel" "$tmpdir"
 
   mkdir -p "$ROOT/bin"
-  cp "$new_agent" "$ROOT/bin/kekkai-agent"
-  cp "$new_cli" "$ROOT/bin/kekkai"
-  chmod +x "$ROOT/bin/kekkai-agent" "$ROOT/bin/kekkai"
+  install -m 0755 "$REL_NEW_AGENT" "$LOCAL_AGENT_BIN"
+  install -m 0755 "$REL_NEW_CLI"   "$LOCAL_CLI_BIN"
   rm -rf "$tmpdir"
 }
 
 validate_config_against_new_binary() {
-  local candidate_bin="${1:-$ROOT/bin/kekkai-agent}"
+  local candidate_bin="${1:-$LOCAL_AGENT_BIN}"
   [[ -f "$CONFIG_FILE" ]] || return 0
   log "validating $CONFIG_FILE against new binary"
   local rc=0
@@ -907,7 +959,7 @@ validate_config_against_new_binary() {
     info "to fix, one of:"
     info "  1. edit the config:        sudo nano $CONFIG_FILE"
     info "  2. reset to a clean template (backs up the broken file first):"
-    info "       sudo $ROOT/bin/kekkai-agent -reset -config $CONFIG_FILE"
+    info "       sudo $LOCAL_AGENT_BIN -reset -config $CONFIG_FILE"
     info "     then edit to add filter.ingress_allowlist, and re-run:"
     info "       bash ./kekkai.sh update"
     info "  3. restore from an earlier backup:"
@@ -950,14 +1002,11 @@ do_update() {
       ensure_go
       git_update
       build_from_source
-      validate_config_against_new_binary "$ROOT/bin/kekkai-agent"
+      validate_config_against_new_binary "$LOCAL_AGENT_BIN"
       local new_ver
-      new_ver="$(read_cli_version "$ROOT/bin/kekkai")"
+      new_ver="$(read_cli_version "$LOCAL_CLI_BIN")"
 
-      local old_sha new_sha
-      old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
-      new_sha="$(sha256sum "$ROOT/bin/kekkai-agent" | awk '{print $1}')"
-      if [[ "$old_sha" == "$new_sha" ]]; then
+      if agent_unchanged "$LOCAL_AGENT_BIN"; then
         log "up-to-date (binary unchanged — nothing to restart)"
         print_version_transition "$old_ver" "$new_ver"
         return 0
