@@ -91,6 +91,8 @@ var (
 	kanjiStyle = lipgloss.NewStyle().
 			Foreground(cMagenta).
 			Bold(true)
+
+	sparkBlocks = []rune("▁▂▃▄▅▆▇█")
 )
 
 // ---------- entry ---------------------------------------------------------
@@ -498,9 +500,15 @@ func sparkline(series []float64, width int, color lipgloss.Color) string {
 	if len(series) == 0 {
 		return dimStyle.Render(strings.Repeat("·", width))
 	}
-	blocks := []rune("▁▂▃▄▅▆▇█")
-	// Downsample to requested width.
-	sampled := make([]float64, width)
+	// Downsample to requested width. Charts page caps width at 96, so use a
+	// fixed stack buffer in steady-state to avoid per-frame heap allocations.
+	var sampledFixed [96]float64
+	sampled := sampledFixed[:0]
+	if width <= len(sampledFixed) {
+		sampled = sampledFixed[:width]
+	} else {
+		sampled = make([]float64, width)
+	}
 	if len(series) <= width {
 		start := width - len(series)
 		for i := 0; i < start; i++ {
@@ -523,15 +531,16 @@ func sparkline(series []float64, width int, color lipgloss.Color) string {
 		return dimStyle.Render(strings.Repeat("·", width))
 	}
 	var b strings.Builder
+	b.Grow(width * 3) // block glyphs are multi-byte UTF-8
 	for _, v := range sampled {
-		level := int((v / maxV) * float64(len(blocks)-1))
+		level := int((v / maxV) * float64(len(sparkBlocks)-1))
 		if level < 0 {
 			level = 0
 		}
-		if level >= len(blocks) {
-			level = len(blocks) - 1
+		if level >= len(sparkBlocks) {
+			level = len(sparkBlocks) - 1
 		}
-		b.WriteRune(blocks[level])
+		b.WriteRune(sparkBlocks[level])
 	}
 	return lipgloss.NewStyle().Foreground(color).Render(b.String())
 }

@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+
+	"github.com/ExpTechTW/kekkai/internal/fastio"
 )
 
 // Global stats slot indices — keep in sync with bpf/xdp_filter.c.
@@ -125,8 +127,8 @@ type Reader struct {
 	prev         Global
 	prevAt       time.Time
 	hasPrev      bool
-	txBytesPath  string
-	txPktsPath   string
+	txBytes      *fastio.CounterReader
+	txPkts       *fastio.CounterReader
 	prevTxBytes  uint64
 	prevTxPkts   uint64
 	prevTxAt     time.Time
@@ -171,14 +173,14 @@ func NewReader(global, perip *ebpf.Map, nodeID, iface, outPath string) *Reader {
 		topN:         10,
 		peripCap:     peripCap,
 		startedAt:    time.Now(),
-		txBytesPath:  fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface),
-		txPktsPath:   fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface),
 		globalPerCPU: make([]uint64, 0, 128),
 		bufA:         make([]TopEntry, 0, peripCap),
 		bufB:         make([]TopEntry, 0, peripCap),
 		scanKeys:     make([]uint32, batchSize),
 		scanVals:     make([]perIPStat, batchSize),
 	}
+	r.txBytes = fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface))
+	r.txPkts = fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface))
 	r.fileBuf.Grow(4096)
 	return r
 }
@@ -188,6 +190,14 @@ func (r *Reader) Run(stop <-chan struct{}) error {
 	if err := os.MkdirAll(filepath.Dir(r.outPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir stats dir: %w", err)
 	}
+	defer func() {
+		if r.txBytes != nil {
+			_ = r.txBytes.Close()
+		}
+		if r.txPkts != nil {
+			_ = r.txPkts.Close()
+		}
+	}()
 
 	// Seed an empty snapshot so the writer has something to render.
 	r.snapshot[0] = topSnapshot{Entries: r.bufA[:0]}
@@ -349,17 +359,14 @@ func (r *Reader) readGlobal() (Global, error) {
 }
 
 func (r *Reader) readTx() (uint64, uint64) {
-	b, _ := readUint(r.txBytesPath)
-	p, _ := readUint(r.txPktsPath)
-	return b, p
-}
-
-func readUint(path string) (uint64, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
+	var b, p uint64
+	if r.txBytes != nil {
+		b, _ = r.txBytes.Read()
 	}
-	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if r.txPkts != nil {
+		p, _ = r.txPkts.Read()
+	}
+	return b, p
 }
 
 // --- slow path: perip scan --------------------------------------------------

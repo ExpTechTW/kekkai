@@ -8,14 +8,12 @@ package tui
 import (
 	"fmt"
 	"net/netip"
-	"os"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
 
+	"github.com/ExpTechTW/kekkai/internal/fastio"
 	"github.com/ExpTechTW/kekkai/internal/stats"
 )
 
@@ -29,8 +27,8 @@ type Source struct {
 	peripMap *ebpf.Map
 
 	iface       string
-	txBytesPath string
-	txPktsPath  string
+	txBytes     *fastio.CounterReader
+	txPkts      *fastio.CounterReader
 
 	// scratch for PERCPU_ARRAY lookups
 	perCPU []uint64
@@ -91,8 +89,8 @@ func NewSource(iface string) (*Source, error) {
 		statsMap:    st,
 		peripMap:    perip,
 		iface:       iface,
-		txBytesPath: fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface),
-		txPktsPath:  fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface),
+		txBytes:     fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface)),
+		txPkts:      fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface)),
 		perCPU:      make([]uint64, 0, 128),
 		topBuf:      make([]topRow, 0, cap),
 	}, nil
@@ -104,6 +102,12 @@ func (s *Source) Close() {
 	}
 	if s.peripMap != nil {
 		s.peripMap.Close()
+	}
+	if s.txBytes != nil {
+		_ = s.txBytes.Close()
+	}
+	if s.txPkts != nil {
+		_ = s.txPkts.Close()
 	}
 }
 
@@ -261,17 +265,14 @@ func assignSlot(g *stats.Global, slot uint32, sum uint64) {
 }
 
 func (s *Source) readTx() (uint64, uint64) {
-	b, _ := readUint(s.txBytesPath)
-	p, _ := readUint(s.txPktsPath)
-	return b, p
-}
-
-func readUint(path string) (uint64, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
+	var b, p uint64
+	if s.txBytes != nil {
+		b, _ = s.txBytes.Read()
 	}
-	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if s.txPkts != nil {
+		p, _ = s.txPkts.Read()
+	}
+	return b, p
 }
 
 func unpackAddr(key uint32) [4]byte {
