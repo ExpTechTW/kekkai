@@ -213,11 +213,19 @@ func (l *linuxImpl) close() error {
 // <root>/<map-name>. Called right after NewCollection so subsequent
 // LoadPinnedMap() calls from CLI / TUI processes succeed.
 func pinMaps(coll *ebpf.Collection, root string) error {
+	// Best-effort: keep pin root traversable for non-root operator tooling
+	// (kekkai status / doctor). Some hardened systems may still enforce
+	// additional LSM checks, so permission failures are non-fatal here.
+	_ = os.Chmod(root, 0o755)
+
 	for name, m := range coll.Maps {
 		path := filepath.Join(root, name)
 		if err := m.Pin(path); err != nil {
 			return fmt.Errorf("pin %s → %s: %w", name, path, err)
 		}
+		// Make pinned map inode readable by non-root users so `kekkai status`
+		// can open maps without sudo on standard Linux setups.
+		_ = os.Chmod(path, 0o644)
 	}
 	return nil
 }
