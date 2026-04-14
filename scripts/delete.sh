@@ -103,4 +103,4 @@ fi
 log "delete complete"
 echo
 echo "Reinstall when ready:"
-echo "  KEKKAI_UPDATE_CHANNEL=pre-release bash <(curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh)"
+echo "  curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh | KEKKAI_UPDATE_CHANNEL=pre-release bash -s -- install"

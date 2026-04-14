@@ -21,13 +21,22 @@
 一鍵安裝（直接執行 GitHub raw 腳本）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh)
+curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh \
+  | bash -s -- install
 ```
 
 若要固定更新通道（例如 pre-release）：
 
 ```bash
-KEKKAI_UPDATE_CHANNEL=pre-release bash <(curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh)
+curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh \
+  | KEKKAI_UPDATE_CHANNEL=pre-release bash -s -- install
+```
+
+完整刪除（建議用 `curl | sudo bash`，避免 `sudo` + `/dev/fd` 問題）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/scripts/delete.sh \
+  | sudo bash -s -- --yes --purge-home
 ```
 
 或用 repo 模式（開發者）：
