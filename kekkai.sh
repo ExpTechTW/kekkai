@@ -25,10 +25,31 @@
 #
 set -euo pipefail
 
-# ROOT is the directory containing this script — the repo root, since
-# kekkai.sh lives at the top level so `bash kekkai.sh` from a fresh
-# clone does the right thing without extra path juggling.
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+# ROOT resolution:
+# - repo mode: directory containing kekkai.sh (normal git clone usage)
+# - raw mode (`bash <(curl ...)`): fallback to ~/kekkai (or $KEKKAI_REPO)
+#   because $0 becomes /dev/fd/* and is not a writable project directory.
+resolve_root() {
+  if [[ -n "${KEKKAI_REPO:-}" ]]; then
+    mkdir -p "$KEKKAI_REPO"
+    (cd "$KEKKAI_REPO" && pwd)
+    return
+  fi
+
+  local script_dir
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+
+  if [[ "$script_dir" == /dev/fd* ]] || [[ "$script_dir" == /proc/*/fd* ]]; then
+    local fallback="${HOME:-/tmp}/kekkai"
+    mkdir -p "$fallback"
+    (cd "$fallback" && pwd)
+    return
+  fi
+
+  echo "$script_dir"
+}
+
+ROOT="$(resolve_root)"
 cd "$ROOT"
 
 # ---------------------------------------------------------------------------
@@ -497,9 +518,50 @@ install_config() {
 
 install_systemd_unit() {
   command -v systemctl >/dev/null 2>&1 || { warn "systemctl not found — skipping unit install"; return; }
-  [[ -f "$UNIT_SRC" ]] || die "systemd unit template missing: $UNIT_SRC"
   log "installing systemd unit to $UNIT_DST"
-  $SUDO install -D -m 0644 "$UNIT_SRC" "$UNIT_DST"
+  if [[ -f "$UNIT_SRC" ]]; then
+    $SUDO install -D -m 0644 "$UNIT_SRC" "$UNIT_DST"
+  else
+    warn "systemd unit template not found in $ROOT; using built-in fallback unit"
+    local tmp_unit
+    tmp_unit="$(mktemp)"
+    cat > "$tmp_unit" <<'EOF'
+[Unit]
+Description=kekkai edge XDP firewall agent
+Documentation=https://github.com/ExpTechTW/kekkai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kekkai-agent -config /etc/kekkai/kekkai.yaml -managed-config /etc/kekkai/kekkai.agent.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+User=root
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/sys/fs/bpf /var/run /run /etc/kekkai
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kekkai-agent
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    $SUDO install -D -m 0644 "$tmp_unit" "$UNIT_DST"
+    rm -f "$tmp_unit"
+  fi
   $SUDO systemctl daemon-reload
 }
 
