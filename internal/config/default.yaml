@@ -39,6 +39,18 @@ interface:
   #     driver 失敗時會自動降級回 generic。
   xdp_mode: __INTERFACE_XDP_MODE__
 
+# ---------- update channel ----------
+update:
+  # EN: Select where `kekkai update` gets binaries/code from:
+  #     - git:main    -> use local repo fast-forward + build (developer mode)
+  #     - release     -> download latest stable release from GitHub Releases
+  #     - pre-release -> download latest pre-release from GitHub Releases
+  # ZH: 指定 `kekkai update` 更新來源：
+  #     - git:main    -> 走本地 repo fast-forward + build（開發模式）
+  #     - release     -> 從 GitHub Releases 抓最新穩定版
+  #     - pre-release -> 從 GitHub Releases 抓最新預發布版
+  channel: __UPDATE_CHANNEL__
+
 # ---------- runtime toggles ----------
 runtime:
   # EN: Emergency bypass loads the eBPF program and maps but does NOT attach

@@ -23,6 +23,7 @@ type Values struct {
 
 	InterfaceName    string
 	InterfaceXDPMode string
+	UpdateChannel    string
 
 	EmergencyBypass bool
 	PerIPTableSize  uint32
@@ -50,6 +51,7 @@ func DefaultValues() Values {
 	return Values{
 		NodeRegion:        "default",
 		InterfaceXDPMode:  DefaultXDPMode,
+		UpdateChannel:     DefaultUpdateChannel,
 		EmergencyBypass:   false,
 		PerIPTableSize:    DefaultPerIPTableSize,
 		StatsFile:         DefaultStatsFile,
@@ -71,6 +73,9 @@ func Render(v Values) string {
 	}
 	if v.InterfaceXDPMode == "" {
 		v.InterfaceXDPMode = DefaultXDPMode
+	}
+	if v.UpdateChannel == "" {
+		v.UpdateChannel = DefaultUpdateChannel
 	}
 	if v.PerIPTableSize == 0 {
 		v.PerIPTableSize = DefaultPerIPTableSize
@@ -102,6 +107,7 @@ func Render(v Values) string {
 	replace("__NODE_REGION__", v.NodeRegion)
 	replace("__INTERFACE_NAME__", v.InterfaceName)
 	replace("__INTERFACE_XDP_MODE__", v.InterfaceXDPMode)
+	replace("__UPDATE_CHANNEL__", v.UpdateChannel)
 	replace("__RUNTIME_EMERGENCY_BYPASS__", boolYAML(v.EmergencyBypass))
 	replace("__RUNTIME_PERIP_TABLE_SIZE__", strconv.FormatUint(uint64(v.PerIPTableSize), 10))
 	replace("__OBSERVABILITY_STATS_FILE__", v.StatsFile)

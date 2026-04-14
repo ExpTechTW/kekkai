@@ -306,7 +306,7 @@ func cmdUpdate(args []string) int {
 		realUser := os.Getenv("SUDO_USER")
 		sudoArgs := []string{
 			"-u", realUser,
-			"--preserve-env=KEKKAI_SCRIPT,KEKKAI_REPO,KEKKAI_GIT_ACCEPT_NEW_HOSTKEY,GIT_SSH_COMMAND",
+			"--preserve-env=KEKKAI_SCRIPT,KEKKAI_REPO,KEKKAI_GIT_ACCEPT_NEW_HOSTKEY,GIT_SSH_COMMAND,KEKKAI_UPDATE_CHANNEL",
 			"bash", script, "update",
 		}
 		sudoArgs = append(sudoArgs, args...)
@@ -400,7 +400,14 @@ func cmdStatus(args []string) int {
 	}
 	defer src.Close()
 
-	model := tui.NewModel(src, cfg.Node.ID, cfg.Interface.Name, cfg.Interface.XDPMode)
+	model := tui.NewModel(
+		src,
+		cfg.Node.ID,
+		cfg.Interface.Name,
+		cfg.Interface.XDPMode,
+		version,
+		cfg.Update.Channel,
+	)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui: %v\n", err)

@@ -10,6 +10,7 @@ const (
 	DefaultStatsFile       = "/var/run/kekkai/stats.txt"
 	DefaultPerIPTableSize  = 65536
 	DefaultXDPMode         = "generic"
+	DefaultUpdateChannel   = "release"
 	DefaultUDPEphemeralMin = uint16(32768)
 
 	SSHPort = uint16(22)

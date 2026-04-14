@@ -29,6 +29,7 @@ type Config struct {
 
 	Node          NodeConfig          `yaml:"node"`
 	Interface     InterfaceConfig     `yaml:"interface"`
+	Update        UpdateConfig        `yaml:"update"`
 	Runtime       RuntimeConfig       `yaml:"runtime"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	Security      SecurityConfig      `yaml:"security"`
@@ -43,6 +44,14 @@ type NodeConfig struct {
 type InterfaceConfig struct {
 	Name    string `yaml:"name"`
 	XDPMode string `yaml:"xdp_mode"` // generic | driver | offload
+}
+
+type UpdateConfig struct {
+	// Channel controls `kekkai update` source.
+	// - git:main    : fast-forward + local build from repository
+	// - release     : latest stable GitHub release asset
+	// - pre-release : latest pre-release GitHub release asset
+	Channel string `yaml:"channel"`
 }
 
 type RuntimeConfig struct {
@@ -255,6 +264,7 @@ func ValuesFromConfig(cfg *Config) Values {
 		NodeRegion:        cfg.Node.Region,
 		InterfaceName:     cfg.Interface.Name,
 		InterfaceXDPMode:  cfg.Interface.XDPMode,
+		UpdateChannel:     cfg.Update.Channel,
 		EmergencyBypass:   cfg.Runtime.EmergencyBypass,
 		PerIPTableSize:    cfg.Runtime.PerIPTableSize,
 		StatsFile:         cfg.Observability.StatsFile,
@@ -300,6 +310,9 @@ func (c *Config) applyDefaults() {
 	if c.Interface.XDPMode == "" {
 		c.Interface.XDPMode = DefaultXDPMode
 	}
+	if c.Update.Channel == "" {
+		c.Update.Channel = DefaultUpdateChannel
+	}
 	if c.Runtime.PerIPTableSize == 0 {
 		c.Runtime.PerIPTableSize = DefaultPerIPTableSize
 	}
@@ -332,6 +345,11 @@ func (c *Config) Validate() error {
 	case "generic", "driver", "offload":
 	default:
 		return fmt.Errorf("interface.xdp_mode: invalid %q (want generic|driver|offload)", c.Interface.XDPMode)
+	}
+	switch c.Update.Channel {
+	case "git:main", "release", "pre-release":
+	default:
+		return fmt.Errorf("update.channel: invalid %q (want git:main|release|pre-release)", c.Update.Channel)
 	}
 
 	tcpSeen, udpSeen := map[uint16]string{}, map[uint16]string{}

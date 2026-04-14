@@ -1,0 +1,76 @@
+name: Draft Release Artifacts
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build-artifacts:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_SHA::12}"
+          go build -ldflags "-s -w -X main.version=${VERSION}" -o "dist/kekkai-${GOOS}-${GOARCH}" ./cmd/kekkai
+          go build -ldflags "-s -w -X main.version=${VERSION}" -o "dist/kekkai-agent-${GOOS}-${GOARCH}" ./cmd/kekkai-agent
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bins-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+  publish-draft:
+    runs-on: ubuntu-latest
+    needs: build-artifacts
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish / update draft release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: main-draft
+          name: Main Draft (auto)
+          body: |
+            Auto-generated draft release from `main`.
+            Commit: ${{ github.sha }}
+          draft: true
+          prerelease: false
+          allowUpdates: true
+          replacesArtifacts: true
+          removeArtifacts: true
+          artifactErrorsFailBuild: true
+          artifacts: "dist/*"

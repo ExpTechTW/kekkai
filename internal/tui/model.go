@@ -1,7 +1,12 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -46,12 +51,17 @@ type Model struct {
 	nodeID    string
 	iface     string
 	xdpMode   string
+	version   string
+	updateChannel string
+	updateState   string // checking | up-to-date | update-available | n/a | error
+	updateLatest  string
+	updateHint    string
 	errMsg    string // non-fatal error from the last tick
 }
 
 // NewModel wires a Source to a Model. The Source is owned by the Model
 // and closed when the program exits.
-func NewModel(src *Source, nodeID, iface, xdpMode string) *Model {
+func NewModel(src *Source, nodeID, iface, xdpMode, version, updateChannel string) *Model {
 	return &Model{
 		src:       src,
 		page:      PageOverview,
@@ -59,6 +69,9 @@ func NewModel(src *Source, nodeID, iface, xdpMode string) *Model {
 		nodeID:    nodeID,
 		iface:     iface,
 		xdpMode:   xdpMode,
+		version:   version,
+		updateChannel: updateChannel,
+		updateState:   "checking",
 		ppsHist:   make([]float64, 0, 120),
 		dpsHist:   make([]float64, 0, 120),
 		tcpHist:   make([]float64, 0, 120),
@@ -85,10 +98,17 @@ type readMsg struct {
 	err  error
 }
 
+type updateCheckMsg struct {
+	state  string
+	latest string
+	hint   string
+}
+
 func (m *Model) Init() tea.Cmd {
 	return tea.Batch(
 		tickCmd(),
 		m.doRead(),
+		m.doUpdateCheck(),
 	)
 }
 
@@ -96,6 +116,13 @@ func (m *Model) doRead() tea.Cmd {
 	return func() tea.Msg {
 		snap, err := m.src.Read(m.prev)
 		return readMsg{snap: snap, err: err}
+	}
+}
+
+func (m *Model) doUpdateCheck() tea.Cmd {
+	return func() tea.Msg {
+		state, latest, hint := checkUpdateStatus(m.updateChannel, m.version)
+		return updateCheckMsg{state: state, latest: latest, hint: hint}
 	}
 }
 
@@ -137,6 +164,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.topCursor = 0
 			}
 		}
+		return m, nil
+
+	case updateCheckMsg:
+		m.updateState = msg.state
+		m.updateLatest = msg.latest
+		m.updateHint = msg.hint
 		return m, nil
 	}
 	return m, nil
@@ -215,4 +248,132 @@ func pushSeries(series []float64, v float64, max int) []float64 {
 func (m *Model) uptime() string {
 	d := time.Since(m.startedAt).Truncate(time.Second)
 	return fmt.Sprintf("%s", d)
+}
+
+func checkUpdateStatus(channel, current string) (state, latest, hint string) {
+	channel = strings.TrimSpace(channel)
+	if channel == "" {
+		channel = "release"
+	}
+	switch channel {
+	case "git:main":
+		return "n/a", "", "update check via status is release-only (channel=git:main)"
+	case "release", "pre-release":
+	default:
+		return "error", "", "unsupported update channel: " + channel
+	}
+
+	tag, err := fetchLatestReleaseTag(channel)
+	if err != nil {
+		return "error", "", "check failed: " + err.Error()
+	}
+	if tag == "" {
+		return "error", "", "check failed: empty release tag"
+	}
+
+	curNorm, curOK := normalizeSemver(current)
+	latestNorm, latestOK := normalizeSemver(tag)
+	if !curOK || !latestOK {
+		return "n/a", tag, "local version is non-semver; latest release=" + tag
+	}
+	switch compareSemver(curNorm, latestNorm) {
+	case -1:
+		return "update-available", tag, "new release available"
+	default:
+		return "up-to-date", tag, "already latest"
+	}
+}
+
+func fetchLatestReleaseTag(channel string) (string, error) {
+	const base = "https://api.github.com/repos/ExpTechTW/kekkai/releases"
+	url := base + "/latest"
+	if channel == "pre-release" {
+		url = base + "?per_page=20"
+	}
+
+	client := &http.Client{Timeout: 3500 * time.Millisecond}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("http %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if channel == "release" {
+		var r struct {
+			TagName string `json:"tag_name"`
+		}
+		if err := json.Unmarshal(body, &r); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(r.TagName), nil
+	}
+
+	var rs []struct {
+		Draft      bool   `json:"draft"`
+		Prerelease bool   `json:"prerelease"`
+		TagName    string `json:"tag_name"`
+	}
+	if err := json.Unmarshal(body, &rs); err != nil {
+		return "", err
+	}
+	for _, r := range rs {
+		if r.Draft || !r.Prerelease {
+			continue
+		}
+		return strings.TrimSpace(r.TagName), nil
+	}
+	return "", fmt.Errorf("no pre-release found")
+}
+
+func normalizeSemver(v string) (string, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", false
+	}
+	v = strings.TrimPrefix(v, "v")
+	core := v
+	if i := strings.IndexAny(core, "-+"); i >= 0 {
+		core = core[:i]
+	}
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return "", false
+		}
+		if _, err := strconv.Atoi(p); err != nil {
+			return "", false
+		}
+	}
+	return core, true
+}
+
+func compareSemver(a, b string) int {
+	pa := strings.Split(a, ".")
+	pb := strings.Split(b, ".")
+	for i := 0; i < 3; i++ {
+		ai, _ := strconv.Atoi(pa[i])
+		bi, _ := strconv.Atoi(pb[i])
+		if ai < bi {
+			return -1
+		}
+		if ai > bi {
+			return 1
+		}
+	}
+	return 0
 }

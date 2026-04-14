@@ -173,7 +173,8 @@ func (m *Model) viewBanner() string {
 func (m *Model) viewHeader() string {
 	meta := fmt.Sprintf("node=%s  iface=%s  xdp=%s  uptime=%s",
 		m.nodeID, m.iface, m.xdpMode, m.uptime())
-	return " " + dimStyle.Render(meta)
+	update := m.renderUpdateStatus()
+	return " " + dimStyle.Render(meta) + "\n " + update
 }
 
 func (m *Model) viewTabs() string {
@@ -195,6 +196,30 @@ func (m *Model) viewFooter() string {
 		help = criticalStyle.Render("⚠ "+m.errMsg) + "   " + help
 	}
 	return footerStyle.Render(help)
+}
+
+func (m *Model) renderUpdateStatus() string {
+	base := fmt.Sprintf("version=%s  channel=%s", m.version, m.updateChannel)
+	switch m.updateState {
+	case "checking":
+		return dimStyle.Render(base + "  update=checking...")
+	case "up-to-date":
+		return passStyle.Render(base + "  update=up-to-date (" + m.updateLatest + ")")
+	case "update-available":
+		return warnStyle.Render(base + "  update=available (" + m.updateLatest + ")")
+	case "n/a":
+		if m.updateHint != "" {
+			return dimStyle.Render(base + "  update=n/a · " + m.updateHint)
+		}
+		return dimStyle.Render(base + "  update=n/a")
+	case "error":
+		if m.updateHint != "" {
+			return alertStyle.Render(base + "  update=error · " + m.updateHint)
+		}
+		return alertStyle.Render(base + "  update=error")
+	default:
+		return dimStyle.Render(base + "  update=unknown")
+	}
 }
 
 // ---------- threat level --------------------------------------------------

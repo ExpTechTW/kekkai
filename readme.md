@@ -32,7 +32,8 @@ sudo kekkai reload
 sudo kekkai status
 ```
 
-> 所有指令細節（`status/check/ports/show/backup/reload/update/reset/doctor`）已移到 [`COMMAND_ZH.md`](COMMAND_ZH.md)。
+> 所有指令細節（`status/check/ports/show/backup/reload/update/reset/doctor`）已移到 [`COMMAND_ZH.md`](COMMAND_ZH.md)。  
+> `kekkai update` 來源可由 `update.channel` 設為 `git:main` / `release` / `pre-release`。
 
 ## 過濾模型（Ingress）
 

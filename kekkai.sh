@@ -4,7 +4,7 @@
 # Usage:
 #   bash kekkai.sh               # auto-detect state and do the right thing
 #   bash kekkai.sh install       # force first-time install
-#   bash kekkai.sh update        # force update from git
+#   bash kekkai.sh update        # force update (source depends on update.channel)
 #   bash kekkai.sh repair        # force re-install of binaries + systemd unit
 #   bash kekkai.sh doctor        # read-only health check (delegates to `kekkai doctor`)
 #   bash kekkai.sh uninstall     # remove everything except config
@@ -20,7 +20,7 @@
 # Auto-detect logic (no subcommand):
 #   - no binaries yet            → install
 #   - binaries present but no systemd unit OR unit disabled → repair
-#   - everything installed + git has new commits → update
+#   - everything installed + update source has new version → update
 #   - everything installed + no new commits → doctor
 #
 set -euo pipefail
@@ -49,6 +49,9 @@ SUDOERS_FILE_PREFIX=kekkai-cli-
 GO_MIN="1.22"
 GO_DOWNLOAD_VERSION="1.23.4"
 BRANCH=main
+REPO_OWNER=ExpTechTW
+REPO_NAME=kekkai
+RELEASES_API_BASE="https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases"
 
 # ---------------------------------------------------------------------------
 # CLI parsing
@@ -293,6 +296,40 @@ detect_iface() {
   echo "$iface"
 }
 
+read_update_channel_from_config() {
+  local cfg="${1:-$CONFIG_FILE}"
+  [[ -f "$cfg" ]] || return 1
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^update:[[:space:]]*$/ { in_update=1; next }
+    /^[^[:space:]]/ { in_update=0 }
+    in_update && /^[[:space:]]+channel:[[:space:]]*/ {
+      line=$0
+      sub(/^[[:space:]]+channel:[[:space:]]*/, "", line)
+      gsub(/["'\''[:space:]]/, "", line)
+      print line
+      exit 0
+    }
+  ' "$cfg"
+}
+
+resolve_update_channel() {
+  local ch
+  ch="${KEKKAI_UPDATE_CHANNEL:-}"
+  if [[ -z "$ch" ]]; then
+    ch="$(read_update_channel_from_config "$CONFIG_FILE" 2>/dev/null || true)"
+  fi
+  [[ -n "$ch" ]] || ch="git:main"
+  case "$ch" in
+    git:main|release|pre-release) ;;
+    *)
+      warn "unknown update.channel '$ch' — fallback to git:main"
+      ch="git:main"
+      ;;
+  esac
+  echo "$ch"
+}
+
 # ---------------------------------------------------------------------------
 # Build from source (repo mode)
 # ---------------------------------------------------------------------------
@@ -309,9 +346,11 @@ build_from_source() {
   [[ -x "$ROOT/bin/kekkai" ]]       || die "build failed: bin/kekkai missing"
 }
 
-install_binaries() {
-  local src_agent="$ROOT/bin/kekkai-agent"
-  local src_cli="$ROOT/bin/kekkai"
+install_binaries_from() {
+  local src_agent="$1"
+  local src_cli="$2"
+  [[ -x "$src_agent" ]] || die "missing agent binary: $src_agent"
+  [[ -x "$src_cli" ]] || die "missing cli binary: $src_cli"
 
   # Rollback snapshot of the current daemon (update only — install has
   # nothing to roll back to).
@@ -324,6 +363,10 @@ install_binaries() {
 
   $SUDO install -D -m 0755 "$src_cli" "$CLI_BIN"
   log "installed: $CLI_BIN"
+}
+
+install_binaries() {
+  install_binaries_from "$ROOT/bin/kekkai-agent" "$ROOT/bin/kekkai"
 }
 
 setup_sudo_shortcut() {
@@ -494,10 +537,184 @@ git_update() {
   return 0
 }
 
+fetch_release_metadata() {
+  local channel="$1"
+  local endpoint
+  case "$channel" in
+    release)
+      endpoint="$RELEASES_API_BASE/latest"
+      ;;
+    pre-release)
+      endpoint="$RELEASES_API_BASE?per_page=30"
+      ;;
+    *)
+      die "fetch_release_metadata: unsupported channel '$channel'"
+      ;;
+  esac
+  curl -fsSL -H "Accept: application/vnd.github+json" "$endpoint"
+}
+
+select_release_assets() {
+  local channel="$1"
+  local os="$2"
+  local arch="$3"
+  python3 -c '
+import json
+import sys
+
+channel, os_name, arch = sys.argv[1:4]
+data = json.load(sys.stdin)
+
+def pick_release(obj):
+    if channel == "release":
+        return obj
+    for rel in obj:
+        if rel.get("draft"):
+            continue
+        if rel.get("prerelease"):
+            return rel
+    return None
+
+release = pick_release(data)
+if not release:
+    raise SystemExit("no matching release found")
+
+assets = release.get("assets", [])
+
+def is_noise(name):
+    n = name.lower()
+    return n.endswith((".sha256", ".sha256sum", ".sig", ".txt", ".json", ".sbom"))
+
+def score(kind, name):
+    n = name.lower()
+    if kind not in n:
+        return -1
+    if kind == "kekkai" and "agent" in n:
+        return -1
+    if is_noise(name):
+        return -1
+    s = 0
+    if os_name in n:
+        s += 5
+    if arch in n:
+        s += 5
+    if f"{os_name}-{arch}" in n or f"{os_name}_{arch}" in n:
+        s += 3
+    if n.endswith((".tar.gz", ".tgz", ".zip")):
+        s -= 1
+    return s
+
+def best_asset(kind):
+    best = None
+    best_s = -1
+    for a in assets:
+        name = a.get("name", "")
+        s = score(kind, name)
+        if s > best_s:
+            best_s = s
+            best = a
+    return best if best_s >= 8 else None
+
+agent = best_asset("kekkai-agent")
+cli = best_asset("kekkai")
+if agent is None or cli is None:
+    raise SystemExit("release assets for kekkai-agent/kekkai not found for target os/arch")
+
+print(release.get("tag_name", "unknown"))
+print(agent["browser_download_url"])
+print(cli["browser_download_url"])
+' "$channel" "$os" "$arch"
+}
+
+download_release_binary() {
+  local url="$1"
+  local want_name="$2"
+  local tmpdir="$3"
+  local archive="$tmpdir/$(basename "${url%%\?*}")"
+  [[ -n "$archive" ]] || die "invalid asset url: $url"
+
+  curl -fsSL "$url" -o "$archive"
+
+  local out="$tmpdir/$want_name"
+  case "$archive" in
+    *.tar.gz|*.tgz)
+      local ex="$tmpdir/extract-$want_name"
+      mkdir -p "$ex"
+      tar -xzf "$archive" -C "$ex"
+      local found
+      found="$(find "$ex" -type f -name "$want_name" -print -quit)"
+      [[ -n "$found" ]] || die "archive $(basename "$archive") missing $want_name"
+      cp "$found" "$out"
+      ;;
+    *.zip)
+      command -v unzip >/dev/null 2>&1 || die "unzip not found (required for zip release assets)"
+      local ex="$tmpdir/extract-$want_name"
+      mkdir -p "$ex"
+      unzip -q "$archive" -d "$ex"
+      local found
+      found="$(find "$ex" -type f -name "$want_name" -print -quit)"
+      [[ -n "$found" ]] || die "archive $(basename "$archive") missing $want_name"
+      cp "$found" "$out"
+      ;;
+    *)
+      cp "$archive" "$out"
+      ;;
+  esac
+
+  chmod +x "$out"
+  echo "$out"
+}
+
+release_update() {
+  local channel="$1"
+  command -v curl >/dev/null 2>&1 || die "curl not found"
+  command -v python3 >/dev/null 2>&1 || die "python3 not found (required for release metadata parsing)"
+
+  local meta
+  meta="$(fetch_release_metadata "$channel")" || die "failed to fetch GitHub release metadata"
+
+  local parsed
+  parsed="$(printf '%s' "$meta" | select_release_assets "$channel" "$OS" "$ARCH")" || die "failed to resolve release assets for $OS/$ARCH"
+  local tag agent_url cli_url
+  tag="$(printf '%s\n' "$parsed" | sed -n '1p')"
+  agent_url="$(printf '%s\n' "$parsed" | sed -n '2p')"
+  cli_url="$(printf '%s\n' "$parsed" | sed -n '3p')"
+  [[ -n "$agent_url" && -n "$cli_url" ]] || die "release metadata incomplete"
+
+  log "selected release: $tag ($channel)"
+  info "agent asset: $(basename "${agent_url%%\?*}")"
+  info "cli asset:   $(basename "${cli_url%%\?*}")"
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+
+  local new_agent new_cli
+  new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")"
+  new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")"
+
+  validate_config_against_new_binary "$new_agent"
+
+  local old_sha new_sha
+  old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
+  new_sha="$(sha256sum "$new_agent" | awk '{print $1}')"
+  if [[ "$old_sha" == "$new_sha" ]]; then
+    log "binary unchanged — nothing to restart"
+    rm -rf "$tmpdir"
+    return 0
+  fi
+
+  install_binaries_from "$new_agent" "$new_cli"
+  rm -rf "$tmpdir"
+  setup_sudo_shortcut
+  enable_and_start
+  log "update complete (channel=$channel, tag=$tag)"
+}
+
 validate_config_against_new_binary() {
+  local candidate_bin="${1:-$ROOT/bin/kekkai-agent}"
   [[ -f "$CONFIG_FILE" ]] || return 0
   log "validating $CONFIG_FILE against new binary"
-  if ! "$ROOT/bin/kekkai-agent" -check "$CONFIG_FILE" >/tmp/kekkai-check.log 2>&1; then
+  if ! "$candidate_bin" -check "$CONFIG_FILE" >/tmp/kekkai-check.log 2>&1; then
     echo
     err "new binary rejects current config:"
     sed 's/^/    /' /tmp/kekkai-check.log >&2
@@ -542,21 +759,35 @@ do_update() {
   banner
   step "update · $OS/$ARCH"
   ensure_go
-  git_update
-  build_from_source
-  validate_config_against_new_binary
+  local channel
+  channel="$(resolve_update_channel)"
+  log "update channel: $channel"
 
-  local old_sha new_sha
-  old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
-  new_sha="$(sha256sum "$ROOT/bin/kekkai-agent" | awk '{print $1}')"
-  if [[ "$old_sha" == "$new_sha" ]]; then
-    log "binary unchanged — nothing to restart"
-    return 0
-  fi
-  install_binaries
-  setup_sudo_shortcut
-  enable_and_start
-  log "update complete"
+  case "$channel" in
+    git:main)
+      git_update
+      build_from_source
+      validate_config_against_new_binary "$ROOT/bin/kekkai-agent"
+
+      local old_sha new_sha
+      old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
+      new_sha="$(sha256sum "$ROOT/bin/kekkai-agent" | awk '{print $1}')"
+      if [[ "$old_sha" == "$new_sha" ]]; then
+        log "binary unchanged — nothing to restart"
+        return 0
+      fi
+      install_binaries
+      setup_sudo_shortcut
+      enable_and_start
+      log "update complete (channel=git:main)"
+      ;;
+    release|pre-release)
+      release_update "$channel"
+      ;;
+    *)
+      die "unsupported update channel: $channel"
+      ;;
+  esac
 }
 
 do_repair() {

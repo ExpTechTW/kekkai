@@ -22,6 +22,7 @@
 ### 2.1 kekkai status
 
 啟動互動式 TUI，取代 `watch -n 1 cat /var/run/kekkai/stats.txt`。
+啟動後會背景檢查 `update.channel` 對應來源是否有新版（release / pre-release），並在 header 顯示 `up-to-date` / `available`。
 
 ```bash
 kekkai status                              # 預設讀 /etc/kekkai/kekkai.yaml
@@ -41,7 +42,7 @@ sudo kekkai status
 | 1. Overview | RX / TX、協定速率、drop 原因摘要、top 5 IP |
 | 2. Detail | 完整計數、每個 drop/pass reason 的 slot 值 |
 | 3. Top-N | 整張 perip_v4 map 的 src IP 排行，支援上下捲動 |
-| 4. Charts | 最近 120 秒 PPS/DPS/TCP/UDP/ICMP 走勢圖 |
+| 4. Charts | 最近 120 秒 PPS/DPS/TCP/UDP/ICMP + stateful hit 走勢圖 |
 
 **鍵盤**
 
@@ -453,7 +454,7 @@ bash ./kekkai.sh                        # 自動偵測狀態
 
 ```bash
 bash ./kekkai.sh install                # 強制走 install
-bash ./kekkai.sh update                 # 強制走 update（git pull + 重編 + 重啟）
+bash ./kekkai.sh update                 # 強制走 update（依 update.channel 決定來源）
 bash ./kekkai.sh repair                 # 補裝缺失的 binary / unit
 bash ./kekkai.sh doctor                 # read-only 健康檢查
 bash ./kekkai.sh uninstall              # 移除 binary + unit，config 保留
@@ -472,6 +473,13 @@ bash ./kekkai.sh --sudo-shortcut        # 強制開啟 `kekkai` 免密碼 sudo +
 bash ./kekkai.sh --no-sudo-shortcut     # 關閉 sudo shortcut 設定
 ```
 
+`update.channel` 設定在 `/etc/kekkai/kekkai.yaml`：
+
+```yaml
+update:
+  channel: release     # git:main | release | pre-release
+```
+
 ### 7.3 安裝完成後
 
 ```bash
@@ -484,18 +492,27 @@ sudo kekkai status                              # 看 TUI
 
 ### 7.4 更新流程內部細節
 
-`bash ./kekkai.sh update` 做這些事（含自動 rollback）：
-1. 還原 `internal/loader/bpf/xdp_filter.o`（go:embed placeholder，避免上次 build 殘留 dirty）
-2. 檢查 working tree 乾淨，不乾淨列 `git status --short` 後終止
-3. `git fetch origin main` 比對 commit
-4. 遠端 commit 時間比本地舊 → 拒絕降級
-5. `git merge --ff-only`
-6. `make bpf && make build`
-7. 用新 binary 跑 `kekkai-agent -check` 驗當前 config（失敗中止）
-8. 舊 binary 備份到 `/usr/local/bin/kekkai-agent.prev`
-9. 安裝新 `kekkai-agent` + `kekkai`
-10. `systemctl restart kekkai-agent`
-11. 1 秒後確認 active；沒起來就自動 rollback 舊 binary 再重啟
+`bash ./kekkai.sh update` 會依 `update.channel` 走不同路徑（都含 rollback）：
+
+- `git:main`：
+  1. 還原 `internal/loader/bpf/xdp_filter.o`（避免上次 build 殘留 dirty）
+  2. 檢查 working tree 乾淨，不乾淨列 `git status --short` 後終止
+  3. `git fetch origin main` + `git merge --ff-only`
+  4. `make bpf && make build`
+  5. 用新 binary 跑 `kekkai-agent -check` 驗當前 config（失敗中止）
+  6. 安裝新 `kekkai-agent` + `kekkai`，`systemctl restart`，失敗自動 rollback
+
+- `release`：
+  1. 從 `https://github.com/ExpTechTW/kekkai/releases` 抓最新 stable release 資產
+  2. 驗 config
+  3. 安裝 binary + restart，失敗自動 rollback
+
+- `pre-release`：
+  1. 從 `https://github.com/ExpTechTW/kekkai/releases` 抓最新 pre-release 資產
+  2. 驗 config
+  3. 安裝 binary + restart，失敗自動 rollback
+
+可臨時覆蓋：`KEKKAI_UPDATE_CHANNEL=release kekkai update`
 
 ### 7.3 手動建置
 
@@ -685,7 +702,7 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 |---|---|---|
 | `kekkai.sh` (無參數)      | ✅ | 自動偵測狀態並執行對應動作 |
 | `kekkai.sh install`       | ✅ | 強制初次安裝 |
-| `kekkai.sh update`        | ✅ | 強制從 git 更新 |
+| `kekkai.sh update`        | ✅ | 強制更新（來源由 `update.channel` 決定） |
 | `kekkai.sh repair`        | ✅ | 補齊缺失的 binary / systemd unit |
 | `kekkai.sh doctor`        | ✅ | delegate 到 `kekkai doctor` |
 | `kekkai.sh uninstall`     | ✅ | 移除 binary + systemd，config 保留 |
