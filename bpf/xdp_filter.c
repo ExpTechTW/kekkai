@@ -7,13 +7,19 @@
 //      non-IPv4/ARP          → DROP
 //   2. IP frag 2+            → PASS (no L4 header to inspect)
 //   3. conntrack hit         → PASS (TCP/UDP stateful fast path)
-//   4. return traffic        → PASS (TCP ACK, UDP ephemeral, ICMP-if-enabled)
-//   4. static blocklist      → DROP
-//   5. dynamic blocklist     → DROP (if not expired)
-//   6. public port           → PASS (any source)
-//   7. private port + allow  → PASS
-//   8. private port, no allow→ DROP
-//   9. no rule               → DROP (default deny)
+//   4. return traffic        → PASS (TCP established, DHCP client, ICMP-if-enabled)
+//                              NOTE: UDP ephemeral-port fallback was removed
+//                              in build.21 — attackers were trivially bypassing
+//                              it by targeting dport >= 32768. UDP return now
+//                              depends entirely on the egress seed (TC hook)
+//                              populating flowtrack_v4, which the stateful
+//                              fast path in step 3 consumes.
+//   5. static blocklist      → DROP
+//   6. dynamic blocklist     → DROP (if not expired)
+//   7. public port           → PASS (any source)
+//   8. private port + allow  → PASS
+//   9. private port, no allow→ DROP
+//  10. no rule               → DROP (default deny)
 //
 // All counters are per-CPU to avoid contention on the hot path. Userspace
 // sums across CPUs when rendering stats.
@@ -37,7 +43,6 @@ char __license[] SEC("license") = "GPL";
 #define EVENTS_RINGBUF_BYTES      (1 << 18)
 #define FLOW_TCP_TTL_NS           (5ULL * 60ULL * 1000000000ULL)
 #define FLOW_UDP_TTL_NS           (120ULL * 1000000000ULL)
-#define DEFAULT_UDP_EPHEMERAL_MIN 32768
 #define LEGACY_DHCP_CLIENT_PORT   68
 
 // --- global stats slots -----------------------------------------------------
@@ -270,11 +275,9 @@ static __always_inline int port_in(void *map, __u16 port_be) {
     return bpf_map_lookup_elem(map, &port_be) != NULL;
 }
 
-static __always_inline void runtime_cfg_get(__u8 *allow_arp, __u8 *allow_icmp,
-                                            __u16 *udp_ephemeral_min) {
+static __always_inline void runtime_cfg_get(__u8 *allow_arp, __u8 *allow_icmp) {
     *allow_arp = 1;
     *allow_icmp = 1;
-    *udp_ephemeral_min = DEFAULT_UDP_EPHEMERAL_MIN;
 
     __u32 k = 0;
     struct runtime_cfg_v4 *cfg = bpf_map_lookup_elem(&runtime_cfg_v4, &k);
@@ -283,8 +286,10 @@ static __always_inline void runtime_cfg_get(__u8 *allow_arp, __u8 *allow_icmp,
 
     *allow_arp = (cfg->flags & RUNTIME_FLAG_ALLOW_ARP) ? 1 : 0;
     *allow_icmp = (cfg->flags & RUNTIME_FLAG_ALLOW_ICMP) ? 1 : 0;
-    if (cfg->udp_ephemeral_min >= 1024)
-        *udp_ephemeral_min = cfg->udp_ephemeral_min;
+    // cfg->udp_ephemeral_min is deliberately ignored: UDP return traffic
+    // is now governed entirely by the egress seed + stateful fast path.
+    // The config field is still accepted by the loader for backward
+    // compatibility but has no effect on packet decisions.
 }
 
 static __always_inline __u64 flow_ttl_ns(__u8 proto) {
@@ -366,8 +371,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
     stat_add(STAT_BYTES_TOTAL, pkt_len);
 
     __u8 allow_arp = 1, allow_icmp = 1;
-    __u16 udp_ephemeral_min = DEFAULT_UDP_EPHEMERAL_MIN;
-    runtime_cfg_get(&allow_arp, &allow_icmp, &udp_ephemeral_min);
+    runtime_cfg_get(&allow_arp, &allow_icmp);
 
     // 1. ethernet + IPv4 only (ARP may be toggled at runtime)
     struct ethhdr *eth = data;
@@ -462,6 +466,9 @@ int kekkai_xdp(struct xdp_md *ctx) {
     }
 
     // 3. stateful conntrack fast path (TCP/UDP only).
+    //    Counters are split: stateful hits bump only the stateful counter,
+    //    not `return`. Earlier builds double-counted here, which made the
+    //    return-traffic numbers unreadable when the box is under load.
     if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
         struct flow4_key fkey = {
             .saddr = saddr,
@@ -473,10 +480,8 @@ int kekkai_xdp(struct xdp_md *ctx) {
         if (flow_lookup_alive(&fkey, now_ns)) {
             if (proto == IPPROTO_TCP) {
                 stat_add(STAT_PASS_STATEFUL_TCP, 1);
-                stat_add(STAT_PASS_RETURN_TCP, 1);
             } else {
                 stat_add(STAT_PASS_STATEFUL_UDP, 1);
-                stat_add(STAT_PASS_RETURN_UDP, 1);
             }
             stat_add(STAT_PKTS_PASSED, 1);
             perip_touch(saddr, pkt_len, proto, 0);
@@ -494,10 +499,12 @@ int kekkai_xdp(struct xdp_md *ctx) {
     //      Matching RST/FIN is essential — otherwise the server-side
     //      session dies the moment the peer sends a reset or starts a
     //      graceful close, because those packets carry no payload ACK.
-    //    - UDP: dst port in ephemeral range (matches responses to
-    //      agent-initiated DNS/NTP/etc without conntrack). DHCP client
-    //      replies (dst 68) are also always allowed so lease renewal does
-    //      not flap the interface IP.
+    //    - UDP: only DHCP client replies (dst 68) are allowed here, so
+    //      lease renewal does not flap the interface IP. All other UDP
+    //      return traffic must come through the stateful fast path above,
+    //      which is fed by the TC egress seed. This is intentional: the
+    //      old "dport >= ephemeral" heuristic was a trivial UDP amplifier
+    //      bypass (attackers just aimed at dport 32768+).
     if (proto == IPPROTO_ICMP && allow_icmp) {
         stat_add(STAT_PASS_RETURN_ICMP, 1);
         stat_add(STAT_PKTS_PASSED, 1);
@@ -528,17 +535,10 @@ int kekkai_xdp(struct xdp_md *ctx) {
             perip_touch(saddr, pkt_len, proto, 0);
             return XDP_PASS;
         }
-        if (bpf_ntohs(dport_be) >= udp_ephemeral_min) {
-            struct flow4_key fkey = {
-                .saddr = saddr, .daddr = ip->daddr,
-                .sport = sport_be, .dport = dport_be, .proto = proto,
-            };
-            flow_upsert(&fkey, now_ns);
-            stat_add(STAT_PASS_RETURN_UDP, 1);
-            stat_add(STAT_PKTS_PASSED, 1);
-            perip_touch(saddr, pkt_len, proto, 0);
-            return XDP_PASS;
-        }
+        // No UDP ephemeral fallback — the stateful fast path already covers
+        // legitimate return traffic via the TC egress seed. Fall through to
+        // the port-policy checks below; anything not matching public/private
+        // rules will hit default deny.
     } else {
         // Unknown L4 proto and not a return classification — default deny.
         stat_add(STAT_DROP_NO_POLICY, 1);
