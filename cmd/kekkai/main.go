@@ -35,6 +35,54 @@ const agentBinary = "/usr/local/bin/kekkai-agent"
 const agentUnit = "kekkai-agent"
 const bypassUsage = "usage: kekkai bypass on|off [--save] [config]"
 
+var (
+	uiTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a78bfa"))
+	uiKeyStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#94a3b8"))
+	uiErrStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f43f5e"))
+	uiWarnStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f59e0b"))
+	uiOKStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#22c55e"))
+	uiInfoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#cbd5e1"))
+)
+
+func stderrIsTerminal() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func uiErr(msg string) string {
+	if !stderrIsTerminal() {
+		return msg
+	}
+	return uiErrStyle.Render("✗ ") + msg
+}
+
+func uiWarn(msg string) string {
+	if !stderrIsTerminal() {
+		return msg
+	}
+	return uiWarnStyle.Render("! ") + msg
+}
+
+func uiOK(msg string) string {
+	if !stdoutIsTerminal() {
+		return msg
+	}
+	return uiOKStyle.Render("✓ ") + msg
+}
+
+func uiInfo(msg string) string {
+	if !stdoutIsTerminal() {
+		return msg
+	}
+	return uiInfoStyle.Render("· " + msg)
+}
+
 // requireRoot prints a clear error and exits 1 if euid != 0. kekkai CLI is
 // designed for sudo-only use (kernel.unprivileged_bpf_disabled on Debian/
 // Ubuntu/Pi OS blocks non-root bpf() regardless of caps), so we fail fast
@@ -50,8 +98,8 @@ func requireRoot() {
 	for _, a := range os.Args[1:] {
 		cmdline += " " + shellQuote(a)
 	}
-	fmt.Fprintln(os.Stderr, "kekkai must run as root.")
-	fmt.Fprintln(os.Stderr, "retry with: "+cmdline)
+	fmt.Fprintln(os.Stderr, uiErr("kekkai must run as root"))
+	fmt.Fprintln(os.Stderr, uiInfoStyle.Render("retry with: "+cmdline))
 	os.Exit(1)
 }
 
@@ -129,7 +177,8 @@ func main() {
 	case "help", "-h", "--help":
 		usage()
 	default:
-		fmt.Fprintf(os.Stderr, "kekkai: unknown command %q\n\n", cmd)
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("kekkai: unknown command %q", cmd)))
+		fmt.Fprintln(os.Stderr)
 		usage()
 		os.Exit(2)
 	}
@@ -174,8 +223,8 @@ func buildResetArgs(args []string) []string {
 // than duplicate the config-handling logic here.
 func runWafEdge(args ...string) int {
 	if _, err := exec.LookPath(agentBinary); err != nil {
-		fmt.Fprintf(os.Stderr, "kekkai-agent binary not found at %s\n", agentBinary)
-		fmt.Fprintln(os.Stderr, "is kekkai installed? run: bash scripts/bootstrap.sh")
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("kekkai-agent binary not found at %s", agentBinary)))
+		fmt.Fprintln(os.Stderr, uiWarn("is kekkai installed? run: bash scripts/bootstrap.sh"))
 		return 1
 	}
 	c := exec.Command(agentBinary, args...)
@@ -188,7 +237,7 @@ func cmdPorts(args []string) int {
 
 	res, err := config.LoadReadOnly(cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("config: %v", err)))
 		return 1
 	}
 	cfg := res.Config
@@ -297,7 +346,7 @@ func hasPort(list []uint16, p uint16) bool {
 func cmdBypass(args []string) int {
 	p, err := parseBypassArgs(args)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
+		fmt.Fprintln(os.Stderr, uiErr(err.Error()))
 		return 2
 	}
 	if p.save {
@@ -308,11 +357,11 @@ func cmdBypass(args []string) int {
 
 func cmdBypassTemporary(wantBypass bool) int {
 	if os.Geteuid() != 0 {
-		fmt.Fprintln(os.Stderr, "bypass toggle requires root (run: sudo kekkai bypass on|off)")
+		fmt.Fprintln(os.Stderr, uiErr("bypass toggle requires root (run: sudo kekkai bypass on|off)"))
 		return 1
 	}
 	if _, err := exec.LookPath("systemctl"); err != nil {
-		fmt.Fprintln(os.Stderr, "systemctl not found: cannot signal kekkai-agent")
+		fmt.Fprintln(os.Stderr, uiErr("systemctl not found: cannot signal kekkai-agent"))
 		return 1
 	}
 
@@ -327,8 +376,8 @@ func cmdBypassTemporary(wantBypass bool) int {
 		return code
 	}
 
-	fmt.Printf("temporary bypass %s (not saved)\n", action)
-	fmt.Println("WARNING: this temporary bypass state will be lost after restart/reboot; use --save to persist.")
+	fmt.Println(uiOK(fmt.Sprintf("temporary bypass %s (not saved)", action)))
+	fmt.Fprintln(os.Stderr, uiWarn("temporary bypass state is ephemeral; use --save to persist"))
 	return 0
 }
 
@@ -367,43 +416,43 @@ func parseBypassArgs(args []string) (parsedBypassArgs, error) {
 
 func cmdBypassSave(wantBypass bool, cfgPath string) int {
 	if os.Geteuid() != 0 {
-		fmt.Fprintln(os.Stderr, "bypass --save requires root (run: sudo kekkai bypass on|off --save)")
+		fmt.Fprintln(os.Stderr, uiErr("bypass --save requires root (run: sudo kekkai bypass on|off --save)"))
 		return 1
 	}
 
 	res, err := config.Load(cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("config: %v", err)))
 		return 1
 	}
 	cfg := res.Config
 	if cfg.Runtime.EmergencyBypass == wantBypass {
-		fmt.Printf("config already has runtime.emergency_bypass=%v\n", wantBypass)
+		fmt.Println(uiInfo(fmt.Sprintf("config already has runtime.emergency_bypass=%v", wantBypass)))
 		return cmdReload([]string{cfgPath})
 	}
 
 	if backupPath, err := config.BackupFile(cfgPath, config.BackupKindManual); err == nil {
-		fmt.Printf("backup written: %s\n", backupPath)
+		fmt.Println(uiOK(fmt.Sprintf("backup written: %s", backupPath)))
 	} else {
-		fmt.Fprintf(os.Stderr, "backup failed: %v\n", err)
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("backup failed: %v", err)))
 		return 1
 	}
 
 	cfg.Runtime.EmergencyBypass = wantBypass
 	b, err := config.Marshal(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "marshal: %v\n", err)
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("marshal: %v", err)))
 		return 1
 	}
 	if err := writeFileAtomic(cfgPath, b, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "write config: %v\n", err)
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("write config: %v", err)))
 		return 1
 	}
 	if code := cmdReload([]string{cfgPath}); code != 0 {
 		return code
 	}
 
-	fmt.Printf("persisted runtime.emergency_bypass=%v in %s\n", wantBypass, cfgPath)
+	fmt.Println(uiOK(fmt.Sprintf("persisted runtime.emergency_bypass=%v in %s", wantBypass, cfgPath)))
 	return 0
 }
 
@@ -414,7 +463,7 @@ func cmdConfig(args []string) int {
 
 	nanoPath, err := exec.LookPath("nano")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "nano not found; install nano first")
+		fmt.Fprintln(os.Stderr, uiErr("nano not found; install nano first"))
 		return 1
 	}
 
@@ -433,7 +482,7 @@ func cmdConfig(args []string) int {
 	}
 	exe, err := os.Executable()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve executable for reload: %v\n", err)
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("resolve executable for reload: %v", err)))
 		return 1
 	}
 	return runCommand(exec.Command("sudo", exe, "reload", cfgPath), "sudo reload after config edit")
@@ -463,16 +512,16 @@ func cmdReload(args []string) int {
 
 	// Always lint/validate before touching the running service.
 	if code := runWafEdge("-check", "-config", cfgPath); code != 0 {
-		fmt.Fprintln(os.Stderr, "reload aborted: config check failed")
+		fmt.Fprintln(os.Stderr, uiErr("reload aborted: config check failed"))
 		return code
 	}
 
 	if os.Geteuid() != 0 {
-		fmt.Fprintln(os.Stderr, "reload requires root (run: sudo kekkai reload)")
+		fmt.Fprintln(os.Stderr, uiErr("reload requires root (run: sudo kekkai reload)"))
 		return 1
 	}
 	if _, err := exec.LookPath("systemctl"); err != nil {
-		fmt.Fprintln(os.Stderr, "systemctl not found: cannot reload kekkai-agent")
+		fmt.Fprintln(os.Stderr, uiErr("systemctl not found: cannot reload kekkai-agent"))
 		return 1
 	}
 
@@ -481,7 +530,7 @@ func cmdReload(args []string) int {
 		return code
 	}
 
-	fmt.Printf("reload requested: %s (config checked: %s)\n", agentUnit, cfgPath)
+	fmt.Println(uiOK(fmt.Sprintf("reload requested: %s (config checked: %s)", agentUnit, cfgPath)))
 	return 0
 }
 
@@ -490,11 +539,11 @@ func cmdReload(args []string) int {
 func cmdUpdate(args []string) int {
 	script, searched := resolveUpdateScript()
 	if script == "" {
-		fmt.Fprintln(os.Stderr, "kekkai update requires kekkai.sh")
-		fmt.Fprintln(os.Stderr, "run from repository root, or set KEKKAI_REPO=/path/to/waf-go")
-		fmt.Fprintln(os.Stderr, "searched:")
+		fmt.Fprintln(os.Stderr, uiErr("kekkai update requires kekkai.sh"))
+		fmt.Fprintln(os.Stderr, uiWarn("run from repository root, or set KEKKAI_REPO=/path/to/waf-go"))
+		fmt.Fprintln(os.Stderr, uiKeyStyle.Render("searched:"))
 		for _, p := range searched {
-			fmt.Fprintf(os.Stderr, "  - %s\n", p)
+			fmt.Fprintf(os.Stderr, "  %s\n", uiInfoStyle.Render("- "+p))
 		}
 		return 1
 	}
@@ -564,14 +613,14 @@ func cmdStatus(args []string) int {
 
 	res, err := config.Load(cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("config: %v", err)))
 		return 1
 	}
 	cfg := res.Config
 
 	src, err := tui.NewSource(cfg.Interface.Name)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "open eBPF maps: %v\n", err)
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("open eBPF maps: %v", err)))
 		return 1
 	}
 	defer src.Close()
@@ -586,7 +635,7 @@ func cmdStatus(args []string) int {
 	)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
+		fmt.Fprintln(os.Stderr, uiErr(fmt.Sprintf("tui: %v", err)))
 		return 1
 	}
 	return 0
@@ -614,7 +663,12 @@ func stdoutIsTerminal() bool {
 }
 
 func cmdVersion() {
-	fmt.Printf("kekkai %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+	if stdoutIsTerminal() {
+		fmt.Println(uiTitleStyle.Render("◈ KEKKAI VERSION"))
+		fmt.Printf("%s %s\n", uiKeyStyle.Render("kekkai"), uiInfoStyle.Render(fmt.Sprintf("%s (%s/%s)", version, runtime.GOOS, runtime.GOARCH)))
+	} else {
+		fmt.Printf("kekkai %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+	}
 	// Also print kekkai-agent's version if available.
 	if _, err := exec.LookPath(agentBinary); err == nil {
 		out, err := exec.Command(agentBinary, "-check", "/dev/null").CombinedOutput()
@@ -622,13 +676,46 @@ func cmdVersion() {
 		_ = err
 		// kekkai-agent doesn't have -version yet; just note its presence.
 		if st, err := os.Stat(agentBinary); err == nil {
-			fmt.Printf("kekkai-agent present at %s (size %d bytes, modified %s)\n",
+			msg := fmt.Sprintf("present at %s (size %d bytes, modified %s)",
 				agentBinary, st.Size(), st.ModTime().Format("2006-01-02 15:04:05"))
+			if stdoutIsTerminal() {
+				fmt.Printf("%s %s\n", uiKeyStyle.Render("kekkai-agent"), uiInfoStyle.Render(msg))
+			} else {
+				fmt.Printf("kekkai-agent %s\n", msg)
+			}
 		}
 	}
 }
 
 func usage() {
+	if stderrIsTerminal() {
+		fmt.Fprintln(os.Stderr, uiTitleStyle.Render("◈ KEKKAI CLI"))
+		fmt.Fprintln(os.Stderr, uiInfoStyle.Render("operator CLI for the kekkai edge firewall"))
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, uiKeyStyle.Render("Usage:"))
+		fmt.Fprintln(os.Stderr, "  sudo kekkai <command> [args]")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, uiWarn("always run with sudo for cross-host consistency"))
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, uiKeyStyle.Render("Commands:"))
+		fmt.Fprintln(os.Stderr, "  status [config]            launch the live TUI")
+		fmt.Fprintln(os.Stderr, "  config [config]            open config in nano, then auto-reload")
+		fmt.Fprintln(os.Stderr, "  check  [config]            validate a config file (read-only)")
+		fmt.Fprintln(os.Stderr, "  ports  [config]            show colorized public/private port summary")
+		fmt.Fprintln(os.Stderr, "  show   [config]            print the normalised config after migration")
+		fmt.Fprintln(os.Stderr, "  backup [config]            write a timestamped manual backup")
+		fmt.Fprintln(os.Stderr, "  reload [config]            validate config, then systemctl reload")
+		fmt.Fprintln(os.Stderr, "  bypass on|off [--save]     toggle emergency bypass")
+		fmt.Fprintln(os.Stderr, "  update [kekkai.sh flags]   run installer update flow (delegates to kekkai.sh update)")
+		fmt.Fprintln(os.Stderr, "  reset  [config] [--iface]  overwrite config with a fresh default template")
+		fmt.Fprintln(os.Stderr, "  doctor                     run read-only health checks and print a report")
+		fmt.Fprintln(os.Stderr, "  version                    show version information")
+		fmt.Fprintln(os.Stderr, "  help                       show this message")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, uiInfoStyle.Render("See COMMAND_ZH.md for the full operator handbook."))
+		return
+	}
+
 	fmt.Fprintln(os.Stderr, `kekkai — operator CLI for the kekkai edge firewall
 
 Usage:
