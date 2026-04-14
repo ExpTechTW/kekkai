@@ -451,7 +451,6 @@ install_binaries_from() {
   $SUDO install -D -m 0755 "$src_cli" "$CLI_BIN"
   log "installed: $CLI_BIN"
 
-  persist_script_for_updates
   install_completions
 }
 
@@ -574,10 +573,12 @@ read_cli_version() {
 #   state=updated    → blue accent, headline "UPDATED"
 #   state=unchanged  → green accent, headline "ALREADY UP-TO-DATE"
 #
-# Args: state old_ver new_ver tag channel
-# `tag` / `channel` may be empty (git:main path leaves them blank).
+# Args: state old_ver new_ver tag channel changed
+# `tag` / `channel` / `changed` may be empty. `changed` is a human-readable
+# comma-separated list of components that were actually rewritten (e.g.
+# "agent, cli, kekkai.sh") — only rendered for state=updated.
 print_update_result() {
-  local state="$1" old_v="$2" new_v="$3" tag="$4" channel="$5"
+  local state="$1" old_v="$2" new_v="$3" tag="$4" channel="$5" changed="$6"
   local accent headline
   case "$state" in
     updated)
@@ -607,6 +608,9 @@ print_update_result() {
       "$C_DIM" "$C_RESET" \
       "$C_DIM" "$old_v" "$C_RESET" \
       "$C_BOLD" "$new_v" "$C_RESET"
+  fi
+  if [[ "$state" == "updated" && -n "$changed" ]]; then
+    printf '  %schanged%s    %s\n' "$C_DIM" "$C_RESET" "$changed"
   fi
   if [[ -n "$tag" ]]; then
     printf '  %stag%s        %s\n' "$C_DIM" "$C_RESET" "$tag"
@@ -985,15 +989,51 @@ fetch_release_artifacts() {
     || die "failed to download/verify kekkai binary"
 }
 
-# agent_unchanged: 0 (true) if the candidate agent binary matches the
-# currently installed one byte-for-byte — used to short-circuit restart.
-agent_unchanged() {
-  local candidate="$1"
-  [[ -f "$AGENT_BIN" ]] || return 1
-  local old_sha new_sha
-  old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
-  new_sha="$(sha256sum "$candidate" | awk '{print $1}')"
-  [[ "$old_sha" == "$new_sha" ]]
+# files_match: 0 (true) if both files exist and have identical sha256.
+files_match() {
+  local a="$1" b="$2"
+  [[ -f "$a" && -f "$b" ]] || return 1
+  local a_sha b_sha
+  a_sha="$(sha256sum "$a" | awk '{print $1}')"
+  b_sha="$(sha256sum "$b" | awk '{print $1}')"
+  [[ "$a_sha" == "$b_sha" ]]
+}
+
+# agent_unchanged / cli_unchanged: 0 (true) if the candidate binary matches
+# the currently installed one byte-for-byte. Used to decide whether a
+# release actually needs a service restart (or any write at all).
+agent_unchanged() { files_match "$AGENT_BIN" "$1"; }
+cli_unchanged()   { files_match "$CLI_BIN"   "$1"; }
+
+# sync_script_from_remote: fetch the latest kekkai.sh from $RAW_BASE and
+# compare with the currently installed /usr/local/bin/kekkai.sh.
+#
+# Exit codes:
+#   0   → remote content differs, installed copy was overwritten
+#   10  → remote matches installed copy (no-op)
+#   11  → fetch failed (network / curl missing) — caller should warn but not fail
+#
+# Kept separate from binary updates because the script can ship fixes that
+# have no corresponding binary release (this very patch is one such case).
+sync_script_from_remote() {
+  [[ "$OS" == "linux" ]] || return 10
+  command -v curl >/dev/null 2>&1 || return 11
+
+  local tmp
+  tmp="$(mktemp)"
+  if ! curl -fsSL "$RAW_BASE/$BRANCH/kekkai.sh" -o "$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    return 11
+  fi
+
+  if files_match "$SCRIPT_INSTALL_PATH" "$tmp"; then
+    rm -f "$tmp"
+    return 10
+  fi
+
+  $SUDO install -D -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"
+  rm -f "$tmp"
+  return 0
 }
 
 release_update() {
@@ -1009,17 +1049,55 @@ release_update() {
 
   validate_config_against_new_binary "$REL_NEW_AGENT"
 
-  if agent_unchanged "$REL_NEW_AGENT"; then
-    rm -rf "$tmpdir"
-    print_update_result unchanged "$old_ver" "$new_ver" "$REL_TAG" "$channel"
-    return 0
+  # Three-way diff: agent binary, CLI binary, and kekkai.sh itself.
+  # Any single one changing counts as "updated". kekkai.sh can ship
+  # fixes independent of a binary release, so we can't gate on agent alone.
+  local -a changed_parts=()
+  local need_restart=0
+
+  if ! agent_unchanged "$REL_NEW_AGENT"; then
+    changed_parts+=("agent")
+    need_restart=1
+  fi
+  if ! cli_unchanged "$REL_NEW_CLI"; then
+    changed_parts+=("cli")
   fi
 
-  install_binaries_from "$REL_NEW_AGENT" "$REL_NEW_CLI"
+  if (( need_restart )); then
+    install_binaries_from "$REL_NEW_AGENT" "$REL_NEW_CLI"
+  elif (( ${#changed_parts[@]} > 0 )); then
+    # CLI changed but agent didn't — still need to install the new CLI,
+    # just no service restart.
+    $SUDO install -D -m 0755 "$REL_NEW_CLI" "$CLI_BIN"
+    log "installed: $CLI_BIN"
+    install_completions
+  fi
   rm -rf "$tmpdir"
-  setup_passwordless_sudo
-  enable_and_start
-  print_update_result updated "$old_ver" "$new_ver" "$REL_TAG" "$channel"
+
+  # Script sync: independent of binary changes. Done after binaries
+  # because sync_script_from_remote may overwrite the script this very
+  # process is running — bash has already parsed our source, so this is
+  # safe as long as we don't source the file again afterward.
+  sync_script_from_remote
+  local script_rc=$?
+  case $script_rc in
+    0)  changed_parts+=("kekkai.sh") ;;
+    10) : ;; # already up-to-date
+    11) warn "could not fetch remote kekkai.sh (network?) — skipped script sync" ;;
+  esac
+
+  if (( need_restart )); then
+    setup_passwordless_sudo
+    enable_and_start
+  fi
+
+  if (( ${#changed_parts[@]} == 0 )); then
+    print_update_result unchanged "$old_ver" "$new_ver" "$REL_TAG" "$channel" ""
+  else
+    local changed_str="${changed_parts[*]}"
+    changed_str="${changed_str// /, }"
+    print_update_result updated "$old_ver" "$new_ver" "$REL_TAG" "$channel" "$changed_str"
+  fi
 }
 
 fetch_release_binaries_to_root_bin() {
@@ -1085,6 +1163,7 @@ do_install() {
   check_kernel
   prepare_binaries
   install_binaries
+  persist_script_for_updates
   setup_passwordless_sudo
   install_config
   install_systemd_unit
@@ -1111,14 +1190,44 @@ do_update() {
       local new_ver
       new_ver="$(read_cli_version "$LOCAL_CLI_BIN")"
 
-      if agent_unchanged "$LOCAL_AGENT_BIN"; then
-        print_update_result unchanged "$old_ver" "$new_ver" "" "git:main"
-        return 0
+      # Same three-way comparison as release_update — any of agent / cli /
+      # kekkai.sh changing counts as "updated". In repo mode the new
+      # kekkai.sh came from `git pull`, so just diff $ROOT/kekkai.sh
+      # against $SCRIPT_INSTALL_PATH instead of curl-fetching it.
+      local -a changed_parts=()
+      local need_restart=0
+
+      if ! agent_unchanged "$LOCAL_AGENT_BIN"; then
+        changed_parts+=("agent")
+        need_restart=1
       fi
-      install_binaries
-      setup_passwordless_sudo
-      enable_and_start
-      print_update_result updated "$old_ver" "$new_ver" "" "git:main"
+      if ! cli_unchanged "$LOCAL_CLI_BIN"; then
+        changed_parts+=("cli")
+      fi
+      if [[ -f "$ROOT/kekkai.sh" ]] && ! files_match "$SCRIPT_INSTALL_PATH" "$ROOT/kekkai.sh"; then
+        $SUDO install -D -m 0755 "$ROOT/kekkai.sh" "$SCRIPT_INSTALL_PATH"
+        log "installed: $SCRIPT_INSTALL_PATH"
+        changed_parts+=("kekkai.sh")
+      fi
+
+      if (( need_restart )); then
+        install_binaries
+        setup_passwordless_sudo
+        enable_and_start
+      elif (( ${#changed_parts[@]} > 0 )); then
+        # CLI-only change: install just the CLI binary, skip service restart.
+        $SUDO install -D -m 0755 "$LOCAL_CLI_BIN" "$CLI_BIN"
+        log "installed: $CLI_BIN"
+        install_completions
+      fi
+
+      if (( ${#changed_parts[@]} == 0 )); then
+        print_update_result unchanged "$old_ver" "$new_ver" "" "git:main" ""
+      else
+        local changed_str="${changed_parts[*]}"
+        changed_str="${changed_str// /, }"
+        print_update_result updated "$old_ver" "$new_ver" "" "git:main" "$changed_str"
+      fi
       ;;
     release|pre-release)
       release_update "$channel"
@@ -1134,6 +1243,7 @@ do_repair() {
   step "repair · $OS/$ARCH"
   prepare_binaries
   install_binaries
+  persist_script_for_updates
   setup_passwordless_sudo
   [[ -f "$CONFIG_FILE" ]] || install_config
   install_systemd_unit
