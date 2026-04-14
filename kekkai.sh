@@ -52,6 +52,23 @@ resolve_root() {
 ROOT="$(resolve_root)"
 cd "$ROOT"
 
+# Ensure a reusable local script copy exists for `kekkai update`.
+# This is critical when running via process substitution:
+#   bash <(curl -fsSL .../kekkai.sh)
+# where $0 is /dev/fd/* and no on-disk kekkai.sh exists by default.
+persist_self_script() {
+  local target="$ROOT/kekkai.sh"
+  if [[ -f "$target" ]] && [[ -s "$target" ]]; then
+    return 0
+  fi
+  if [[ -r "$0" ]]; then
+    cat "$0" > "$target" 2>/dev/null || true
+    chmod +x "$target" 2>/dev/null || true
+  fi
+}
+
+persist_self_script
+
 # ---------------------------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------------------------
