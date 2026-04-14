@@ -28,12 +28,14 @@ jobs:
           HEAD_MSG: ${{ github.event.head_commit.message }}
           BRANCH_NAME: ${{ github.ref_name }}
         run: |
-          if ! printf '%s\n' "$HEAD_MSG" | grep -qi 'build:'; then
-            echo "mode=none" >> "$GITHUB_OUTPUT"
-          elif [[ "$BRANCH_NAME" == "main" ]]; then
-            echo "mode=pre-release" >> "$GITHUB_OUTPUT"
+          if [[ "$BRANCH_NAME" == "main" ]]; then
+            if printf '%s\n' "$HEAD_MSG" | grep -qi 'build:'; then
+              echo "mode=pre-release" >> "$GITHUB_OUTPUT"
+            else
+              echo "mode=none" >> "$GITHUB_OUTPUT"
+            fi
           elif [[ "$BRANCH_NAME" == "release" ]]; then
-            echo "mode=draft" >> "$GITHUB_OUTPUT"
+            echo "mode=release" >> "$GITHUB_OUTPUT"
           else
             echo "mode=none" >> "$GITHUB_OUTPUT"
           fi
@@ -235,14 +237,14 @@ jobs:
               f.write("\n".join(lines))
           PY
 
-      - name: Publish / update draft release
-        if: needs.meta.outputs.mode == 'draft'
+      - name: Publish / update release
+        if: needs.meta.outputs.mode == 'release'
         uses: ncipollo/release-action@v1
         with:
-          tag: v${{ needs.meta.outputs.version }}-draft
-          name: v${{ needs.meta.outputs.version }} Draft (auto)
+          tag: v${{ needs.meta.outputs.version }}
+          name: v${{ needs.meta.outputs.version }} Release (auto)
           bodyFile: release-notes.md
-          draft: true
+          draft: false
           prerelease: false
           allowUpdates: true
           replacesArtifacts: true
