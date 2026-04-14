@@ -263,48 +263,70 @@ func Marshal(cfg *Config) ([]byte, error) {
 // zero-valued fields so an in-memory Config built from partial YAML still
 // renders cleanly.
 func ValuesFromConfig(cfg *Config) Values {
+	if cfg == nil {
+		return DefaultValues()
+	}
+
+	// Work on a local copy so defaulting logic is centralized and we don't
+	// accidentally mutate the caller's in-memory config.
+	c := *cfg
+	c.applyDefaults()
+
+	defaults := DefaultValues()
+
 	version := cfg.Version
 	if version <= 0 {
 		version = CurrentVersion
 	}
+	autoUpdateDownload := defaults.AutoUpdateDownload
+	if c.Update.AutoUpdateDownload != nil {
+		autoUpdateDownload = *c.Update.AutoUpdateDownload
+	}
+	autoUpdateInterval := c.Update.AutoUpdateInterval
+	if autoUpdateInterval == 0 {
+		autoUpdateInterval = DefaultAutoUpdateInterval
+	}
 	enforce := true
-	if cfg.Security.EnforceSSHPrivate != nil {
-		enforce = *cfg.Security.EnforceSSHPrivate
+	if c.Security.EnforceSSHPrivate != nil {
+		enforce = *c.Security.EnforceSSHPrivate
 	}
 	allowICMP := true
-	if cfg.Filter.AllowICMP != nil {
-		allowICMP = *cfg.Filter.AllowICMP
+	if c.Filter.AllowICMP != nil {
+		allowICMP = *c.Filter.AllowICMP
 	}
 	allowARP := true
-	if cfg.Filter.AllowARP != nil {
-		allowARP = *cfg.Filter.AllowARP
+	if c.Filter.AllowARP != nil {
+		allowARP = *c.Filter.AllowARP
 	}
 	hostname, _ := os.Hostname()
-	nodeID := cfg.Node.ID
+	nodeID := c.Node.ID
 	if nodeID == "" {
 		nodeID = hostname
 	}
 	return Values{
-		Version:           version,
-		NodeID:            nodeID,
-		NodeRegion:        cfg.Node.Region,
-		InterfaceName:     cfg.Interface.Name,
-		InterfaceXDPMode:  cfg.Interface.XDPMode,
-		UpdateChannel:     cfg.Update.Channel,
-		EmergencyBypass:   cfg.Runtime.EmergencyBypass,
-		PerIPTableSize:    cfg.Runtime.PerIPTableSize,
-		StatsFile:         cfg.Observability.StatsFile,
-		EnforceSSHPrivate: enforce,
-		AllowSSHPublic:    cfg.Security.AllowSSHPublic,
-		PublicTCP:         cfg.Filter.Public.TCP,
-		PublicUDP:         cfg.Filter.Public.UDP,
-		PrivateTCP:        cfg.Filter.Private.TCP,
-		PrivateUDP:        cfg.Filter.Private.UDP,
-		AllowICMP:         allowICMP,
-		AllowARP:          allowARP,
-		UDPEphemeralMin:   cfg.Filter.UDPEphemeralMin,
-		IngressAllowlist:  cfg.Filter.IngressAllowlist,
-		StaticBlocklist:   cfg.Filter.StaticBlocklist,
+		Version:            version,
+		NodeID:             nodeID,
+		NodeRegion:         c.Node.Region,
+		InterfaceName:      c.Interface.Name,
+		InterfaceXDPMode:   c.Interface.XDPMode,
+		UpdateChannel:      c.Update.Channel,
+		AutoUpdateDownload: autoUpdateDownload,
+		AutoUpdateReload:   c.Update.AutoUpdateReload,
+		AutoUpdateInterval: autoUpdateInterval,
+		EmergencyBypass:    c.Runtime.EmergencyBypass,
+		PerIPTableSize:     c.Runtime.PerIPTableSize,
+		StatsFile:          c.Observability.StatsFile,
+		EnforceSSHPrivate:  enforce,
+		AllowSSHPublic:     c.Security.AllowSSHPublic,
+		PublicTCP:          c.Filter.Public.TCP,
+		PublicUDP:          c.Filter.Public.UDP,
+		PrivateTCP:         c.Filter.Private.TCP,
+		PrivateUDP:         c.Filter.Private.UDP,
+		AllowICMP:          allowICMP,
+		AllowARP:           allowARP,
+		UDPEphemeralMin:    c.Filter.UDPEphemeralMin,
+		IngressAllowlist:   c.Filter.IngressAllowlist,
+		StaticBlocklist:    c.Filter.StaticBlocklist,
 	}
 }
 
