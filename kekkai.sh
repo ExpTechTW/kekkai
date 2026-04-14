@@ -679,20 +679,38 @@ select_release_assets() {
   local arch="$3"
   python3 -c '
 import json
+import re
 import sys
 
 channel, os_name, arch = sys.argv[1:4]
 data = json.load(sys.stdin)
 
+# Tag format is fixed by draft-release.yml: vYYYY.MM.DD+build.N
+# Anything that does not match sorts as (0,0,0,0) so it loses to any
+# well-formed tag — we never want to accidentally pick a hand-pushed
+# tag over the CI-generated ones.
+TAG_RE = re.compile(r"^v(\d{4})\.(\d{2})\.(\d{2})\+build\.(\d+)$")
+
+def parse_version(tag):
+    m = TAG_RE.match(tag or "")
+    if not m:
+        return (0, 0, 0, 0)
+    return tuple(int(m.group(i)) for i in range(1, 5))
+
 def pick_release(obj):
+    # release channel: /releases/latest already returns the single
+    # newest non-prerelease release, nothing to sort.
     if channel == "release":
         return obj
-    for rel in obj:
-        if rel.get("draft"):
-            continue
-        if rel.get("prerelease"):
-            return rel
-    return None
+
+    # pre-release channel: the list endpoint is sorted by created_at
+    # (newest first), which is NOT the same as version order — a
+    # re-published older build would hop to the top and shadow the
+    # real latest. Sort by parsed tag version and take the max.
+    candidates = [r for r in obj if not r.get("draft") and r.get("prerelease")]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: parse_version(r.get("tag_name", "")))
 
 release = pick_release(data)
 if not release:
