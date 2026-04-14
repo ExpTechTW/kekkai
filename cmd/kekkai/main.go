@@ -19,14 +19,15 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/ExpTechTW/kekkai/internal/buildinfo"
 	"github.com/ExpTechTW/kekkai/internal/config"
 	"github.com/ExpTechTW/kekkai/internal/doctor"
 	"github.com/ExpTechTW/kekkai/internal/tui"
 )
 
-// version is injected at build time via -ldflags. Defaults to "dev" when
-// building with plain `go build`.
-var version = "dev"
+// version is injected at build time via -ldflags. Defaults to repository
+// version constant when building with plain `go build`.
+var version = buildinfo.DefaultVersion
 
 const defaultConfigPath = "/etc/kekkai/kekkai.yaml"
 const agentBinary = "/usr/local/bin/kekkai-agent"

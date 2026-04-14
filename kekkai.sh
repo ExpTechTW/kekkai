@@ -296,6 +296,24 @@ detect_iface() {
   echo "$iface"
 }
 
+iface_has_default_allowlist_ip() {
+  local iface="$1"
+  [[ -n "$iface" ]] || return 1
+  # default allowlist is 192.168.0.0/16
+  ip -o -4 addr show dev "$iface" scope global 2>/dev/null | \
+    awk '
+      {
+        split($4, parts, "/")
+        ip = parts[1]
+        split(ip, octets, ".")
+        if (octets[1] == 192 && octets[2] == 168) {
+          found = 1
+        }
+      }
+      END { exit(found ? 0 : 1) }
+    '
+}
+
 read_update_channel_from_config() {
   local cfg="${1:-$CONFIG_FILE}"
   [[ -f "$cfg" ]] || return 1
@@ -319,7 +337,7 @@ resolve_update_channel() {
   if [[ -z "$ch" ]]; then
     ch="$(read_update_channel_from_config "$CONFIG_FILE" 2>/dev/null || true)"
   fi
-  [[ -n "$ch" ]] || ch="git:main"
+  [[ -n "$ch" ]] || ch="release"
   case "$ch" in
     git:main|release|pre-release) ;;
     *)
@@ -328,6 +346,28 @@ resolve_update_channel() {
       ;;
   esac
   echo "$ch"
+}
+
+prepare_binaries() {
+  if [[ "$SOURCE_MODE" == "repo" ]]; then
+    ensure_go
+    build_from_source
+    return 0
+  fi
+
+  local channel
+  channel="$(resolve_update_channel)"
+  case "$channel" in
+    release|pre-release)
+      fetch_release_binaries_to_root_bin "$channel"
+      ;;
+    git:main)
+      die "update.channel=git:main requires repo mode. For raw install use update.channel=release or pre-release."
+      ;;
+    *)
+      die "unsupported update.channel: $channel"
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -433,7 +473,11 @@ install_config() {
   # We delegate the template to `kekkai-agent -reset` so shell and Go stay
   # in sync on one source of truth for the default config.
   $SUDO "$AGENT_BIN" -reset -config "$CONFIG_FILE" -iface "$iface" >/dev/null
-  warn "edit $CONFIG_FILE and add your management network to filter.ingress_allowlist"
+  if ! iface_has_default_allowlist_ip "$iface"; then
+    warn "detected iface '$iface' is not in default ingress_allowlist 192.168.0.0/16"
+    warn "service may reject startup until you set filter.ingress_allowlist to your management subnet"
+  fi
+  warn "review $CONFIG_FILE and set filter.ingress_allowlist to your management network"
 }
 
 install_systemd_unit() {
@@ -710,6 +754,39 @@ release_update() {
   log "update complete (channel=$channel, tag=$tag)"
 }
 
+fetch_release_binaries_to_root_bin() {
+  local channel="$1"
+  command -v curl >/dev/null 2>&1 || die "curl not found"
+  command -v python3 >/dev/null 2>&1 || die "python3 not found (required for release metadata parsing)"
+
+  local meta
+  meta="$(fetch_release_metadata "$channel")" || die "failed to fetch GitHub release metadata"
+
+  local parsed
+  parsed="$(printf '%s' "$meta" | select_release_assets "$channel" "$OS" "$ARCH")" || die "failed to resolve release assets for $OS/$ARCH"
+  local tag agent_url cli_url
+  tag="$(printf '%s\n' "$parsed" | sed -n '1p')"
+  agent_url="$(printf '%s\n' "$parsed" | sed -n '2p')"
+  cli_url="$(printf '%s\n' "$parsed" | sed -n '3p')"
+  [[ -n "$agent_url" && -n "$cli_url" ]] || die "release metadata incomplete"
+
+  log "selected release: $tag ($channel)"
+  info "agent asset: $(basename "${agent_url%%\?*}")"
+  info "cli asset:   $(basename "${cli_url%%\?*}")"
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local new_agent new_cli
+  new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")"
+  new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")"
+
+  mkdir -p "$ROOT/bin"
+  cp "$new_agent" "$ROOT/bin/kekkai-agent"
+  cp "$new_cli" "$ROOT/bin/kekkai"
+  chmod +x "$ROOT/bin/kekkai-agent" "$ROOT/bin/kekkai"
+  rm -rf "$tmpdir"
+}
+
 validate_config_against_new_binary() {
   local candidate_bin="${1:-$ROOT/bin/kekkai-agent}"
   [[ -f "$CONFIG_FILE" ]] || return 0
@@ -743,9 +820,8 @@ do_install() {
   banner
   step "first-time install · $OS/$ARCH"
   install_deps
-  ensure_go
   check_kernel
-  build_from_source
+  prepare_binaries
   install_binaries
   setup_sudo_shortcut
   install_config
@@ -758,13 +834,13 @@ do_install() {
 do_update() {
   banner
   step "update · $OS/$ARCH"
-  ensure_go
   local channel
   channel="$(resolve_update_channel)"
   log "update channel: $channel"
 
   case "$channel" in
     git:main)
+      ensure_go
       git_update
       build_from_source
       validate_config_against_new_binary "$ROOT/bin/kekkai-agent"
@@ -793,8 +869,7 @@ do_update() {
 do_repair() {
   banner
   step "repair · $OS/$ARCH"
-  ensure_go
-  build_from_source
+  prepare_binaries
   install_binaries
   setup_sudo_shortcut
   [[ -f "$CONFIG_FILE" ]] || install_config

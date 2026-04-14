@@ -3,7 +3,7 @@ CLI_BIN   := kekkai
 AGENT_PKG := ./cmd/kekkai-agent
 CLI_PKG   := ./cmd/kekkai
 
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION ?= $(shell tr -d ' \n\r' < internal/buildinfo/VERSION)
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 
 .PHONY: all bpf build build-agent build-cli build-linux vet test clean run status \

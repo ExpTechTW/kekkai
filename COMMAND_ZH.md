@@ -127,7 +127,7 @@ sudo kekkai reset /tmp/test.yaml --iface eth0
 3. 寫出乾淨的 v2 template（node / interface / runtime / observability / security / filter 全部預設值）
 4. 印 `default config written: ...` + 提醒要補 `ingress_allowlist`
 
-**寫出來的 config 不會立即可用** — `filter.ingress_allowlist: []` 是空的，而 `security.enforce_ssh_private: true` 預設會把 22 塞進 `private.tcp`，SSH 鎖防護會拒絕啟動。你必須：
+預設 template 會先放一條 `filter.ingress_allowlist: [192.168.0.0/16]`，避免初次安裝直接因 SSH 防呆拒啟。你仍然應該改成自己的管理網段：
 
 ```bash
 sudo kekkai reset
@@ -645,7 +645,7 @@ journalctl -u kekkai-agent -n 30 --no-pager
 |---|---|
 | `/usr/local/bin/kekkai` | CLI + TUI |
 | `/usr/local/bin/kekkai-agent` | Daemon |
-| `/usr/local/bin/kekkai-agent.prev` | update.sh 留的 rollback 快照 |
+| `/usr/local/bin/kekkai-agent.prev` | `kekkai.sh update` 留的 rollback 快照 |
 | `/etc/kekkai/kekkai.yaml` | user 主 config（可手動編輯） |
 | `/etc/kekkai/kekkai.agent.yaml` | agent 管理的 last-known-good config（啟動優先使用） |
 | `/etc/kekkai/kekkai.yaml.*_backup.*` | 備份檔 |
@@ -658,7 +658,14 @@ journalctl -u kekkai-agent -n 30 --no-pager
 
 ## 十一、環境變數
 
-幾乎沒有。目前唯一會看環境變數的地方是 `NO_COLOR`（未來 TUI 支援）。其餘所有行為都由 `/etc/kekkai/kekkai.yaml` 和 CLI flag 決定。
+主要會看這些環境變數：
+
+- `NO_COLOR`：關閉彩色輸出
+- `KEKKAI_REPO`：`kekkai update` 在非 repo 目錄時指定 repo 根目錄
+- `KEKKAI_SCRIPT`：直接指定 `kekkai.sh` 路徑
+- `KEKKAI_UPDATE_CHANNEL`：臨時覆蓋 `update.channel`（`release` / `pre-release` / `git:main`）
+- `KEKKAI_GIT_ACCEPT_NEW_HOSTKEY`：控制 update 時 git SSH 的 `accept-new` 行為（`1` 預設啟用）
+- `GIT_SSH_COMMAND`：覆蓋 git SSH 行為（進階用途）
 
 ---
 

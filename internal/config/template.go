@@ -61,6 +61,7 @@ func DefaultValues() Values {
 		AllowARP:          true,
 		UDPEphemeralMin:   DefaultUDPEphemeralMin,
 		PublicTCP:         []uint16{80, 443},
+		IngressAllowlist:  []string{"192.168.0.0/16"},
 	}
 }
 

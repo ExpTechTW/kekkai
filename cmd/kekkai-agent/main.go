@@ -21,11 +21,16 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/ExpTechTW/kekkai/internal/buildinfo"
 	"github.com/ExpTechTW/kekkai/internal/config"
 	"github.com/ExpTechTW/kekkai/internal/loader"
 	kmaps "github.com/ExpTechTW/kekkai/internal/maps"
 	"github.com/ExpTechTW/kekkai/internal/stats"
 )
+
+// version is injected at build time via -ldflags. It exists in agent too so
+// release workflows can stamp both binaries from one value.
+var version = buildinfo.DefaultVersion
 
 func main() {
 	cfgPath := flag.String("config", "/etc/kekkai/kekkai.yaml", "path to edge config")

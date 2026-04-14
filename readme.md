@@ -12,10 +12,25 @@
 
 ## 目前狀態
 
-- 已完成：M1-M3、strict policy、CLI/TUI、doctor、installer
-- 進行中路線：M4 NATS、M5 黑名單同步、M6 rate-limit/自動封鎖、M7 運維強化
+- 已完成：strict policy、CLI/TUI、doctor、installer/update、雙檔 config 隔離
+- 已完成：hybrid stateful conntrack（ingress flowtrack + egress state seed）
+- 進行中路線：NATS/黑名單同步、進階限速與運維指令補齊
 
 ## 快速開始
+
+一鍵安裝（直接執行 GitHub raw 腳本）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh)
+```
+
+若要固定更新通道（例如 pre-release）：
+
+```bash
+KEKKAI_UPDATE_CHANNEL=pre-release bash <(curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh)
+```
+
+或用 repo 模式（開發者）：
 
 ```bash
 git clone git@github.com:ExpTechTW/kekkai.git
@@ -32,8 +47,16 @@ sudo kekkai reload
 sudo kekkai status
 ```
 
-> 所有指令細節（`status/check/ports/show/backup/reload/update/reset/doctor`）已移到 [`COMMAND_ZH.md`](COMMAND_ZH.md)。  
+> 注意：預設 `filter.ingress_allowlist` 會先放 `192.168.0.0/16` 避免初次啟動被 SSH 防呆擋住；請務必改成你的實際管理網段。
+
+> 所有指令細節（`status/check/ports/show/backup/reload/bypass/update/reset/doctor`）已移到 [`COMMAND_ZH.md`](COMMAND_ZH.md)。  
 > `kekkai update` 來源可由 `update.channel` 設為 `git:main` / `release` / `pre-release`。
+
+GitHub Releases 會提供各平台檔案（`kekkai-*` 與 `kekkai-agent-*`）：
+- `linux-amd64`
+- `linux-arm64`
+- `darwin-amd64`
+- `darwin-arm64`
 
 ## 過濾模型（Ingress）
 
@@ -41,12 +64,13 @@ sudo kekkai status
 
 1. ARP（可配置）放行；其他非 IPv4 丟棄
 2. IPv4 後續分片放行（無 L4 header 可檢查）
-3. 回程流量放行（TCP ACK/RST/FIN、UDP ephemeral、ICMP 可配置）
-4. static blocklist 命中丟棄
-5. dynamic blocklist 命中丟棄
-6. `filter.public.*` 放行
-7. `filter.private.*` 只有 `ingress_allowlist` 可放行
-8. 其餘 default deny
+3. conntrack hit 直接放行（stateful fast path）
+4. 回程 fallback 放行（TCP ACK/RST/FIN、UDP ephemeral、ICMP 可配置）
+5. static blocklist 命中丟棄
+6. dynamic blocklist 命中丟棄
+7. `filter.public.*` 放行
+8. `filter.private.*` 只有 `ingress_allowlist` 可放行
+9. 其餘 default deny
 
 ## 設定檔隔離（雙檔案）
 
@@ -59,11 +83,12 @@ reload 成功後，agent 會更新 managed 檔，避免 user config 損毀導致
 ## 核心特性
 
 - XDP 在 ingress 熱路徑做 L3/L4 決策（低延遲、低 CPU）
+- Hybrid stateful：flowtrack fast path + egress state seed
 - LPM blocklist/allowlist + port policy（public/private）
-- 熱重載（SIGHUP）、emergency bypass
+- 熱重載（SIGHUP）、emergency bypass（`kekkai bypass on|off [--save]`）
 - 觀測：全域/協定/drop-pass reason/per-IP topN
 - TUI：Overview / Detail / Top-N / Charts
-- 配置：嚴格 schema 驗證、SSH lockout 防護、自動備份
+- 配置：嚴格 schema 驗證、SSH lockout 防護、自動備份、update channel
 
 ## 專案結構（精簡）
 
@@ -95,7 +120,7 @@ deploy/systemd/
 
 ## 不在此 repo 的範圍
 
-- Stateful conntrack / NAT
+- NAT
 - L7 WAF 規則
 - TLS 指紋
 - ML 異常偵測
