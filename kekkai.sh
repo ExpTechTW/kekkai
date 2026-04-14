@@ -461,7 +461,16 @@ git_update() {
   before="$(git rev-parse HEAD)"
   log "current HEAD: ${before:0:12}"
   log "fetching origin/$BRANCH"
-  git fetch origin "$BRANCH"
+  # Avoid interactive hangs on first SSH contact with github.com.
+  # Users can disable this behavior by setting:
+  #   KEKKAI_GIT_ACCEPT_NEW_HOSTKEY=0
+  local accept_new_hostkey="${KEKKAI_GIT_ACCEPT_NEW_HOSTKEY:-1}"
+  if [[ "$accept_new_hostkey" == "1" ]]; then
+    GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o StrictHostKeyChecking=accept-new}" \
+      git fetch origin "$BRANCH"
+  else
+    git fetch origin "$BRANCH"
+  fi
   remote="$(git rev-parse "origin/$BRANCH")"
 
   if [[ "$before" == "$remote" ]]; then
