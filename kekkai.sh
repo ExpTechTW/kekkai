@@ -1078,8 +1078,12 @@ release_update() {
   # because sync_script_from_remote may overwrite the script this very
   # process is running — bash has already parsed our source, so this is
   # safe as long as we don't source the file again afterward.
-  sync_script_from_remote
-  local script_rc=$?
+  #
+  # NOTE: `set -e` would kill us on the non-zero API returns (10/11) if we
+  # called this as a bare statement. The `|| script_rc=$?` idiom isolates
+  # the call from errexit so we can branch on the exit code ourselves.
+  local script_rc=0
+  sync_script_from_remote || script_rc=$?
   case $script_rc in
     0)  changed_parts+=("kekkai.sh") ;;
     10) : ;; # already up-to-date
