@@ -1103,6 +1103,7 @@ release_update() {
   new_ver="$(read_cli_version "$REL_NEW_CLI")"
 
   validate_config_against_new_binary "$REL_NEW_AGENT"
+  sync_user_config_to_canonical "$REL_NEW_AGENT" || die "config canonical sync failed"
 
   # Downgrade guard: `kekkai update` must NEVER replace a newer binary with
   # an older one. Common footgun: user installs pre-release (build.9), then
@@ -1259,6 +1260,62 @@ validate_config_against_new_binary() {
   fi
   rm -f "$log_file"
   log "config ok"
+}
+
+sync_user_config_to_canonical() {
+  local candidate_bin="${1:-$LOCAL_AGENT_BIN}"
+  [[ -f "$CONFIG_FILE" ]] || return 0
+
+  local tmp_show
+  tmp_show="$(mktemp -t kekkai-show.XXXXXX)"
+
+  # Render canonical config (with comments + defaulted fields) via the new
+  # binary so newly introduced keys are written into /etc/kekkai/kekkai.yaml
+  # after update.
+  if ! "$candidate_bin" -show -config "$CONFIG_FILE" >"$tmp_show" 2>/tmp/kekkai-show.log; then
+    rm -f "$tmp_show"
+    echo
+    err "failed to render canonical config with new binary:"
+    sed 's/^/    /' /tmp/kekkai-show.log >&2 || true
+    echo
+    return 1
+  fi
+
+  local cur_ver next_ver
+  cur_ver="$(awk -F': *' '/^version:[[:space:]]*[0-9]+/{print $2; exit}' "$CONFIG_FILE" | tr -d '[:space:]')"
+  next_ver="$(awk -F': *' '/^version:[[:space:]]*[0-9]+/{print $2; exit}' "$tmp_show" | tr -d '[:space:]')"
+
+  # Only sync user config when schema version changes. For same-version
+  # updates we intentionally keep the user's existing file shape as-is.
+  if [[ -z "$cur_ver" || -z "$next_ver" ]]; then
+    info "config canonical sync: skipped (unable to read schema version)"
+    rm -f "$tmp_show"
+    return 0
+  fi
+  if [[ "$cur_ver" == "$next_ver" ]]; then
+    info "config canonical sync: skipped (schema unchanged v$cur_ver)"
+    rm -f "$tmp_show"
+    return 0
+  fi
+
+  local backup_out
+  if ! backup_out="$("$candidate_bin" -backup -config "$CONFIG_FILE" 2>/tmp/kekkai-backup.log)"; then
+    rm -f "$tmp_show"
+    echo
+    err "failed to backup config before canonical sync:"
+    sed 's/^/    /' /tmp/kekkai-backup.log >&2 || true
+    echo
+    return 1
+  fi
+  [[ -n "$backup_out" ]] && info "$backup_out"
+
+  $SUDO install -D -m 0644 "$tmp_show" "$CONFIG_FILE" || {
+    rm -f "$tmp_show"
+    err "failed to write canonical config to $CONFIG_FILE"
+    return 1
+  }
+  log "config canonical sync: wrote normalized config to $CONFIG_FILE (v${cur_ver:-unknown} -> v${next_ver:-unknown})"
+  rm -f "$tmp_show"
 }
 
 # ---------------------------------------------------------------------------

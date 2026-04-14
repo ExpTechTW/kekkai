@@ -537,10 +537,11 @@ sudo kekkai status                              # 看 TUI
 1. 從 `https://github.com/ExpTechTW/kekkai/releases` 抓目標 channel（release / pre-release）的最新資產
 2. 下載 `kekkai-agent-linux-<arch>` 和 `kekkai-linux-<arch>` 到 tmp 目錄
 3. 用新 agent binary 跑 `-check` 驗 `/etc/kekkai/kekkai.yaml`（失敗中止，不動 service）
-4. 三路 diff：agent / cli / kekkai.sh 個別比對 sha256，每個獨立決定要不要更新
-5. agent 有變 → `systemctl restart kekkai-agent`（失敗自動 rollback 到 `kekkai-agent.prev`）
-6. cli 或 kekkai.sh 有變 → 個別覆寫，不 restart service
-7. 最後印藍色 `UPDATED`（有變）或綠色 `ALREADY UP-TO-DATE`（全部沒變）結果區塊
+4. 只有在 `config version` 變更時，才用新 agent binary 產生 canonical config；先備份再寫回 `/etc/kekkai/kekkai.yaml`（保留原有值並補新欄位）
+5. 三路 diff：agent / cli / kekkai.sh 個別比對 sha256，每個獨立決定要不要更新
+6. agent 有變 → `systemctl restart kekkai-agent`（失敗自動 rollback 到 `kekkai-agent.prev`）
+7. cli 或 kekkai.sh 有變 → 個別覆寫，不 restart service
+8. 最後印藍色 `UPDATED`（有變）或綠色 `ALREADY UP-TO-DATE`（全部沒變）結果區塊
 
 ### 7.7 開發者本機建置（maintainer 用）
 

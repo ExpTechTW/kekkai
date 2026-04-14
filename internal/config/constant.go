@@ -4,7 +4,7 @@ package config
 // Not yet bumped — the project has not shipped a breaking schema change.
 // The field is reserved so older agents can refuse to load future formats
 // and future agents know when to run migration.
-const CurrentVersion = 1
+const CurrentVersion = 2
 
 const (
 	DefaultStatsFile       = "/var/run/kekkai/stats.txt"

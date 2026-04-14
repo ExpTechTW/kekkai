@@ -62,6 +62,7 @@ sudo kekkai status
 
 > 所有指令細節（`status/check/ports/show/backup/reload/bypass/update/reset/doctor`）已移到 [`COMMAND_ZH.md`](COMMAND_ZH.md)。  
 > `kekkai update` 來源可由 `update.channel` 設為 `release`（預設）或 `pre-release`。
+> `kekkai update` 只在 config schema `version` 變更時才會回寫 `/etc/kekkai/kekkai.yaml`（先自動備份），平常同版本更新不會覆蓋你的檔案排版。
 
 GitHub Releases 會提供各平台檔案（`kekkai-*` 與 `kekkai-agent-*`）：
 
