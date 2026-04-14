@@ -263,6 +263,10 @@ func Marshal(cfg *Config) ([]byte, error) {
 // zero-valued fields so an in-memory Config built from partial YAML still
 // renders cleanly.
 func ValuesFromConfig(cfg *Config) Values {
+	version := cfg.Version
+	if version <= 0 {
+		version = CurrentVersion
+	}
 	enforce := true
 	if cfg.Security.EnforceSSHPrivate != nil {
 		enforce = *cfg.Security.EnforceSSHPrivate
@@ -281,6 +285,7 @@ func ValuesFromConfig(cfg *Config) Values {
 		nodeID = hostname
 	}
 	return Values{
+		Version:           version,
 		NodeID:            nodeID,
 		NodeRegion:        cfg.Node.Region,
 		InterfaceName:     cfg.Interface.Name,

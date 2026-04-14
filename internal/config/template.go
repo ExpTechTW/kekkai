@@ -18,6 +18,8 @@ func DefaultTemplate() string { return defaultTemplate }
 // optional — empty values fall back to conservative defaults so the
 // output is always valid YAML.
 type Values struct {
+	Version int
+
 	NodeID     string
 	NodeRegion string
 
@@ -53,6 +55,7 @@ type Values struct {
 // fields they have better information for (hostname, detected iface, ...).
 func DefaultValues() Values {
 	return Values{
+		Version:            CurrentVersion,
 		NodeRegion:         "default",
 		InterfaceXDPMode:   DefaultXDPMode,
 		UpdateChannel:      DefaultUpdateChannel,
@@ -76,6 +79,9 @@ func DefaultValues() Values {
 // document. Placeholders unfilled by v fall back to hard defaults so the
 // result always parses (modulo validation errors like empty allowlist).
 func Render(v Values) string {
+	if v.Version <= 0 {
+		v.Version = CurrentVersion
+	}
 	if v.NodeRegion == "" {
 		v.NodeRegion = "default"
 	}
@@ -114,6 +120,7 @@ func Render(v Values) string {
 		replace(placeholder, value)
 	}
 
+	replace("__VERSION__", strconv.FormatInt(int64(v.Version), 10))
 	replace("__NODE_ID__", v.NodeID)
 	replace("__NODE_REGION__", v.NodeRegion)
 	replace("__INTERFACE_NAME__", v.InterfaceName)

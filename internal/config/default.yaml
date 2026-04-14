@@ -8,7 +8,7 @@
 #
 # EN: Schema version. Reserved for future migrations.
 # ZH: Schema 版本號。保留給未來的 migration 機制使用。
-version: 1
+version: __VERSION__
 
 # ---------- identity ----------
 node:
