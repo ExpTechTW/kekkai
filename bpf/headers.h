@@ -31,10 +31,6 @@
 #define TCP_FLAG_ACK  0x10
 #define TCP_FLAG_URG  0x20
 
-// Ephemeral port range used to identify return UDP traffic. Matches Linux
-// default /proc/sys/net/ipv4/ip_local_port_range on recent kernels.
-#define EPHEMERAL_PORT_MIN 32768
-
 struct ethhdr {
     __u8   h_dest[ETH_ALEN];
     __u8   h_source[ETH_ALEN];

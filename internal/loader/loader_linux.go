@@ -21,7 +21,8 @@ var programBytes []byte
 const (
 	bpffsRoot = "/sys/fs/bpf/kekkai"
 
-	progName = "kekkai_xdp"
+	progNameXDP      = "kekkai_xdp"
+	progNameTCEgress = "kekkai_tcx_egress_seed"
 
 	mapBlocklistV4     = "blocklist_v4"
 	mapAllowlistV4     = "allowlist_v4"
@@ -37,6 +38,7 @@ const (
 type linuxImpl struct {
 	coll       *ebpf.Collection
 	lnk        link.Link
+	tcEgress   link.Link
 	lastIfidx  int
 	lastFlags  link.XDPAttachFlags
 	bypassed   bool // currently detached due to emergency bypass
@@ -87,11 +89,11 @@ func (l *linuxImpl) attach(ifaceIndex int, opts Options) error {
 		return fmt.Errorf("pin maps: %w", err)
 	}
 
-	prog := coll.Programs[progName]
+	prog := coll.Programs[progNameXDP]
 	if prog == nil {
 		coll.Close()
 		l.coll = nil
-		return fmt.Errorf("program %s not found in object", progName)
+		return fmt.Errorf("program %s not found in object", progNameXDP)
 	}
 
 	l.lastIfidx = ifaceIndex
@@ -128,27 +130,77 @@ func (l *linuxImpl) attachLink(prog *ebpf.Program) error {
 		}
 	}
 	l.lnk = lnk
+	if err := l.attachTCEgress(); err != nil {
+		_ = l.lnk.Close()
+		l.lnk = nil
+		return err
+	}
 	l.bypassed = false
 	return nil
 }
 
+func (l *linuxImpl) attachTCEgress() error {
+	if l.tcEgress != nil {
+		_ = l.tcEgress.Close()
+		l.tcEgress = nil
+	}
+	prog := l.coll.Programs[progNameTCEgress]
+	if prog == nil {
+		return fmt.Errorf("program %s not found in object", progNameTCEgress)
+	}
+	lnk, err := link.AttachTCX(link.TCXOptions{
+		Interface: l.lastIfidx,
+		Program:   prog,
+		Attach:    ebpf.AttachTCXEgress,
+	})
+	if err != nil {
+		// TCX depends on kernel support (6.6+). If unavailable, continue
+		// without egress seeding; ingress path still works via fallback rules.
+		if errors.Is(err, link.ErrNotSupported) || isTCXModeError(err) {
+			return nil
+		}
+		return fmt.Errorf("attach tcx egress: %w", err)
+	}
+	l.tcEgress = lnk
+	return nil
+}
+
 func (l *linuxImpl) detach() error {
+	var firstErr error
+	if l.tcEgress != nil {
+		if err := l.tcEgress.Close(); err != nil {
+			firstErr = err
+		}
+		l.tcEgress = nil
+	}
 	if l.lnk != nil {
 		err := l.lnk.Close()
 		l.lnk = nil
 		l.bypassed = true
-		return err
+		if firstErr == nil {
+			firstErr = err
+		}
+		return firstErr
 	}
-	return nil
+	l.bypassed = true
+	return firstErr
 }
 
 func (l *linuxImpl) close() error {
 	var firstErr error
 	if l.lnk != nil {
-		if err := l.lnk.Close(); err != nil && firstErr == nil {
+		if err := l.lnk.Close(); err != nil {
 			firstErr = err
 		}
 		l.lnk = nil
+	}
+	if l.tcEgress != nil {
+		if err := l.tcEgress.Close(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		l.tcEgress = nil
 	}
 	if l.coll != nil {
 		l.coll.Close()
@@ -213,6 +265,13 @@ func isXDPModeError(err error) bool {
 			"not supported", "no such device", "invalid argument")))
 }
 
+func isTCXModeError(err error) bool {
+	return errors.Is(err, os.ErrNotExist) ||
+		errors.Is(err, os.ErrInvalid) ||
+		(err != nil && (containsAny(err.Error(),
+			"not supported", "invalid argument", "operation not supported")))
+}
+
 func containsAny(s string, needles ...string) bool {
 	for _, n := range needles {
 		if len(n) > 0 && bytesContains([]byte(s), []byte(n)) {
@@ -262,9 +321,9 @@ func (l *Loader) SetBypass(bypass bool) error {
 		return li.detach()
 	}
 	// Re-attach.
-	prog := li.coll.Programs[progName]
+	prog := li.coll.Programs[progNameXDP]
 	if prog == nil {
-		return fmt.Errorf("program %s not found", progName)
+		return fmt.Errorf("program %s not found", progNameXDP)
 	}
 	return li.attachLink(prog)
 }
