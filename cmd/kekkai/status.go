@@ -8,6 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -42,6 +45,7 @@ func cmdStatus(args []string) int {
 		cfg.Interface.XDPMode,
 		version,
 		cfg.Update.Channel,
+		readAgentActiveSince(),
 	)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
@@ -82,4 +86,25 @@ func cmdVersion() {
 			}
 		}
 	}
+}
+
+// readAgentActiveSince tries to read systemd's active-enter timestamp for the
+// running agent unit. Returns zero time when systemctl is unavailable or when
+// the property can't be parsed.
+func readAgentActiveSince() time.Time {
+	out, err := exec.Command(
+		"systemctl",
+		"show",
+		"--property=ActiveEnterTimestampUSec",
+		"--value",
+		agentUnit,
+	).Output()
+	if err != nil {
+		return time.Time{}
+	}
+	usec, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil || usec <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, usec*int64(time.Microsecond))
 }

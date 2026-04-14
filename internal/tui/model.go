@@ -48,7 +48,8 @@ type Model struct {
 	statefulUDPHist []float64
 
 	// startup metadata
-	startedAt time.Time
+	agentStartedAt   time.Time
+	sessionStartedAt time.Time
 	nodeID    string
 	iface     string
 	xdpMode   string
@@ -62,11 +63,16 @@ type Model struct {
 
 // NewModel wires a Source to a Model. The Source is owned by the Model
 // and closed when the program exits.
-func NewModel(src *Source, nodeID, iface, xdpMode, version, updateChannel string) *Model {
+func NewModel(
+	src *Source,
+	nodeID, iface, xdpMode, version, updateChannel string,
+	agentStartedAt time.Time,
+) *Model {
 	return &Model{
 		src:       src,
 		page:      PageOverview,
-		startedAt: time.Now(),
+		agentStartedAt:   agentStartedAt,
+		sessionStartedAt: time.Now(),
 		nodeID:    nodeID,
 		iface:     iface,
 		xdpMode:   xdpMode,
@@ -242,12 +248,18 @@ func pushSeries(series []float64, v float64, max int) []float64 {
 	return series
 }
 
-// uptime formats how long the TUI itself has been running. The agent
-// uptime is not directly visible to kekkai (maps are pinned but have no
-// start timestamp), so this is "session uptime" which is good enough for
-// an operator glancing at the screen.
+// uptime prefers agent runtime (from systemd ActiveEnterTimestampUSec as
+// provided by cmd/kekkai status). If unavailable, fall back to TUI session
+// time so non-systemd/manual runs still show a useful counter.
 func (m *Model) uptime() string {
-	d := time.Since(m.startedAt).Truncate(time.Second)
+	startAt := m.agentStartedAt
+	if startAt.IsZero() {
+		startAt = m.sessionStartedAt
+	}
+	d := time.Since(startAt).Truncate(time.Second)
+	if d < 0 {
+		d = 0
+	}
 	return fmt.Sprintf("%s", d)
 }
 
