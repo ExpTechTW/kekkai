@@ -318,9 +318,23 @@ check_kernel() {
   fi
   if ! mount | grep -q 'type bpf '; then
     log "mounting bpffs at /sys/fs/bpf"
-    $SUDO mount -t bpf bpf /sys/fs/bpf || warn "bpffs mount failed"
+    $SUDO mount -t bpf bpf /sys/fs/bpf -o mode=755 || warn "bpffs mount failed"
   fi
+  ensure_bpffs_root_mode
   $SUDO mkdir -p "$BPFFS_DIR"
+}
+
+ensure_bpffs_root_mode() {
+  [[ "$OS" == "linux" ]] || return 0
+  if ! mount | grep -qE ' on /sys/fs/bpf .*type bpf '; then
+    return 0
+  fi
+  local opts
+  opts="$(findmnt -no OPTIONS /sys/fs/bpf 2>/dev/null || true)"
+  if [[ "$opts" == *"mode=700"* ]]; then
+    warn "bpffs mounted with mode=700; remounting /sys/fs/bpf with mode=755 for non-root status"
+    $SUDO mount -o remount,mode=755 /sys/fs/bpf || warn "bpffs remount to mode=755 failed"
+  fi
 }
 
 detect_iface() {
@@ -531,20 +545,16 @@ setup_status_capabilities() {
   fi
 }
 
-repair_bpffs_status_permissions() {
-  [[ "$OS" == "linux" ]] || return 0
-  [[ -d "$BPFFS_DIR" ]] || return 0
-  # Keep status readable for non-root users.
-  $SUDO chmod 0755 "$BPFFS_DIR" 2>/dev/null || true
-  $SUDO chmod 0644 "$BPFFS_DIR"/* 2>/dev/null || true
-}
-
 probe_status_permissions() {
   [[ "$OS" == "linux" ]] || return 0
   local ok=1
 
-  if [[ ! -d "$BPFFS_DIR" ]]; then
+  if [[ ! -e "$BPFFS_DIR" ]]; then
     warn "status permission probe: $BPFFS_DIR missing (agent may not have pinned maps yet)"
+    return 0
+  fi
+  if [[ ! -d "$BPFFS_DIR" ]]; then
+    warn "status permission probe: cannot access $BPFFS_DIR (permission denied?)"
     return 0
   fi
   if [[ ! -r "$BPFFS_DIR" || ! -x "$BPFFS_DIR" ]]; then
@@ -679,7 +689,6 @@ enable_and_start() {
     $SUDO journalctl -u "$UNIT_NAME" -n 20 --no-pager >&2 || true
     die "service failed to come up"
   fi
-  repair_bpffs_status_permissions
   probe_status_permissions
 }
 
@@ -921,7 +930,6 @@ release_update() {
   old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
   new_sha="$(sha256sum "$new_agent" | awk '{print $1}')"
   if [[ "$old_sha" == "$new_sha" ]]; then
-    repair_bpffs_status_permissions
     setup_status_capabilities
     probe_status_permissions
     log "up-to-date (binary unchanged — nothing to restart)"
@@ -1052,7 +1060,6 @@ do_update() {
       old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
       new_sha="$(sha256sum "$ROOT/bin/kekkai-agent" | awk '{print $1}')"
       if [[ "$old_sha" == "$new_sha" ]]; then
-        repair_bpffs_status_permissions
         setup_status_capabilities
         probe_status_permissions
         log "up-to-date (binary unchanged — nothing to restart)"
