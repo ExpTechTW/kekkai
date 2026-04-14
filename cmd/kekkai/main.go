@@ -137,13 +137,20 @@ func main() {
 
 	cmd, args := os.Args[1], os.Args[2:]
 
-	// Everything except `help` / `-h` / `--help` requires root. The CLI is
-	// a sudo-only tool on Debian/Ubuntu/Pi OS (kernel.unprivileged_bpf_disabled
+	// Everything except `help` / `version` requires root. The CLI is a
+	// sudo-only tool on Debian/Ubuntu/Pi OS (kernel.unprivileged_bpf_disabled
 	// blocks non-root bpf() even with file caps), so we fail fast with a
 	// copy-pasteable sudo hint instead of letting downstream calls emit
 	// cryptic EACCES.
+	//
+	// `version` is deliberately outside the gate: kekkai.sh's update flow
+	// calls `kekkai-candidate version` to diff old vs new version strings
+	// before deciding whether to restart the service. If version required
+	// root, a freshly-downloaded CLI in a tmp dir (which kekkai.sh may
+	// invoke while itself running under sudo's preserved env) could fail
+	// that probe and leave the update result block showing "unknown".
 	switch cmd {
-	case "help", "-h", "--help":
+	case "help", "-h", "--help", "version", "-v", "--version":
 		// no gate
 	default:
 		requireRoot()

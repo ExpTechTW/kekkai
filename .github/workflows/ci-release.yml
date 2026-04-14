@@ -285,11 +285,19 @@ jobs:
               f.write("\n".join(lines))
           PY
 
+      # `commit: github.sha` pins the release + tag to the exact commit
+      # that triggered this workflow. Without it, ncipollo/release-action
+      # falls back to the repo's default branch HEAD — which made every
+      # pre-release under an old setup end up pointing at the `release`
+      # branch tip instead of the `main` commit that actually built the
+      # binaries. target_commitish and created_at will now reflect the
+      # real source commit.
       - name: Publish / update release
         if: needs.meta.outputs.mode == 'release'
         uses: ncipollo/release-action@v1
         with:
           tag: v${{ needs.meta.outputs.version }}
+          commit: ${{ github.sha }}
           name: v${{ needs.meta.outputs.version }} Release (auto)
           bodyFile: release-notes.md
           draft: false
@@ -305,6 +313,7 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           tag: v${{ needs.meta.outputs.version }}
+          commit: ${{ github.sha }}
           name: v${{ needs.meta.outputs.version }} Pre-release (auto)
           bodyFile: release-notes.md
           draft: false
