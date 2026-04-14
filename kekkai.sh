@@ -840,7 +840,7 @@ release_update() {
   old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
   new_sha="$(sha256sum "$new_agent" | awk '{print $1}')"
   if [[ "$old_sha" == "$new_sha" ]]; then
-    log "binary unchanged — nothing to restart"
+    log "up-to-date (binary unchanged — nothing to restart)"
     print_version_transition "$old_ver" "$new_ver"
     rm -rf "$tmpdir"
     return 0
@@ -953,7 +953,7 @@ do_update() {
       old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
       new_sha="$(sha256sum "$ROOT/bin/kekkai-agent" | awk '{print $1}')"
       if [[ "$old_sha" == "$new_sha" ]]; then
-        log "binary unchanged — nothing to restart"
+        log "up-to-date (binary unchanged — nothing to restart)"
         print_version_transition "$old_ver" "$new_ver"
         return 0
       fi
