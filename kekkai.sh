@@ -14,8 +14,13 @@
 #   --no-install  skip apt dependency install
 #   --iface NAME  force a specific interface in the default config
 #   --run         launch the agent in foreground at the end (debugging)
-#   --sudo-shortcut     force enable passwordless `kekkai` sudo + shell alias
-#   --no-sudo-shortcut  disable passwordless sudo shortcut setup
+#
+# Runtime note: kekkai CLI always runs under sudo (e.g. `sudo kekkai status`)
+# because on Debian/Ubuntu/Pi OS the kernel sysctl
+# `kernel.unprivileged_bpf_disabled` blocks non-root bpf() regardless of caps.
+# The installer writes a sudoers drop-in (/etc/sudoers.d/kekkai-cli-<user>)
+# so `sudo kekkai ...` won't prompt for a password. No shell alias is added —
+# users should type literal `sudo kekkai` to build portable muscle memory.
 #
 # Auto-detect logic (no subcommand):
 #   - no binaries yet            → install
@@ -99,7 +104,6 @@ FORCE=0
 DO_INSTALL_DEPS=1
 IFACE_OVERRIDE=""
 DO_RUN=0
-SETUP_SUDO_SHORTCUT=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -109,8 +113,6 @@ while [[ $# -gt 0 ]]; do
     --no-install)  DO_INSTALL_DEPS=0; shift ;;
     --iface)       IFACE_OVERRIDE="$2"; shift 2 ;;
     --run)         DO_RUN=1; shift ;;
-    --sudo-shortcut) SETUP_SUDO_SHORTCUT=1; shift ;;
-    --no-sudo-shortcut) SETUP_SUDO_SHORTCUT=0; shift ;;
     -h|--help)
       sed -n '2,23p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -270,7 +272,7 @@ install_deps() {
   $SUDO apt-get update -y
   $SUDO apt-get install -y --no-install-recommends \
     clang llvm libbpf-dev "linux-headers-$(uname -r)" \
-    make gcc pkg-config ca-certificates curl libcap2-bin
+    make gcc pkg-config ca-certificates curl
 }
 
 install_go() {
@@ -318,23 +320,9 @@ check_kernel() {
   fi
   if ! mount | grep -q 'type bpf '; then
     log "mounting bpffs at /sys/fs/bpf"
-    $SUDO mount -t bpf bpf /sys/fs/bpf -o mode=755 || warn "bpffs mount failed"
+    $SUDO mount -t bpf bpf /sys/fs/bpf || warn "bpffs mount failed"
   fi
-  ensure_bpffs_root_mode
   $SUDO mkdir -p "$BPFFS_DIR"
-}
-
-ensure_bpffs_root_mode() {
-  [[ "$OS" == "linux" ]] || return 0
-  if ! mount | grep -qE ' on /sys/fs/bpf .*type bpf '; then
-    return 0
-  fi
-  local opts
-  opts="$(findmnt -no OPTIONS /sys/fs/bpf 2>/dev/null || true)"
-  if [[ "$opts" == *"mode=700"* ]]; then
-    warn "bpffs mounted with mode=700; remounting /sys/fs/bpf with mode=755 for non-root status"
-    $SUDO mount -o remount,mode=755 /sys/fs/bpf || warn "bpffs remount to mode=755 failed"
-  fi
 }
 
 detect_iface() {
@@ -455,8 +443,6 @@ install_binaries_from() {
 
   $SUDO install -D -m 0755 "$src_cli" "$CLI_BIN"
   log "installed: $CLI_BIN"
-
-  setup_status_capabilities
 }
 
 install_binaries() {
@@ -478,118 +464,33 @@ print_version_transition() {
   info "version: ${old_v} -> ${new_v}"
 }
 
-setup_sudo_shortcut() {
-  [[ $SETUP_SUDO_SHORTCUT -eq 1 ]] || return 0
-  [[ "$OS" == "linux" ]] || { warn "--sudo-shortcut is Linux-only"; return 0; }
+setup_passwordless_sudo() {
+  # Install a sudoers drop-in so `sudo kekkai ...` never prompts for a
+  # password. Intentionally NO shell alias — we want the literal `sudo`
+  # keystrokes so users build the right muscle memory across hosts where
+  # the alias may not exist.
+  [[ "$OS" == "linux" ]] || return 0
 
   local target_user
   target_user="${SUDO_USER:-$USER}"
   if [[ -z "$target_user" ]] || [[ "$target_user" == "root" ]]; then
-    warn "skip sudo shortcut setup for root user"
-    return 0
-  fi
-
-  local target_home
-  target_home="$(eval echo "~$target_user")"
-  if [[ -z "$target_home" ]] || [[ ! -d "$target_home" ]]; then
-    warn "cannot resolve home for user '$target_user'; skip sudo shortcut setup"
+    info "skip sudoers drop-in for root user"
     return 0
   fi
 
   local sudoers_file="$SUDOERS_DIR/${SUDOERS_FILE_PREFIX}${target_user}"
-  local sudoers_line="$target_user ALL=(root) NOPASSWD: $CLI_BIN *"
+  local sudoers_line="$target_user ALL=(root) NOPASSWD: $CLI_BIN, $CLI_BIN *"
   log "configuring passwordless sudo for $CLI_BIN (user=$target_user)"
   $SUDO install -d -m 0755 "$SUDOERS_DIR"
   printf '%s\n' "$sudoers_line" | $SUDO tee "$sudoers_file" >/dev/null
   $SUDO chmod 0440 "$sudoers_file"
   if ! $SUDO visudo -cf "$sudoers_file" >/dev/null; then
     $SUDO rm -f "$sudoers_file"
-    die "invalid sudoers syntax generated; aborted --sudo-shortcut"
-  fi
-
-  local shell_name rc_file alias_line
-  shell_name="$(basename "${SHELL:-}")"
-  case "$shell_name" in
-    zsh)  rc_file="$target_home/.zshrc" ;;
-    bash) rc_file="$target_home/.bashrc" ;;
-    *)    rc_file="$target_home/.profile" ;;
-  esac
-  alias_line="alias kekkai='sudo $CLI_BIN'"
-  if [[ ! -f "$rc_file" ]]; then
-    $SUDO touch "$rc_file"
-    $SUDO chown "$target_user":"$target_user" "$rc_file" 2>/dev/null || true
-  fi
-  if ! $SUDO grep -Fq "$alias_line" "$rc_file" 2>/dev/null; then
-    printf '\n%s\n' "$alias_line" | $SUDO tee -a "$rc_file" >/dev/null
-    $SUDO chown "$target_user":"$target_user" "$rc_file" 2>/dev/null || true
-    log "added alias to $rc_file"
-  else
-    info "alias already present in $rc_file"
-  fi
-  info "open a new shell or run: source $rc_file"
-}
-
-setup_status_capabilities() {
-  [[ "$OS" == "linux" ]] || return 0
-  if ! command -v setcap >/dev/null 2>&1; then
-    warn "setcap not found; install libcap2-bin to allow non-root 'kekkai status'"
+    warn "sudoers syntax check failed; removed $sudoers_file"
+    warn "you will be prompted for a password each time you run: sudo kekkai"
     return 0
   fi
-
-  # Some kernels still gate BPF object read behind CAP_SYS_ADMIN.
-  local caps="cap_bpf,cap_perfmon,cap_sys_admin+ep"
-  if $SUDO setcap "$caps" "$CLI_BIN"; then
-    log "granted $caps on $CLI_BIN (non-root status support)"
-  else
-    warn "setcap failed for $CLI_BIN; 'kekkai status' may still require sudo"
-  fi
-}
-
-probe_status_permissions() {
-  [[ "$OS" == "linux" ]] || return 0
-  local ok=1
-
-  if [[ ! -e "$BPFFS_DIR" ]]; then
-    warn "status permission probe: $BPFFS_DIR missing (agent may not have pinned maps yet)"
-    return 0
-  fi
-  if [[ ! -d "$BPFFS_DIR" ]]; then
-    warn "status permission probe: cannot access $BPFFS_DIR (permission denied?)"
-    return 0
-  fi
-  if [[ ! -r "$BPFFS_DIR" || ! -x "$BPFFS_DIR" ]]; then
-    warn "status permission probe: $BPFFS_DIR is not traversable by current user"
-    ok=0
-  fi
-
-  if [[ -e "$BPFFS_DIR/stats" ]]; then
-    if [[ ! -r "$BPFFS_DIR/stats" ]]; then
-      warn "status permission probe: $BPFFS_DIR/stats is not readable"
-      ok=0
-    fi
-  else
-    warn "status permission probe: $BPFFS_DIR/stats missing"
-    ok=0
-  fi
-
-  if command -v getcap >/dev/null 2>&1; then
-    local caps
-    caps="$(getcap "$CLI_BIN" 2>/dev/null || true)"
-    if [[ "$caps" == *cap_bpf* && "$caps" == *cap_perfmon* && "$caps" == *cap_sys_admin* ]]; then
-      info "status permission probe: CLI capabilities ok"
-    else
-      warn "status permission probe: $CLI_BIN missing required capabilities (need cap_bpf,cap_perfmon,cap_sys_admin+ep)"
-      ok=0
-    fi
-  else
-    warn "status permission probe: getcap not found (cannot verify CLI capabilities)"
-  fi
-
-  if [[ $ok -eq 1 ]]; then
-    log "status permission probe passed"
-  else
-    warn "status permission probe warns: non-root 'kekkai status' may still fail"
-  fi
+  info "sudo kekkai will no longer prompt for a password"
 }
 
 install_config() {
@@ -689,7 +590,6 @@ enable_and_start() {
     $SUDO journalctl -u "$UNIT_NAME" -n 20 --no-pager >&2 || true
     die "service failed to come up"
   fi
-  probe_status_permissions
 }
 
 # ---------------------------------------------------------------------------
@@ -930,8 +830,6 @@ release_update() {
   old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
   new_sha="$(sha256sum "$new_agent" | awk '{print $1}')"
   if [[ "$old_sha" == "$new_sha" ]]; then
-    setup_status_capabilities
-    probe_status_permissions
     log "up-to-date (binary unchanged — nothing to restart)"
     print_version_transition "$old_ver" "$new_ver"
     rm -rf "$tmpdir"
@@ -940,7 +838,7 @@ release_update() {
 
   install_binaries_from "$new_agent" "$new_cli"
   rm -rf "$tmpdir"
-  setup_sudo_shortcut
+  setup_passwordless_sudo
   enable_and_start
   log "update complete (channel=$channel, tag=$tag)"
   print_version_transition "$old_ver" "$new_ver"
@@ -1030,7 +928,7 @@ do_install() {
   check_kernel
   prepare_binaries
   install_binaries
-  setup_sudo_shortcut
+  setup_passwordless_sudo
   install_config
   install_systemd_unit
   enable_and_start
@@ -1060,14 +958,12 @@ do_update() {
       old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
       new_sha="$(sha256sum "$ROOT/bin/kekkai-agent" | awk '{print $1}')"
       if [[ "$old_sha" == "$new_sha" ]]; then
-        setup_status_capabilities
-        probe_status_permissions
         log "up-to-date (binary unchanged — nothing to restart)"
         print_version_transition "$old_ver" "$new_ver"
         return 0
       fi
       install_binaries
-      setup_sudo_shortcut
+      setup_passwordless_sudo
       enable_and_start
       log "update complete (channel=git:main)"
       print_version_transition "$old_ver" "$new_ver"
@@ -1086,7 +982,7 @@ do_repair() {
   step "repair · $OS/$ARCH"
   prepare_binaries
   install_binaries
-  setup_sudo_shortcut
+  setup_passwordless_sudo
   [[ -f "$CONFIG_FILE" ]] || install_config
   install_systemd_unit
   enable_and_start
@@ -1127,12 +1023,12 @@ do_uninstall() {
 
 post_install_hints() {
   echo
-  info "next steps:"
+  info "next steps (always run kekkai with sudo):"
   printf '  %s1.%s edit config:      sudo nano %s\n' "$C_BOLD" "$C_RESET" "$CONFIG_FILE"
-  printf '  %s2.%s validate:         kekkai check\n' "$C_BOLD" "$C_RESET"
+  printf '  %s2.%s validate:         sudo kekkai check\n' "$C_BOLD" "$C_RESET"
   printf '  %s3.%s restart:          sudo systemctl restart kekkai-agent\n' "$C_BOLD" "$C_RESET"
-  printf '  %s4.%s watch live:       kekkai status\n' "$C_BOLD" "$C_RESET"
-  printf '  %s5.%s diagnose:         kekkai doctor\n' "$C_BOLD" "$C_RESET"
+  printf '  %s4.%s watch live:       sudo kekkai status\n' "$C_BOLD" "$C_RESET"
+  printf '  %s5.%s diagnose:         sudo kekkai doctor\n' "$C_BOLD" "$C_RESET"
   echo
 
   if [[ $DO_RUN -eq 1 ]]; then

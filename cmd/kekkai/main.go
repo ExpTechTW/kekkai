@@ -589,26 +589,29 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `kekkai — operator CLI for the kekkai edge firewall
 
 Usage:
-  kekkai <command> [args]
+  sudo kekkai <command> [args]
+
+Always run kekkai with sudo. On Debian/Ubuntu/Pi OS the kernel sysctl
+kernel.unprivileged_bpf_disabled blocks non-root bpf() regardless of caps,
+so the CLI needs root to open pinned eBPF maps.
 
 Commands:
-  status [config]            launch the live TUI (default: /etc/kekkai/kekkai.yaml)
-  config [config]            open config in nano, then auto-reload kekkai-agent
-  check  [config]            validate a config file (read-only; safe as non-root)
+  status [config]            launch the live TUI
+  config [config]            open config in nano, then auto-reload
+  check  [config]            validate a config file (read-only)
   ports  [config]            show colorized public/private port summary
   show   [config]            print the normalised config after migration
-  backup [config]            write a timestamped manual backup of the config file
-  reload [config]            validate config, then systemctl reload kekkai-agent
-  bypass on|off [--save]     toggle emergency bypass (default temporary; --save persists)
+  backup [config]            write a timestamped manual backup
+  reload [config]            validate config, then systemctl reload
+  bypass on|off [--save]     toggle emergency bypass
   update [kekkai.sh flags]   run installer update flow (delegates to kekkai.sh update)
   reset  [config] [--iface]  overwrite config with a fresh default template
-                             (existing file is backed up first; auto-detects iface)
+                             (existing file is backed up first)
   doctor                     run read-only health checks and print a report
   version                    show version information
   help                       show this message
 
-Run reset via sudo when the config lives under /etc/kekkai.
-Run doctor to diagnose common installation/runtime problems.
+Run "sudo kekkai doctor" to diagnose common installation/runtime problems.
 
 See COMMAND_ZH.md for the full operator handbook (in Chinese).`)
 }

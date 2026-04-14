@@ -69,10 +69,10 @@ uninstall:
 CFG ?= /etc/kekkai/kekkai.yaml
 
 config-check:
-	@/usr/local/bin/kekkai check $(CFG)
+	@sudo /usr/local/bin/kekkai check $(CFG)
 
 config-backup:
 	@sudo /usr/local/bin/kekkai backup $(CFG)
 
 config-show:
-	@/usr/local/bin/kekkai show $(CFG)
+	@sudo /usr/local/bin/kekkai show $(CFG)

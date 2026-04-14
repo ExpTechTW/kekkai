@@ -455,21 +455,25 @@ func sysfsTxPath(iface, metric string) string {
 func checkPermissions(r *Runner) {
 	sec := r.Section("permissions")
 
+	// kekkai CLI is designed to run as root (`sudo kekkai ...`). On
+	// Debian/Ubuntu/Pi OS `kernel.unprivileged_bpf_disabled` blocks non-root
+	// bpf() syscalls regardless of file caps — so running doctor as non-root
+	// gives a false negative on the pinned map checks below.
 	euid := os.Geteuid()
 	if euid == 0 {
 		sec.Add(Result{
-			Status: StatusWarn,
+			Status: StatusOK,
 			Title:  "effective uid",
-			Detail: "0 (root) — non-root status permission check is less representative",
-			Suggestions: []string{
-				"run doctor as non-root once: /usr/local/bin/kekkai doctor",
-			},
+			Detail: "0 (root) — recommended",
 		})
 	} else {
 		sec.Add(Result{
-			Status: StatusOK,
+			Status: StatusWarn,
 			Title:  "effective uid",
-			Detail: fmt.Sprintf("%d (non-root)", euid),
+			Detail: fmt.Sprintf("%d (non-root) — kekkai expects sudo", euid),
+			Suggestions: []string{
+				"rerun as: sudo kekkai doctor",
+			},
 		})
 	}
 
@@ -480,25 +484,13 @@ func checkPermissions(r *Runner) {
 		sec.Add(Result{Status: StatusWarn, Title: "/sys/fs/bpf", Detail: err.Error()})
 	}
 
-	// Try pin-root traversal/read checks.
-	if st, err := os.Stat(bpffsPinRoot); err == nil {
-		mode := st.Mode().Perm()
-		if mode&0o005 == 0 || mode&0o004 == 0 {
-			sec.Add(Result{
-				Status: StatusWarn,
-				Title:  "pin root mode",
-				Detail: fmt.Sprintf("%s mode=%#o (non-root traversal/read may fail)", bpffsPinRoot, mode),
-				Suggestions: []string{
-					"sudo chmod 0755 /sys/fs/bpf/kekkai",
-				},
-			})
-		} else {
-			sec.Add(Result{
-				Status: StatusOK,
-				Title:  "pin root mode",
-				Detail: fmt.Sprintf("%s mode=%#o", bpffsPinRoot, mode),
-			})
-		}
+	// Pin-root presence (mode doesn't matter for sudo-only workflow).
+	if _, err := os.Stat(bpffsPinRoot); err == nil {
+		sec.Add(Result{
+			Status: StatusOK,
+			Title:  "pin root",
+			Detail: bpffsPinRoot + " present",
+		})
 	} else {
 		sec.Add(Result{
 			Status: StatusWarn,
@@ -507,32 +499,33 @@ func checkPermissions(r *Runner) {
 		})
 	}
 
-	// Check CLI file capabilities needed by non-root `kekkai status`.
-	if _, err := exec.LookPath("getcap"); err != nil {
-		sec.Add(Result{
-			Status: StatusWarn,
-			Title:  "kekkai CLI capabilities",
-			Detail: "getcap not found (install libcap2-bin)",
-		})
-	}
-	capsOut, _ := exec.Command("getcap", cliBinaryPath).CombinedOutput()
-	caps := strings.TrimSpace(string(capsOut))
-	if strings.Contains(caps, "cap_bpf") &&
-		strings.Contains(caps, "cap_perfmon") &&
-		strings.Contains(caps, "cap_sys_admin") {
+	// unprivileged_bpf_disabled sysctl — informational only. The expected
+	// workflow is sudo, so any value is fine; we just surface it so the
+	// operator knows why non-root would fail.
+	if data, err := os.ReadFile("/proc/sys/kernel/unprivileged_bpf_disabled"); err == nil {
+		val := strings.TrimSpace(string(data))
 		sec.Add(Result{
 			Status: StatusOK,
-			Title:  "kekkai CLI capabilities",
-			Detail: caps,
+			Title:  "unprivileged_bpf_disabled",
+			Detail: fmt.Sprintf("%s (kekkai runs with sudo, so any value is fine)", val),
+		})
+	}
+
+	// Passwordless sudo wiring — purely informational. Presence of the
+	// kekkai sudoers drop-in means `sudo kekkai ...` won't prompt.
+	if entries, err := filepath.Glob("/etc/sudoers.d/kekkai-cli-*"); err == nil && len(entries) > 0 {
+		sec.Add(Result{
+			Status: StatusOK,
+			Title:  "sudo NOPASSWD",
+			Detail: fmt.Sprintf("configured (%s)", filepath.Base(entries[0])),
 		})
 	} else {
 		sec.Add(Result{
 			Status: StatusWarn,
-			Title:  "kekkai CLI capabilities",
-			Detail: iff(caps == "", "no file capabilities set", caps),
+			Title:  "sudo NOPASSWD",
+			Detail: "no kekkai sudoers drop-in — sudo will prompt for password",
 			Suggestions: []string{
-				"sudo apt-get install -y libcap2-bin",
-				"sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep /usr/local/bin/kekkai",
+				"re-run installer to add it: bash ./kekkai.sh repair",
 			},
 		})
 	}
@@ -554,8 +547,8 @@ func checkPermissions(r *Runner) {
 			Title:  "pinned stats map open",
 			Detail: err.Error(),
 			Suggestions: []string{
-				"if this is permission denied: fix bpffs mode + setcap on /usr/local/bin/kekkai",
-				"quick workaround: sudo kekkai status",
+				"run kekkai with sudo: sudo kekkai status",
+				"if sudo also fails, check that kekkai-agent is running: sudo systemctl status kekkai-agent",
 			},
 		})
 		return
