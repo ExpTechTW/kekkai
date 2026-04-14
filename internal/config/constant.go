@@ -1,9 +1,7 @@
 package config
 
 // CurrentVersion is the schema version this build writes and expects.
-// Not yet bumped — the project has not shipped a breaking schema change.
-// The field is reserved so older agents can refuse to load future formats
-// and future agents know when to run migration.
+// v2 is backward-compatible with v1 via migrateIfNeeded().
 const CurrentVersion = 2
 
 const (

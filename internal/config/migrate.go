@@ -10,29 +10,35 @@ import (
 )
 
 // migrateIfNeeded parses an on-disk config and converts it to the current
-// schema if it carries an older version. Since the project hasn't shipped
-// a real schema break yet, there is nothing to migrate — every document
-// must declare `version: 1` (or omit version, which is treated as 1) and
-// is parsed as-is.
+// schema if it carries an older version.
 //
-// When a real v1→v2 migration lands later, this is the place to:
-//  1. Parse the old document with a historic struct.
-//  2. Build a Values from it (see template.go).
-//  3. Return Render(values) as the migrated YAML (comments preserved).
-//  4. Have the caller write that to disk + backup the original.
+// v1 -> v2 currently has no field-level semantic break; we only bump the
+// version marker so newer binaries can persist canonical config with new
+// commented/defaulted keys.
 func migrateIfNeeded(data []byte, fromVersion int) (*Config, bool, error) {
-	switch fromVersion {
-	case 0, CurrentVersion:
+	if fromVersion == 0 || fromVersion == CurrentVersion {
 		cfg, err := parseCurrent(data)
 		if err != nil {
 			return nil, false, err
 		}
 		return cfg, false, nil
-	default:
-		return nil, false, fmt.Errorf(
-			"unsupported config version: %d (this build supports v%d)",
-			fromVersion, CurrentVersion)
 	}
+
+	if fromVersion > 0 && fromVersion < CurrentVersion {
+		// Backward-compatible migration path: parse with current struct, then
+		// bump the version marker so Load() can back up + rewrite canonical
+		// config in the current schema shape.
+		cfg, err := parseCurrent(data)
+		if err != nil {
+			return nil, false, err
+		}
+		cfg.Version = CurrentVersion
+		return cfg, true, nil
+	}
+
+	return nil, false, fmt.Errorf(
+		"unsupported config version: %d (this build supports v%d)",
+		fromVersion, CurrentVersion)
 }
 
 // parseCurrent decodes a current-schema document using strict field
