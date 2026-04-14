@@ -72,8 +72,8 @@ GitHub Releases 會提供各平台檔案（`kekkai-*` 與 `kekkai-agent-*`）：
 
 版本字串規則：
 
-- git 模式（本地/repo build）：`YYYY.MM.DD+<shortSHA>`
 - release / pre-release CI build：`YYYY.MM.DD+build.<N>`
+- 本地開發 build（`make build`）：預設為 `dev-<shortSHA>`，僅供 repo 開發者本機驗證使用
 
 ## 過濾模型（Ingress）
 
@@ -81,13 +81,18 @@ GitHub Releases 會提供各平台檔案（`kekkai-*` 與 `kekkai-agent-*`）：
 
 1. ARP（可配置）放行；其他非 IPv4 丟棄
 2. IPv4 後續分片放行（無 L4 header 可檢查）
-3. conntrack hit 直接放行（stateful fast path）
-4. 回程 fallback 放行（TCP ACK/RST/FIN、UDP ephemeral、ICMP 可配置）
+3. conntrack hit 直接放行（stateful fast path — TCP/UDP 都靠 egress seed 建立的 flow entry）
+4. 回程 fallback 放行：
+   - ICMP（可配置）
+   - TCP：ACK / RST / FIN（classic "tcp-established" 判斷，SYN-only 新連線會掉到 port 規則）
+   - UDP：只放行 dst port 68（DHCP client reply，避免 lease 續約 flap 介面 IP）
 5. static blocklist 命中丟棄
 6. dynamic blocklist 命中丟棄
 7. `filter.public.*` 放行
 8. `filter.private.*` 只有 `ingress_allowlist` 可放行
 9. 其餘 default deny
+
+> UDP 沒有 ephemeral port fallback — 本機主動發出去的 UDP session（DNS / NTP 等）回包完全依賴 egress seed 寫入 flowtrack，由 stateful fast path 接手。這個設計避免「dport >= 32768 就放行」的語義被 attacker 當成 UDP amplification 的入口。
 
 ## 設定檔隔離（雙檔案）
 
@@ -126,14 +131,22 @@ deploy/systemd/
   kekkai-agent.service
 ```
 
-## 建置需求
+## 執行需求（目標機）
 
 - Linux kernel 5.15+
+- `cap_bpf` + `cap_net_admin` + `cap_perfmon`（systemd unit 會設好）
+- 網卡支援 generic/driver/offload XDP 其中之一
+
+> BTF 非必要（目前不依賴 CO-RE）。目標機**不需要** Go / clang / libbpf-dev — 所有 binary 走 GitHub Releases 預編，安裝器會處理。
+
+## 開發需求（repo 開發者）
+
+僅在需要本機建置 / 測試時才需要：
+
+- Linux kernel 5.15+（for `make bpf`）
 - clang/llvm 14+
 - Go 1.22+
 - `libbpf-dev`
-
-> BTF 非必要（目前不依賴 CO-RE）。
 
 ## 不在此 repo 的範圍
 
