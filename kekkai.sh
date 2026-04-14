@@ -499,7 +499,7 @@ print_update_result() {
       "$C_DIM" "$old_v" "$C_RESET" \
       "$C_BOLD" "$new_v" "$C_RESET"
   fi
-  if [[ "$state" == "updated" && -n "$changed" ]]; then
+  if [[ -n "$changed" ]]; then
     printf '  %schanged%s    %s\n' "$C_DIM" "$C_RESET" "$changed"
   fi
   if [[ -n "$tag" ]]; then
@@ -554,6 +554,22 @@ install_config() {
   # We delegate the template to `kekkai-agent -reset` so shell and Go stay
   # in sync on one source of truth for the default config.
   $SUDO "$AGENT_BIN" -reset -config "$CONFIG_FILE" -iface "$iface" >/dev/null
+
+  # Persist KEKKAI_UPDATE_CHANNEL into the fresh config so future
+  # `kekkai update` runs (without the env var) don't flip back to the
+  # default `release` channel. Only apply when the env var is explicitly
+  # set AND it's a supported value — otherwise leave whatever the
+  # template generated.
+  local desired_channel="${KEKKAI_UPDATE_CHANNEL:-}"
+  case "$desired_channel" in
+    release|pre-release)
+      if grep -qE '^[[:space:]]+channel:' "$CONFIG_FILE" 2>/dev/null; then
+        $SUDO sed -i -E "s|^([[:space:]]+channel:[[:space:]]*).*$|\1$desired_channel|" "$CONFIG_FILE"
+        log "update.channel set to $desired_channel (from KEKKAI_UPDATE_CHANNEL)"
+      fi
+      ;;
+  esac
+
   if ! iface_has_default_allowlist_ip "$iface"; then
     warn "detected iface '$iface' is not in default ingress_allowlist 192.168.0.0/16"
     warn "service may reject startup until you set filter.ingress_allowlist to your management subnet"
@@ -832,6 +848,26 @@ files_match() {
 agent_unchanged() { files_match "$AGENT_BIN" "$1"; }
 cli_unchanged()   { files_match "$CLI_BIN"   "$1"; }
 
+# version_is_newer: 0 (true) if $1 (candidate) is strictly newer than $2
+# (installed), using natural version sort. Used to refuse downgrades —
+# if somebody runs `kekkai update` while on pre-release build.9, the
+# release channel's build.4 must NOT replace it.
+#
+# Special values:
+#   - "unknown" / "(none)" for the installed version → always accept
+#     (treat as "we don't know what's on disk, trust the candidate")
+#   - "unknown" / "(none)" for the candidate         → always refuse
+#     (can't prove it's newer)
+version_is_newer() {
+  local candidate="$1" installed="$2"
+  [[ "$candidate" == "unknown" || "$candidate" == "(none)" || -z "$candidate" ]] && return 1
+  [[ "$installed" == "unknown" || "$installed" == "(none)" || -z "$installed" ]] && return 0
+  [[ "$candidate" == "$installed" ]] && return 1
+  local top
+  top="$(printf '%s\n%s\n' "$candidate" "$installed" | sort -V | tail -n1)"
+  [[ "$top" == "$candidate" ]]
+}
+
 # sync_script_from_remote: fetch the latest kekkai.sh from $RAW_BASE and
 # compare with the currently installed /usr/local/bin/kekkai.sh.
 #
@@ -876,28 +912,43 @@ release_update() {
 
   validate_config_against_new_binary "$REL_NEW_AGENT"
 
-  # Three-way diff: agent binary, CLI binary, and kekkai.sh itself.
-  # Any single one changing counts as "updated". kekkai.sh can ship
-  # fixes independent of a binary release, so we can't gate on agent alone.
+  # Downgrade guard: `kekkai update` must NEVER replace a newer binary with
+  # an older one. Common footgun: user installs pre-release (build.9), then
+  # forgets to set update.channel=pre-release in config, so the next update
+  # resolves to channel=release (build.4) and rolls them back. We refuse
+  # by pretending the binaries didn't change — kekkai.sh sync still runs
+  # (script fixes can legitimately ship between releases).
   local -a changed_parts=()
   local need_restart=0
+  local downgrade_refused=0
 
-  if ! agent_unchanged "$REL_NEW_AGENT"; then
-    changed_parts+=("agent")
-    need_restart=1
-  fi
-  if ! cli_unchanged "$REL_NEW_CLI"; then
-    changed_parts+=("cli")
+  if [[ "$new_ver" != "$old_ver" ]] && ! version_is_newer "$new_ver" "$old_ver"; then
+    downgrade_refused=1
+    warn "refusing to downgrade: $channel channel offers $new_ver but installed is $old_ver"
+    warn "to switch channels, set update.channel in $CONFIG_FILE or export KEKKAI_UPDATE_CHANNEL"
   fi
 
-  if (( need_restart )); then
-    install_binaries_from "$REL_NEW_AGENT" "$REL_NEW_CLI"
-  elif (( ${#changed_parts[@]} > 0 )); then
-    # CLI changed but agent didn't — still need to install the new CLI,
-    # just no service restart.
-    $SUDO install -D -m 0755 "$REL_NEW_CLI" "$CLI_BIN"
-    log "installed: $CLI_BIN"
-    install_completions
+  if (( downgrade_refused == 0 )); then
+    # Three-way diff: agent binary, CLI binary, and kekkai.sh itself.
+    # Any single one changing counts as "updated". kekkai.sh can ship
+    # fixes independent of a binary release, so we can't gate on agent alone.
+    if ! agent_unchanged "$REL_NEW_AGENT"; then
+      changed_parts+=("agent")
+      need_restart=1
+    fi
+    if ! cli_unchanged "$REL_NEW_CLI"; then
+      changed_parts+=("cli")
+    fi
+
+    if (( need_restart )); then
+      install_binaries_from "$REL_NEW_AGENT" "$REL_NEW_CLI"
+    elif (( ${#changed_parts[@]} > 0 )); then
+      # CLI changed but agent didn't — still need to install the new CLI,
+      # just no service restart.
+      $SUDO install -D -m 0755 "$REL_NEW_CLI" "$CLI_BIN"
+      log "installed: $CLI_BIN"
+      install_completions
+    fi
   fi
   rm -rf "$tmpdir"
 
@@ -922,7 +973,18 @@ release_update() {
     enable_and_start
   fi
 
-  if (( ${#changed_parts[@]} == 0 )); then
+  # When a downgrade was refused, kekkai.sh may still have changed (script
+  # sync is orthogonal). Report based on what actually landed — but never
+  # show the `updated` version arrow pointing backwards, because `old_ver`
+  # is still the real installed version.
+  if (( downgrade_refused )); then
+    local changed_str=""
+    if (( ${#changed_parts[@]} > 0 )); then
+      changed_str="${changed_parts[*]}"
+      changed_str="${changed_str// /, } (downgrade refused: $channel offered $new_ver)"
+    fi
+    print_update_result unchanged "$old_ver" "$old_ver" "$REL_TAG" "$channel" "$changed_str"
+  elif (( ${#changed_parts[@]} == 0 )); then
     print_update_result unchanged "$old_ver" "$new_ver" "$REL_TAG" "$channel" ""
   else
     local changed_str="${changed_parts[*]}"
