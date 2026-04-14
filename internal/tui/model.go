@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -347,6 +348,14 @@ func normalizeSemver(v string) (string, bool) {
 	if i := strings.IndexAny(core, "-+"); i >= 0 {
 		core = core[:i]
 	}
+
+	// Backward compatibility:
+	// older builds used YYYYMMDD(+meta), e.g. 20260414+b8.
+	// Convert to loose semver-like core: YYYY.MM.DD so update checks still work.
+	if isEightDigits(core) {
+		return fmt.Sprintf("%s.%s.%s", core[:4], core[4:6], core[6:8]), true
+	}
+
 	parts := strings.Split(core, ".")
 	if len(parts) != 3 {
 		return "", false
@@ -360,6 +369,12 @@ func normalizeSemver(v string) (string, bool) {
 		}
 	}
 	return core, true
+}
+
+var eightDigitsRe = regexp.MustCompile(`^\d{8}$`)
+
+func isEightDigits(s string) bool {
+	return eightDigitsRe.MatchString(s)
 }
 
 func compareSemver(a, b string) int {

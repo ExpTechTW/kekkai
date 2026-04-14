@@ -26,7 +26,7 @@ import (
 )
 
 // version is injected at build time via -ldflags:
-//   -X main.version=YYYYMMDD+bN
+//   -X main.version=YYYY.MM.DD+build.N
 // Keep default empty so linker override works reliably.
 var version string
 
