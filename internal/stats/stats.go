@@ -57,6 +57,8 @@ const (
 	SlotPassPublicUDP  = 24
 	SlotPassPrivateTCP = 25
 	SlotPassPrivateUDP = 26
+	SlotPassStatefulTCP = 27
+	SlotPassStatefulUDP = 28
 
 	SlotCount = 48
 )
@@ -73,6 +75,7 @@ type Global struct {
 
 	PassFragment, PassReturnTCP, PassReturnUDP, PassReturnICMP uint64
 	PassPublicTCP, PassPublicUDP, PassPrivateTCP, PassPrivateUDP uint64
+	PassStatefulTCP, PassStatefulUDP uint64
 }
 
 // perIPStat mirrors `struct perip_stat` in the eBPF program. Size: 48 bytes.
@@ -353,6 +356,10 @@ func (r *Reader) readGlobal() (Global, error) {
 			g.PassPrivateTCP = sum
 		case SlotPassPrivateUDP:
 			g.PassPrivateUDP = sum
+		case SlotPassStatefulTCP:
+			g.PassStatefulTCP = sum
+		case SlotPassStatefulUDP:
+			g.PassStatefulUDP = sum
 		}
 	}
 	return g, nil
@@ -554,6 +561,8 @@ func (r *Reader) writeFile(v snapshotView) {
 	fmt.Fprintf(b, "  no policy       : %15s\n\n", fmtU(g.DropNoPolicy))
 
 	fmt.Fprintf(b, "passes by reason (since start)\n")
+	fmt.Fprintf(b, "  stateful tcp hit: %15s\n", fmtU(g.PassStatefulTCP))
+	fmt.Fprintf(b, "  stateful udp hit: %15s\n", fmtU(g.PassStatefulUDP))
 	fmt.Fprintf(b, "  return tcp (ACK): %15s\n", fmtU(g.PassReturnTCP))
 	fmt.Fprintf(b, "  return udp (eph): %15s\n", fmtU(g.PassReturnUDP))
 	fmt.Fprintf(b, "  return icmp     : %15s\n", fmtU(g.PassReturnICMP))

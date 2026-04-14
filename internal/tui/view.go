@@ -310,6 +310,7 @@ func (m *Model) viewOverview() string {
 		labelStyle.Render("tcp") + valueStyle.Render(fmtNum(s.PpsTCP)+" pps"),
 		labelStyle.Render("udp") + valueStyle.Render(fmtNum(s.PpsUDP)+" pps"),
 		labelStyle.Render("icmp") + valueStyle.Render(fmtNum(s.PpsICMP)+" pps"),
+		labelStyle.Render("stateful hit") + valueStyle.Render(fmtNum(s.PpsStatefulTCP+s.PpsStatefulUDP)+" pps"),
 		"",
 		dimStyle.Render(fmt.Sprintf("total: tcp=%s  udp=%s",
 			fmtU(g.PktsTCP), fmtU(g.PktsUDP))),
@@ -372,6 +373,9 @@ func (m *Model) viewDetail() string {
 
 	passesBox := boxStyle.BorderForeground(cPass).Render(strings.Join([]string{
 		titleStyle.Render("▲ Passes by reason"),
+		labelStyle.Render("stateful tcp hit") + passStyle.Render(fmtU(g.PassStatefulTCP)),
+		labelStyle.Render("stateful udp hit") + passStyle.Render(fmtU(g.PassStatefulUDP)),
+		labelStyle.Render("stateful hit pps") + passStyle.Render(fmtNum(s.PpsStatefulTCP+s.PpsStatefulUDP)),
 		labelStyle.Render("return tcp (ACK)") + passStyle.Render(fmtU(g.PassReturnTCP)),
 		labelStyle.Render("return udp (eph)") + passStyle.Render(fmtU(g.PassReturnUDP)),
 		labelStyle.Render("return icmp") + passStyle.Render(fmtU(g.PassReturnICMP)),
@@ -427,6 +431,8 @@ func (m *Model) viewCharts() string {
 		renderSeriesLine("tcp pps   ", m.tcpHist, w, cPass, s.PpsTCP),
 		renderSeriesLine("udp pps   ", m.udpHist, w, cWarn, s.PpsUDP),
 		renderSeriesLine("icmp pps  ", m.icmpHist, w, cMagenta, s.PpsICMP),
+		renderSeriesLine("stcp hit  ", m.statefulTCPHist, w, cBarrier2, s.PpsStatefulTCP),
+		renderSeriesLine("sudp hit  ", m.statefulUDPHist, w, cBarrier, s.PpsStatefulUDP),
 		dimStyle.Render("adaptive scale per line"),
 	}, "\n"))
 

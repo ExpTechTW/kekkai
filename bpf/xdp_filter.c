@@ -77,6 +77,8 @@ enum {
     STAT_PASS_PUBLIC_UDP   = 24,
     STAT_PASS_PRIVATE_TCP  = 25,
     STAT_PASS_PRIVATE_UDP  = 26,
+    STAT_PASS_STATEFUL_TCP = 27,
+    STAT_PASS_STATEFUL_UDP = 28,
 
     STAT_SLOTS             = 48,
 };
@@ -469,10 +471,13 @@ int kekkai_xdp(struct xdp_md *ctx) {
             .proto = proto,
         };
         if (flow_lookup_alive(&fkey, now_ns)) {
-            if (proto == IPPROTO_TCP)
+            if (proto == IPPROTO_TCP) {
+                stat_add(STAT_PASS_STATEFUL_TCP, 1);
                 stat_add(STAT_PASS_RETURN_TCP, 1);
-            else
+            } else {
+                stat_add(STAT_PASS_STATEFUL_UDP, 1);
                 stat_add(STAT_PASS_RETURN_UDP, 1);
+            }
             stat_add(STAT_PKTS_PASSED, 1);
             perip_touch(saddr, pkt_len, proto, 0);
             return XDP_PASS;

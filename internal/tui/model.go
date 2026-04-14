@@ -38,6 +38,8 @@ type Model struct {
 	tcpHist       []float64
 	udpHist       []float64
 	icmpHist      []float64
+	statefulTCPHist []float64
+	statefulUDPHist []float64
 
 	// startup metadata
 	startedAt time.Time
@@ -62,6 +64,8 @@ func NewModel(src *Source, nodeID, iface, xdpMode string) *Model {
 		tcpHist:   make([]float64, 0, 120),
 		udpHist:   make([]float64, 0, 120),
 		icmpHist:  make([]float64, 0, 120),
+		statefulTCPHist: make([]float64, 0, 120),
+		statefulUDPHist: make([]float64, 0, 120),
 	}
 }
 
@@ -188,6 +192,8 @@ func (m *Model) pushHistory(s Snapshot) {
 	m.tcpHist = pushSeries(m.tcpHist, s.PpsTCP, 120)
 	m.udpHist = pushSeries(m.udpHist, s.PpsUDP, 120)
 	m.icmpHist = pushSeries(m.icmpHist, s.PpsICMP, 120)
+	m.statefulTCPHist = pushSeries(m.statefulTCPHist, s.PpsStatefulTCP, 120)
+	m.statefulUDPHist = pushSeries(m.statefulUDPHist, s.PpsStatefulUDP, 120)
 }
 
 func pushSeries(series []float64, v float64, max int) []float64 {

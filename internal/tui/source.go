@@ -59,6 +59,7 @@ type Snapshot struct {
 	PPS, DPS                 float64
 	BpsTotal, BpsDropped     float64
 	PpsTCP, PpsUDP, PpsICMP  float64
+	PpsStatefulTCP, PpsStatefulUDP float64
 	TxBps, TxPps             float64
 
 	// Current tx counters (sysfs).
@@ -139,6 +140,8 @@ func (s *Source) Read(prev *Snapshot) (Snapshot, error) {
 			snap.PpsTCP = float64(global.PktsTCP-prev.Global.PktsTCP) / dt
 			snap.PpsUDP = float64(global.PktsUDP-prev.Global.PktsUDP) / dt
 			snap.PpsICMP = float64(global.PktsICMP-prev.Global.PktsICMP) / dt
+			snap.PpsStatefulTCP = float64(global.PassStatefulTCP-prev.Global.PassStatefulTCP) / dt
+			snap.PpsStatefulUDP = float64(global.PassStatefulUDP-prev.Global.PassStatefulUDP) / dt
 			snap.TxBps = float64(txBytes-prev.TxBytes) * 8 / dt
 			snap.TxPps = float64(txPkts-prev.TxPkts) / dt
 		}
@@ -261,6 +264,10 @@ func assignSlot(g *stats.Global, slot uint32, sum uint64) {
 		g.PassPrivateTCP = sum
 	case stats.SlotPassPrivateUDP:
 		g.PassPrivateUDP = sum
+	case stats.SlotPassStatefulTCP:
+		g.PassStatefulTCP = sum
+	case stats.SlotPassStatefulUDP:
+		g.PassStatefulUDP = sum
 	}
 }
 
