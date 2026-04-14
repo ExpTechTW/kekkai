@@ -81,6 +81,8 @@ AGENT_BIN=/usr/local/bin/kekkai-agent
 CLI_BIN=/usr/local/bin/kekkai
 ROLLBACK_BIN=/usr/local/bin/kekkai-agent.prev
 SCRIPT_INSTALL_PATH=/usr/local/bin/kekkai.sh
+BASH_COMPLETION_DST=/usr/share/bash-completion/completions/kekkai
+ZSH_COMPLETION_DST=/usr/share/zsh/vendor-completions/_kekkai
 CONFIG_DIR=/etc/kekkai
 CONFIG_FILE="$CONFIG_DIR/kekkai.yaml"
 STATS_DIR=/var/run/kekkai
@@ -134,9 +136,10 @@ if [[ -t 1 ]] && [[ "${NO_COLOR:-}" == "" ]]; then
   C_WARN=$'\033[1;33m'  # yellow
   C_ERR=$'\033[1;31m'   # red
   C_INFO=$'\033[1;36m'  # cyan
+  C_BLUE=$'\033[1;34m'  # blue — "something changed" accent for update results
   C_TITLE=$'\033[1;35m' # violet — kekkai barrier theme
 else
-  C_RESET=""; C_DIM=""; C_BOLD=""; C_OK=""; C_WARN=""; C_ERR=""; C_INFO=""; C_TITLE=""
+  C_RESET=""; C_DIM=""; C_BOLD=""; C_OK=""; C_WARN=""; C_ERR=""; C_INFO=""; C_BLUE=""; C_TITLE=""
 fi
 
 step() { printf '\n%s◈ %s%s\n' "$C_TITLE" "$*" "$C_RESET"; }
@@ -449,6 +452,7 @@ install_binaries_from() {
   log "installed: $CLI_BIN"
 
   persist_script_for_updates
+  install_completions
 }
 
 # persist_script_for_updates puts a copy of kekkai.sh at /usr/local/bin/kekkai.sh
@@ -469,7 +473,16 @@ persist_script_for_updates() {
     src="$0"
   fi
 
+  # Skip self-copy: if $0 is already the installed script (common during
+  # `sudo kekkai update`, where kekkai delegates to /usr/local/bin/kekkai.sh),
+  # `install` would error with "same file". Treat that case as already persisted.
   if [[ -n "$src" ]]; then
+    local src_real dst_real
+    src_real="$(readlink -f "$src" 2>/dev/null || echo "$src")"
+    dst_real="$(readlink -f "$SCRIPT_INSTALL_PATH" 2>/dev/null || echo "$SCRIPT_INSTALL_PATH")"
+    if [[ "$src_real" == "$dst_real" ]]; then
+      return 0
+    fi
     $SUDO install -D -m 0755 "$src" "$SCRIPT_INSTALL_PATH"
     log "installed: $SCRIPT_INSTALL_PATH (for future 'sudo kekkai update')"
     return 0
@@ -492,6 +505,55 @@ persist_script_for_updates() {
   warn "could not persist kekkai.sh to $SCRIPT_INSTALL_PATH — 'sudo kekkai update' will need KEKKAI_SCRIPT set"
 }
 
+# fetch_or_copy_asset: stage a repo-tracked file at $1 (relative to $ROOT)
+# into a temp path. Prefers the on-disk copy; falls back to curl from
+# $RAW_BASE/$BRANCH/$1. Echoes the staged path on success, empty on failure.
+fetch_or_copy_asset() {
+  local rel="$1"
+  local local_src="$ROOT/$rel"
+  if [[ -f "$local_src" ]] && [[ -s "$local_src" ]]; then
+    echo "$local_src"
+    return 0
+  fi
+  command -v curl >/dev/null 2>&1 || return 1
+  local tmp
+  tmp="$(mktemp)"
+  if curl -fsSL "$RAW_BASE/$BRANCH/$rel" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    echo "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# install_completions drops the bash + zsh completion scripts into the
+# distro's standard vendor paths. Silently skips targets whose parent
+# dir doesn't exist (e.g. systems without zsh installed). Non-fatal.
+install_completions() {
+  [[ "$OS" == "linux" ]] || return 0
+
+  local bash_src zsh_src
+  bash_src="$(fetch_or_copy_asset contrib/completions/kekkai.bash)" || bash_src=""
+  zsh_src="$(fetch_or_copy_asset contrib/completions/_kekkai)"      || zsh_src=""
+
+  if [[ -n "$bash_src" ]] && [[ -d "$(dirname "$BASH_COMPLETION_DST")" ]]; then
+    $SUDO install -D -m 0644 "$bash_src" "$BASH_COMPLETION_DST"
+    log "installed: $BASH_COMPLETION_DST"
+  fi
+  if [[ -n "$zsh_src" ]] && [[ -d "$(dirname "$ZSH_COMPLETION_DST")" ]]; then
+    $SUDO install -D -m 0644 "$zsh_src" "$ZSH_COMPLETION_DST"
+    log "installed: $ZSH_COMPLETION_DST"
+  fi
+
+  # Clean up any temp files fetch_or_copy_asset may have created.
+  [[ -n "$bash_src" && "$bash_src" != "$ROOT"* ]] && rm -f "$bash_src"
+  [[ -n "$zsh_src"  && "$zsh_src"  != "$ROOT"* ]] && rm -f "$zsh_src"
+
+  if [[ -z "$bash_src" ]] && [[ -z "$zsh_src" ]]; then
+    warn "shell completions not installed (no local or remote source)"
+  fi
+}
+
 install_binaries() {
   install_binaries_from "$LOCAL_AGENT_BIN" "$LOCAL_CLI_BIN"
 }
@@ -505,10 +567,55 @@ read_cli_version() {
   echo "$v"
 }
 
-print_version_transition() {
-  local old_v="$1"
-  local new_v="$2"
-  info "version: ${old_v} -> ${new_v}"
+
+# print_update_result renders the final coloured summary block that users
+# should scan first after an update. Two states:
+#
+#   state=updated    → blue accent, headline "UPDATED"
+#   state=unchanged  → green accent, headline "ALREADY UP-TO-DATE"
+#
+# Args: state old_ver new_ver tag channel
+# `tag` / `channel` may be empty (git:main path leaves them blank).
+print_update_result() {
+  local state="$1" old_v="$2" new_v="$3" tag="$4" channel="$5"
+  local accent headline
+  case "$state" in
+    updated)
+      accent="$C_BLUE"
+      headline="UPDATED"
+      ;;
+    unchanged)
+      accent="$C_OK"
+      headline="ALREADY UP-TO-DATE"
+      ;;
+    *)
+      accent="$C_INFO"
+      headline="$state"
+      ;;
+  esac
+
+  local bar="═══════════════════════════════════════════════"
+  echo
+  printf '%s%s%s\n' "$accent" "$bar" "$C_RESET"
+  printf '%s  ◈ %s%s\n' "$accent" "$headline" "$C_RESET"
+  printf '%s%s%s\n' "$accent" "$bar" "$C_RESET"
+  if [[ "$state" == "unchanged" ]]; then
+    printf '  %sversion%s    %s%s%s  (no change)\n' \
+      "$C_DIM" "$C_RESET" "$C_BOLD" "$new_v" "$C_RESET"
+  else
+    printf '  %sversion%s    %s%s%s  →  %s%s%s\n' \
+      "$C_DIM" "$C_RESET" \
+      "$C_DIM" "$old_v" "$C_RESET" \
+      "$C_BOLD" "$new_v" "$C_RESET"
+  fi
+  if [[ -n "$tag" ]]; then
+    printf '  %stag%s        %s\n' "$C_DIM" "$C_RESET" "$tag"
+  fi
+  if [[ -n "$channel" ]]; then
+    printf '  %schannel%s    %s\n' "$C_DIM" "$C_RESET" "$channel"
+  fi
+  printf '%s%s%s\n' "$accent" "$bar" "$C_RESET"
+  echo
 }
 
 setup_passwordless_sudo() {
@@ -903,9 +1010,8 @@ release_update() {
   validate_config_against_new_binary "$REL_NEW_AGENT"
 
   if agent_unchanged "$REL_NEW_AGENT"; then
-    log "up-to-date (binary unchanged — nothing to restart)"
-    print_version_transition "$old_ver" "$new_ver"
     rm -rf "$tmpdir"
+    print_update_result unchanged "$old_ver" "$new_ver" "$REL_TAG" "$channel"
     return 0
   fi
 
@@ -913,8 +1019,7 @@ release_update() {
   rm -rf "$tmpdir"
   setup_passwordless_sudo
   enable_and_start
-  log "update complete (channel=$channel, tag=$REL_TAG)"
-  print_version_transition "$old_ver" "$new_ver"
+  print_update_result updated "$old_ver" "$new_ver" "$REL_TAG" "$channel"
 }
 
 fetch_release_binaries_to_root_bin() {
@@ -1007,15 +1112,13 @@ do_update() {
       new_ver="$(read_cli_version "$LOCAL_CLI_BIN")"
 
       if agent_unchanged "$LOCAL_AGENT_BIN"; then
-        log "up-to-date (binary unchanged — nothing to restart)"
-        print_version_transition "$old_ver" "$new_ver"
+        print_update_result unchanged "$old_ver" "$new_ver" "" "git:main"
         return 0
       fi
       install_binaries
       setup_passwordless_sudo
       enable_and_start
-      log "update complete (channel=git:main)"
-      print_version_transition "$old_ver" "$new_ver"
+      print_update_result updated "$old_ver" "$new_ver" "" "git:main"
       ;;
     release|pre-release)
       release_update "$channel"

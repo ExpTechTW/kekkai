@@ -1,0 +1,79 @@
+#compdef kekkai
+#
+# zsh completion for kekkai
+#
+# Install to /usr/share/zsh/vendor-completions/_kekkai (system-wide, Debian)
+# or a directory in $fpath (per-user). After install, run `compinit` or
+# start a fresh shell. kekkai.sh install / repair / update installs this
+# file automatically.
+#
+# Works under `sudo kekkai <Tab>` because zsh's _sudo completer forwards
+# to the completion of the next word.
+
+_kekkai() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    local -a subcommands
+    subcommands=(
+        'status:launch the live TUI'
+        'config:edit config then auto-reload'
+        'check:validate a config file (read-only)'
+        'ports:show public/private port summary'
+        'show:print normalised config'
+        'backup:write timestamped manual backup'
+        'reload:validate + systemctl reload'
+        'bypass:toggle emergency bypass'
+        'update:run installer update flow'
+        'reset:overwrite config with default template'
+        'doctor:run health checks'
+        'version:show version information'
+        'help:show usage'
+    )
+
+    _arguments -C \
+        '1: :->cmd' \
+        '*::arg:->args'
+
+    case $state in
+        cmd)
+            _describe -t commands 'kekkai command' subcommands
+            ;;
+        args)
+            case $words[1] in
+                bypass)
+                    if (( CURRENT == 2 )); then
+                        _values 'mode' on off
+                    else
+                        _arguments \
+                            '--save[persist to config and reload]' \
+                            '*:config:_files'
+                    fi
+                    ;;
+                reset)
+                    local -a ifaces
+                    if [[ -d /sys/class/net ]]; then
+                        ifaces=(${(f)"$(ls /sys/class/net 2>/dev/null | grep -v '^lo$')"})
+                    fi
+                    _arguments \
+                        '--iface[network interface]:iface:($ifaces)' \
+                        '*:config:_files'
+                    ;;
+                update)
+                    _arguments \
+                        '--force[bypass safety checks]' \
+                        '--no-install[skip apt deps]' \
+                        '--iface[force interface]:iface:' \
+                        '--run[launch agent in foreground after]'
+                    ;;
+                status|config|check|ports|show|backup|reload)
+                    _arguments '*:config:_files'
+                    ;;
+                doctor|version|help)
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_kekkai "$@"
