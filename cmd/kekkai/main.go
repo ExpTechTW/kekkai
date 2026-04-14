@@ -35,6 +35,48 @@ const agentBinary = "/usr/local/bin/kekkai-agent"
 const agentUnit = "kekkai-agent"
 const bypassUsage = "usage: kekkai bypass on|off [--save] [config]"
 
+// requireRoot prints a clear error and exits 1 if euid != 0. kekkai CLI is
+// designed for sudo-only use (kernel.unprivileged_bpf_disabled on Debian/
+// Ubuntu/Pi OS blocks non-root bpf() regardless of caps), so we fail fast
+// with a copy-pasteable sudo hint rather than letting downstream calls
+// emit cryptic permission-denied errors.
+func requireRoot() {
+	if os.Geteuid() == 0 {
+		return
+	}
+	// Rebuild the full invocation so the user can copy the "retry with"
+	// line verbatim — including any trailing flags / config paths.
+	cmdline := "sudo kekkai"
+	for _, a := range os.Args[1:] {
+		cmdline += " " + shellQuote(a)
+	}
+	fmt.Fprintln(os.Stderr, "kekkai must run as root.")
+	fmt.Fprintln(os.Stderr, "retry with: "+cmdline)
+	os.Exit(1)
+}
+
+// shellQuote wraps an argument in single quotes if it contains anything
+// other than the POSIX "portable filename character set". Keeps the
+// suggested command pasteable even when args have spaces or globs.
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	safe := true
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
+			!(r >= '0' && r <= '9') && r != '_' && r != '-' &&
+			r != '.' && r != '/' && r != ':' && r != '=' && r != ',' {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 func main() {
 	if version == "" {
 		version = buildinfo.DefaultVersion
@@ -46,6 +88,18 @@ func main() {
 	}
 
 	cmd, args := os.Args[1], os.Args[2:]
+
+	// Everything except `help` / `-h` / `--help` requires root. The CLI is
+	// a sudo-only tool on Debian/Ubuntu/Pi OS (kernel.unprivileged_bpf_disabled
+	// blocks non-root bpf() even with file caps), so we fail fast with a
+	// copy-pasteable sudo hint instead of letting downstream calls emit
+	// cryptic EACCES.
+	switch cmd {
+	case "help", "-h", "--help":
+		// no gate
+	default:
+		requireRoot()
+	}
 
 	switch cmd {
 	case "status":
