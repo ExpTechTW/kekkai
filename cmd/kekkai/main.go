@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -54,6 +55,8 @@ func main() {
 		os.Exit(runWafEdge(append([]string{"-backup"}, resolveConfigArg(args)...)...))
 	case "reload":
 		os.Exit(cmdReload(args))
+	case "update":
+		os.Exit(cmdUpdate(args))
 	case "reset":
 		os.Exit(runWafEdge(buildResetArgs(args)...))
 	case "doctor":
@@ -282,6 +285,77 @@ func cmdReload(args []string) int {
 	return 0
 }
 
+// cmdUpdate delegates to kekkai.sh so update logic stays in one place
+// (git fast-forward + rebuild + rollback-safe restart).
+func cmdUpdate(args []string) int {
+	script, searched := resolveUpdateScript()
+	if script == "" {
+		fmt.Fprintln(os.Stderr, "kekkai update requires kekkai.sh")
+		fmt.Fprintln(os.Stderr, "run from repository root, or set KEKKAI_REPO=/path/to/waf-go")
+		fmt.Fprintln(os.Stderr, "searched:")
+		for _, p := range searched {
+			fmt.Fprintf(os.Stderr, "  - %s\n", p)
+		}
+		return 1
+	}
+
+	cmdArgs := append([]string{script, "update"}, args...)
+	c := exec.Command("bash", cmdArgs...)
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	c.Stdin = os.Stdin
+	if err := c.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "run %s update: %v\n", script, err)
+		return 1
+	}
+	return 0
+}
+
+func resolveUpdateScript() (string, []string) {
+	var candidates []string
+
+	if p := strings.TrimSpace(os.Getenv("KEKKAI_SCRIPT")); p != "" {
+		candidates = append(candidates, p)
+	}
+	if repo := strings.TrimSpace(os.Getenv("KEKKAI_REPO")); repo != "" {
+		candidates = append(candidates, filepath.Join(repo, "kekkai.sh"))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(wd, "kekkai.sh"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, "kekkai.sh"),
+			filepath.Join(exeDir, "..", "kekkai.sh"),
+		)
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	searched := make([]string, 0, len(candidates))
+	for _, p := range candidates {
+		if p == "" {
+			continue
+		}
+		abs, err := filepath.Abs(p)
+		if err == nil {
+			p = abs
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		searched = append(searched, p)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p, searched
+		}
+	}
+	return "", searched
+}
+
 // cmdStatus launches the TUI. It reads the running agent's config to
 // find the interface name so the eBPF pinned map paths line up.
 func cmdStatus(args []string) int {
@@ -362,6 +436,7 @@ Commands:
   show   [config]            print the normalised config after migration
   backup [config]            write a timestamped manual backup of the config file
   reload [config]            validate config, then systemctl reload kekkai-agent
+  update [kekkai.sh flags]   run installer update flow (delegates to kekkai.sh update)
   reset  [config] [--iface]  overwrite config with a fresh default template
                              (existing file is backed up first; auto-detects iface)
   doctor                     run read-only health checks and print a report

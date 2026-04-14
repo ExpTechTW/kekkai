@@ -32,7 +32,7 @@ sudo kekkai reload
 sudo kekkai status
 ```
 
-> 所有指令細節（`status/check/ports/show/backup/reload/reset/doctor`）已移到 [`COMMAND_ZH.md`](COMMAND_ZH.md)。
+> 所有指令細節（`status/check/ports/show/backup/reload/update/reset/doctor`）已移到 [`COMMAND_ZH.md`](COMMAND_ZH.md)。
 
 ## 過濾模型（Ingress）
 

@@ -674,6 +674,7 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 | `kekkai show [path]`            | ✅ | 印出正規化 config (read-only) |
 | `kekkai backup [path]`          | ✅ | 手動時戳備份 |
 | `kekkai reload [path]`          | ✅ | 先做 config check，再送出 systemd reload |
+| `kekkai update [kekkai.sh flags]` | ✅ | delegate 到 `kekkai.sh update`（支援 `--force` 等旗標透傳） |
 | `kekkai reset [path] [--iface]` | ✅ | 覆蓋成預設 template，原檔自動備份 |
 | `kekkai version`                | ✅ | 版本資訊 |
 | `kekkai help`                   | ✅ | 指令總表 |
@@ -702,4 +703,4 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 | `kekkai start/stop/restart/enable/disable` | M7 | systemctl 包裝 |
 | `kekkai stats`                | M7 | 印 `stats.txt` 一次（script 友善） |
 
-`kekkai update` 目前由 `./kekkai.sh update`（或 `make update`）提供，未來 M7 會把它整進 `kekkai` CLI。M4 / M5 / M6 / M7 會陸續補齊上表。
+`kekkai update` 已整進 CLI，內部仍委派給 `kekkai.sh update`，所以更新/rollback/安全檢查邏輯維持單一來源。找不到 `kekkai.sh` 時，可在 repo root 執行，或設定 `KEKKAI_REPO=/path/to/waf-go`。
