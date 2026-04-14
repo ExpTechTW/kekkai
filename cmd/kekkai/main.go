@@ -50,6 +50,8 @@ func main() {
 	switch cmd {
 	case "status":
 		os.Exit(cmdStatus(args))
+	case "config":
+		os.Exit(cmdConfig(args))
 	case "version", "-v", "--version":
 		cmdVersion()
 	case "check":
@@ -351,6 +353,47 @@ func cmdBypassSave(wantBypass bool, cfgPath string) int {
 	return 0
 }
 
+// cmdConfig opens config in nano and reloads the agent after editor exit.
+// Non-root users are transparently escalated with sudo when needed.
+func cmdConfig(args []string) int {
+	cfgPath := firstArgOrDefault(args, defaultConfigPath)
+
+	nanoPath, err := exec.LookPath("nano")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "nano not found; install nano first")
+		return 1
+	}
+
+	editorArgs := []string{nanoPath, cfgPath}
+	editorCmd := exec.Command(editorArgs[0], editorArgs[1:]...)
+	if os.Geteuid() != 0 && !isWritableByCurrentUser(cfgPath) {
+		editorCmd = exec.Command("sudo", editorArgs...)
+	}
+	if code := runCommand(editorCmd, "edit config with nano"); code != 0 {
+		return code
+	}
+
+	// Reuse existing reload flow (includes config check).
+	if os.Geteuid() == 0 {
+		return cmdReload([]string{cfgPath})
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resolve executable for reload: %v\n", err)
+		return 1
+	}
+	return runCommand(exec.Command("sudo", exe, "reload", cfgPath), "sudo reload after config edit")
+}
+
+func isWritableByCurrentUser(path string) bool {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
+}
+
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, mode); err != nil {
@@ -550,6 +593,7 @@ Usage:
 
 Commands:
   status [config]            launch the live TUI (default: /etc/kekkai/kekkai.yaml)
+  config [config]            open config in nano, then auto-reload kekkai-agent
   check  [config]            validate a config file (read-only; safe as non-root)
   ports  [config]            show colorized public/private port summary
   show   [config]            print the normalised config after migration
