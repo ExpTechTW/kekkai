@@ -110,24 +110,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Go
-        id: setup-go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-
-      - name: Cache Go modules and build cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          # Scope the key AND the restore-keys to this matrix lane. No
-          # cross-lane fallback — sharing ~/.cache/go-build between
-          # different GOOS/GOARCH targets causes tar to fail with
-          # "File exists" when restoring a cache from another lane.
-          key: ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ matrix.goos }}-${{ matrix.goarch }}-
+          # Built-in caching is enabled by default (setup-go@v4+) and keys
+          # on runner.os + go-version + hash(go.sum). Don't layer an extra
+          # actions/cache on top — double-caching the same paths causes
+          # tar "File exists" errors when restoring into a directory
+          # setup-go has already populated.
 
       - name: Install eBPF build dependencies
         run: |
