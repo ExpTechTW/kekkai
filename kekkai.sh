@@ -531,6 +531,57 @@ setup_status_capabilities() {
   fi
 }
 
+repair_bpffs_status_permissions() {
+  [[ "$OS" == "linux" ]] || return 0
+  [[ -d "$BPFFS_DIR" ]] || return 0
+  # Keep status readable for non-root users.
+  $SUDO chmod 0755 "$BPFFS_DIR" 2>/dev/null || true
+  $SUDO chmod 0644 "$BPFFS_DIR"/* 2>/dev/null || true
+}
+
+probe_status_permissions() {
+  [[ "$OS" == "linux" ]] || return 0
+  local ok=1
+
+  if [[ ! -d "$BPFFS_DIR" ]]; then
+    warn "status permission probe: $BPFFS_DIR missing (agent may not have pinned maps yet)"
+    return 0
+  fi
+  if [[ ! -r "$BPFFS_DIR" || ! -x "$BPFFS_DIR" ]]; then
+    warn "status permission probe: $BPFFS_DIR is not traversable by current user"
+    ok=0
+  fi
+
+  if [[ -e "$BPFFS_DIR/stats" ]]; then
+    if [[ ! -r "$BPFFS_DIR/stats" ]]; then
+      warn "status permission probe: $BPFFS_DIR/stats is not readable"
+      ok=0
+    fi
+  else
+    warn "status permission probe: $BPFFS_DIR/stats missing"
+    ok=0
+  fi
+
+  if command -v getcap >/dev/null 2>&1; then
+    local caps
+    caps="$(getcap "$CLI_BIN" 2>/dev/null || true)"
+    if [[ "$caps" == *cap_bpf* && "$caps" == *cap_perfmon* && "$caps" == *cap_sys_admin* ]]; then
+      info "status permission probe: CLI capabilities ok"
+    else
+      warn "status permission probe: $CLI_BIN missing required capabilities (need cap_bpf,cap_perfmon,cap_sys_admin+ep)"
+      ok=0
+    fi
+  else
+    warn "status permission probe: getcap not found (cannot verify CLI capabilities)"
+  fi
+
+  if [[ $ok -eq 1 ]]; then
+    log "status permission probe passed"
+  else
+    warn "status permission probe warns: non-root 'kekkai status' may still fail"
+  fi
+}
+
 install_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
     info "$CONFIG_FILE already exists — leaving untouched"
@@ -628,6 +679,8 @@ enable_and_start() {
     $SUDO journalctl -u "$UNIT_NAME" -n 20 --no-pager >&2 || true
     die "service failed to come up"
   fi
+  repair_bpffs_status_permissions
+  probe_status_permissions
 }
 
 # ---------------------------------------------------------------------------
@@ -868,6 +921,9 @@ release_update() {
   old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
   new_sha="$(sha256sum "$new_agent" | awk '{print $1}')"
   if [[ "$old_sha" == "$new_sha" ]]; then
+    repair_bpffs_status_permissions
+    setup_status_capabilities
+    probe_status_permissions
     log "up-to-date (binary unchanged — nothing to restart)"
     print_version_transition "$old_ver" "$new_ver"
     rm -rf "$tmpdir"
@@ -996,6 +1052,9 @@ do_update() {
       old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
       new_sha="$(sha256sum "$ROOT/bin/kekkai-agent" | awk '{print $1}')"
       if [[ "$old_sha" == "$new_sha" ]]; then
+        repair_bpffs_status_permissions
+        setup_status_capabilities
+        probe_status_permissions
         log "up-to-date (binary unchanged — nothing to restart)"
         print_version_transition "$old_ver" "$new_ver"
         return 0

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/ExpTechTW/kekkai/internal/config"
 )
 
@@ -454,11 +455,23 @@ func sysfsTxPath(iface, metric string) string {
 func checkPermissions(r *Runner) {
 	sec := r.Section("permissions")
 
-	sec.Add(Result{
-		Status: statusFor(os.Geteuid() == 0),
-		Title:  "effective uid",
-		Detail: fmt.Sprintf("%d (%s)", os.Geteuid(), iff(os.Geteuid() == 0, "root", "non-root")),
-	})
+	euid := os.Geteuid()
+	if euid == 0 {
+		sec.Add(Result{
+			Status: StatusWarn,
+			Title:  "effective uid",
+			Detail: "0 (root) — non-root status permission check is less representative",
+			Suggestions: []string{
+				"run doctor as non-root once: /usr/local/bin/kekkai doctor",
+			},
+		})
+	} else {
+		sec.Add(Result{
+			Status: StatusOK,
+			Title:  "effective uid",
+			Detail: fmt.Sprintf("%d (non-root)", euid),
+		})
+	}
 
 	// /sys/fs/bpf accessibility.
 	if _, err := os.Stat("/sys/fs/bpf"); err == nil {
@@ -467,10 +480,92 @@ func checkPermissions(r *Runner) {
 		sec.Add(Result{Status: StatusWarn, Title: "/sys/fs/bpf", Detail: err.Error()})
 	}
 
-	// Try reading a pinned map path to verify bpffs read access.
-	if _, err := os.Stat(bpffsPinRoot); err == nil {
-		sec.Add(Result{Status: StatusOK, Title: "pin root readable", Detail: bpffsPinRoot})
+	// Try pin-root traversal/read checks.
+	if st, err := os.Stat(bpffsPinRoot); err == nil {
+		mode := st.Mode().Perm()
+		if mode&0o005 == 0 || mode&0o004 == 0 {
+			sec.Add(Result{
+				Status: StatusWarn,
+				Title:  "pin root mode",
+				Detail: fmt.Sprintf("%s mode=%#o (non-root traversal/read may fail)", bpffsPinRoot, mode),
+				Suggestions: []string{
+					"sudo chmod 0755 /sys/fs/bpf/kekkai",
+				},
+			})
+		} else {
+			sec.Add(Result{
+				Status: StatusOK,
+				Title:  "pin root mode",
+				Detail: fmt.Sprintf("%s mode=%#o", bpffsPinRoot, mode),
+			})
+		}
+	} else {
+		sec.Add(Result{
+			Status: StatusWarn,
+			Title:  "pin root",
+			Detail: err.Error(),
+		})
 	}
+
+	// Check CLI file capabilities needed by non-root `kekkai status`.
+	if _, err := exec.LookPath("getcap"); err != nil {
+		sec.Add(Result{
+			Status: StatusWarn,
+			Title:  "kekkai CLI capabilities",
+			Detail: "getcap not found (install libcap2-bin)",
+		})
+	}
+	capsOut, _ := exec.Command("getcap", cliBinaryPath).CombinedOutput()
+	caps := strings.TrimSpace(string(capsOut))
+	if strings.Contains(caps, "cap_bpf") &&
+		strings.Contains(caps, "cap_perfmon") &&
+		strings.Contains(caps, "cap_sys_admin") {
+		sec.Add(Result{
+			Status: StatusOK,
+			Title:  "kekkai CLI capabilities",
+			Detail: caps,
+		})
+	} else {
+		sec.Add(Result{
+			Status: StatusWarn,
+			Title:  "kekkai CLI capabilities",
+			Detail: iff(caps == "", "no file capabilities set", caps),
+			Suggestions: []string{
+				"sudo apt-get install -y libcap2-bin",
+				"sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep /usr/local/bin/kekkai",
+			},
+		})
+	}
+
+	// Strong check: try opening pinned stats map via bpf_obj_get path.
+	statsPin := filepath.Join(bpffsPinRoot, "stats")
+	if _, err := os.Stat(statsPin); err != nil {
+		sec.Add(Result{
+			Status: StatusWarn,
+			Title:  "pinned stats map open",
+			Detail: "missing at " + statsPin,
+		})
+		return
+	}
+	m, err := ebpf.LoadPinnedMap(statsPin, nil)
+	if err != nil {
+		sec.Add(Result{
+			Status: StatusError,
+			Title:  "pinned stats map open",
+			Detail: err.Error(),
+			Suggestions: []string{
+				"if this is permission denied: fix bpffs mode + setcap on /usr/local/bin/kekkai",
+				"quick workaround: sudo kekkai status",
+			},
+		})
+		return
+	}
+	_ = m.Close()
+	sec.Add(Result{
+		Status: StatusOK,
+		Title:  "pinned stats map open",
+		Detail: statsPin,
+	})
 }
 
 func statusFor(ok bool) Status {
