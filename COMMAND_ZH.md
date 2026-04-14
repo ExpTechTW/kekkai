@@ -211,6 +211,25 @@ kekkai version        # 印 kekkai 版本 + 偵測 kekkai-agent 是否存在
 kekkai help           # 指令總表
 ```
 
+### 2.9 kekkai bypass on|off [--save]
+
+切換 `runtime.emergency_bypass`。
+
+```bash
+sudo kekkai bypass on                # 立即開啟 bypass（不寫 config）
+sudo kekkai bypass off               # 立即關閉 bypass（不寫 config）
+sudo kekkai bypass on --save         # 寫入 config 並 reload（重開機後仍生效）
+sudo kekkai bypass off --save
+```
+
+行為：
+- 預設（不帶 `--save`）是**臨時切換**，透過 signal 直接通知 running agent。
+- CLI 會輸出警告：重開機/重啟 service 後會失效。
+- 帶 `--save` 才會：
+  1) 先做手動 backup  
+  2) 改寫 `runtime.emergency_bypass` 到 config  
+  3) 執行 reload 套用
+
 ---
 
 ## 三、`kekkai-agent` 直接使用的 flag
@@ -514,7 +533,7 @@ sudo kekkai status                              # 看 TUI
 
 可臨時覆蓋：`KEKKAI_UPDATE_CHANNEL=release kekkai update`
 
-### 7.3 手動建置
+### 7.5 手動建置
 
 ```bash
 make bpf              # 只編 eBPF .o
@@ -528,7 +547,7 @@ make status           # 本地 build 後直接跑 kekkai status（開發用）
 make run              # 本地 build 後以 sudo 前景跑 kekkai-agent
 ```
 
-### 7.4 Makefile config 捷徑
+### 7.6 Makefile config 捷徑
 
 ```bash
 make config-check     # = kekkai check
@@ -606,7 +625,7 @@ ls /sys/fs/bpf/kekkai/                    # 確認 pin 路徑有檔案
 
 bpffs 沒掛：`sudo mount -t bpf bpf /sys/fs/bpf`。
 
-### 9.5 update.sh 中止且 rollback
+### 9.5 `kekkai.sh update` 中止且 rollback
 
 ```bash
 journalctl -u kekkai-agent -n 30 --no-pager
@@ -691,6 +710,7 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 | `kekkai show [path]`            | ✅ | 印出正規化 config (read-only) |
 | `kekkai backup [path]`          | ✅ | 手動時戳備份 |
 | `kekkai reload [path]`          | ✅ | 先做 config check，再送出 systemd reload |
+| `kekkai bypass on\|off [--save]` | ✅ | 預設臨時切換 bypass；`--save` 才持久化到 config |
 | `kekkai update [kekkai.sh flags]` | ✅ | delegate 到 `kekkai.sh update`（支援 `--force` 等旗標透傳） |
 | `kekkai reset [path] [--iface]` | ✅ | 覆蓋成預設 template，原檔自動備份 |
 | `kekkai version`                | ✅ | 版本資訊 |
@@ -715,7 +735,6 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 |---|---|---|
 | `kekkai block <ip> [--ttl]`   | M6 | 寫入 `dyn_blocklist_v4` 即時封鎖 |
 | `kekkai unblock <ip>`         | M6 | 從動態黑名單移除 |
-| `kekkai bypass on\|off`       | M7 | 切 `runtime.emergency_bypass` + reload |
 | `kekkai logs [-f] [-n N]`     | M7 | `journalctl -u kekkai-agent` 包裝 |
 | `kekkai start/stop/restart/enable/disable` | M7 | systemctl 包裝 |
 | `kekkai stats`                | M7 | 印 `stats.txt` 一次（script 友善） |

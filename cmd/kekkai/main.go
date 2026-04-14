@@ -31,6 +31,7 @@ var version = "dev"
 const defaultConfigPath = "/etc/kekkai/kekkai.yaml"
 const agentBinary = "/usr/local/bin/kekkai-agent"
 const agentUnit = "kekkai-agent"
+const bypassUsage = "usage: kekkai bypass on|off [--save] [config]"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -55,6 +56,8 @@ func main() {
 		os.Exit(runWafEdge(append([]string{"-backup"}, resolveConfigArg(args)...)...))
 	case "reload":
 		os.Exit(cmdReload(args))
+	case "bypass":
+		os.Exit(cmdBypass(args))
 	case "update":
 		os.Exit(cmdUpdate(args))
 	case "reset":
@@ -74,11 +77,7 @@ func main() {
 // If the user didn't pass a positional arg, we inject the default so
 // `kekkai check` works like `kekkai check /etc/kekkai/kekkai.yaml`.
 func resolveConfigArg(args []string) []string {
-	path := defaultConfigPath
-	if len(args) > 0 {
-		path = args[0]
-	}
-	return []string{"-config", path}
+	return []string{"-config", firstArgOrDefault(args, defaultConfigPath)}
 }
 
 // buildResetArgs parses `kekkai reset [path] [--iface name]` into the flag
@@ -118,25 +117,12 @@ func runWafEdge(args ...string) int {
 		return 1
 	}
 	c := exec.Command(agentBinary, args...)
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	c.Stdin = os.Stdin
-	if err := c.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return exitErr.ExitCode()
-		}
-		fmt.Fprintf(os.Stderr, "kekkai-agent: %v\n", err)
-		return 1
-	}
-	return 0
+	return runCommand(c, "kekkai-agent")
 }
 
 // cmdPorts prints a compact, colorized view of public/private port exposure.
 func cmdPorts(args []string) int {
-	cfgPath := defaultConfigPath
-	if len(args) > 0 {
-		cfgPath = args[0]
-	}
+	cfgPath := firstArgOrDefault(args, defaultConfigPath)
 
 	res, err := config.LoadReadOnly(cfgPath)
 	if err != nil {
@@ -246,13 +232,131 @@ func hasPort(list []uint16, p uint16) bool {
 	return false
 }
 
+func cmdBypass(args []string) int {
+	p, err := parseBypassArgs(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return 2
+	}
+	if p.save {
+		return cmdBypassSave(p.wantBypass, p.cfgPath)
+	}
+	return cmdBypassTemporary(p.wantBypass)
+}
+
+func cmdBypassTemporary(wantBypass bool) int {
+	if os.Geteuid() != 0 {
+		fmt.Fprintln(os.Stderr, "bypass toggle requires root (run: sudo kekkai bypass on|off)")
+		return 1
+	}
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		fmt.Fprintln(os.Stderr, "systemctl not found: cannot signal kekkai-agent")
+		return 1
+	}
+
+	sig := "SIGUSR2"
+	action := "disabled"
+	if wantBypass {
+		sig = "SIGUSR1"
+		action = "enabled"
+	}
+	c := exec.Command("systemctl", "kill", "-s", sig, agentUnit)
+	if code := runCommand(c, fmt.Sprintf("systemctl kill -s %s %s", sig, agentUnit)); code != 0 {
+		return code
+	}
+
+	fmt.Printf("temporary bypass %s (not saved)\n", action)
+	fmt.Println("WARNING: this temporary bypass state will be lost after restart/reboot; use --save to persist.")
+	return 0
+}
+
+type parsedBypassArgs struct {
+	wantBypass bool
+	save       bool
+	cfgPath    string
+}
+
+func parseBypassArgs(args []string) (parsedBypassArgs, error) {
+	if len(args) < 1 {
+		return parsedBypassArgs{}, fmt.Errorf(bypassUsage)
+	}
+	p := parsedBypassArgs{cfgPath: defaultConfigPath}
+	switch args[0] {
+	case "on":
+		p.wantBypass = true
+	case "off":
+		p.wantBypass = false
+	default:
+		return parsedBypassArgs{}, fmt.Errorf(bypassUsage)
+	}
+	for _, a := range args[1:] {
+		switch a {
+		case "--save":
+			p.save = true
+		default:
+			if strings.HasPrefix(a, "-") {
+				return parsedBypassArgs{}, fmt.Errorf("unknown flag: %s", a)
+			}
+			p.cfgPath = a
+		}
+	}
+	return p, nil
+}
+
+func cmdBypassSave(wantBypass bool, cfgPath string) int {
+	if os.Geteuid() != 0 {
+		fmt.Fprintln(os.Stderr, "bypass --save requires root (run: sudo kekkai bypass on|off --save)")
+		return 1
+	}
+
+	res, err := config.Load(cfgPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		return 1
+	}
+	cfg := res.Config
+	if cfg.Runtime.EmergencyBypass == wantBypass {
+		fmt.Printf("config already has runtime.emergency_bypass=%v\n", wantBypass)
+		return cmdReload([]string{cfgPath})
+	}
+
+	if backupPath, err := config.BackupFile(cfgPath, config.BackupKindManual); err == nil {
+		fmt.Printf("backup written: %s\n", backupPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "backup failed: %v\n", err)
+		return 1
+	}
+
+	cfg.Runtime.EmergencyBypass = wantBypass
+	b, err := config.Marshal(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "marshal: %v\n", err)
+		return 1
+	}
+	if err := writeFileAtomic(cfgPath, b, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "write config: %v\n", err)
+		return 1
+	}
+	if code := cmdReload([]string{cfgPath}); code != 0 {
+		return code
+	}
+
+	fmt.Printf("persisted runtime.emergency_bypass=%v in %s\n", wantBypass, cfgPath)
+	return 0
+}
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 // cmdReload validates the config first, then triggers a daemon SIGHUP via
 // systemd reload. This prevents applying a broken config.
 func cmdReload(args []string) int {
-	cfgPath := defaultConfigPath
-	if len(args) > 0 {
-		cfgPath = args[0]
-	}
+	cfgPath := firstArgOrDefault(args, defaultConfigPath)
 
 	// Always lint/validate before touching the running service.
 	if code := runWafEdge("-check", "-config", cfgPath); code != 0 {
@@ -270,15 +374,8 @@ func cmdReload(args []string) int {
 	}
 
 	c := exec.Command("systemctl", "reload", agentUnit)
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	c.Stdin = os.Stdin
-	if err := c.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return exitErr.ExitCode()
-		}
-		fmt.Fprintf(os.Stderr, "systemctl reload %s: %v\n", agentUnit, err)
-		return 1
+	if code := runCommand(c, "systemctl reload "+agentUnit); code != 0 {
+		return code
 	}
 
 	fmt.Printf("reload requested: %s (config checked: %s)\n", agentUnit, cfgPath)
@@ -315,17 +412,7 @@ func cmdUpdate(args []string) int {
 		cmdArgs := append([]string{script, "update"}, args...)
 		c = exec.Command("bash", cmdArgs...)
 	}
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	c.Stdin = os.Stdin
-	if err := c.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return exitErr.ExitCode()
-		}
-		fmt.Fprintf(os.Stderr, "run %s update: %v\n", script, err)
-		return 1
-	}
-	return 0
+	return runCommand(c, fmt.Sprintf("run %s update", script))
 }
 
 func resolveUpdateScript() (string, []string) {
@@ -381,10 +468,7 @@ func resolveUpdateScript() (string, []string) {
 // cmdStatus launches the TUI. It reads the running agent's config to
 // find the interface name so the eBPF pinned map paths line up.
 func cmdStatus(args []string) int {
-	cfgPath := defaultConfigPath
-	if len(args) > 0 {
-		cfgPath = args[0]
-	}
+	cfgPath := firstArgOrDefault(args, defaultConfigPath)
 
 	res, err := config.Load(cfgPath)
 	if err != nil {
@@ -465,6 +549,7 @@ Commands:
   show   [config]            print the normalised config after migration
   backup [config]            write a timestamped manual backup of the config file
   reload [config]            validate config, then systemctl reload kekkai-agent
+  bypass on|off [--save]     toggle emergency bypass (default temporary; --save persists)
   update [kekkai.sh flags]   run installer update flow (delegates to kekkai.sh update)
   reset  [config] [--iface]  overwrite config with a fresh default template
                              (existing file is backed up first; auto-detects iface)
@@ -476,4 +561,25 @@ Run reset via sudo when the config lives under /etc/kekkai.
 Run doctor to diagnose common installation/runtime problems.
 
 See COMMAND_ZH.md for the full operator handbook (in Chinese).`)
+}
+
+func firstArgOrDefault(args []string, def string) string {
+	if len(args) == 0 {
+		return def
+	}
+	return args[0]
+}
+
+func runCommand(c *exec.Cmd, op string) int {
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	c.Stdin = os.Stdin
+	if err := c.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "%s: %v\n", op, err)
+		return 1
+	}
+	return 0
 }

@@ -341,9 +341,29 @@ func run(cfgPath, managedCfgPath string) error {
 		}
 	}()
 
+	// SIGUSR1/SIGUSR2 → temporary bypass toggle (not persisted to config).
+	bypassSig := make(chan os.Signal, 1)
+	signal.Notify(bypassSig, syscall.SIGUSR1, syscall.SIGUSR2)
+	go func() {
+		for sig := range bypassSig {
+			switch sig {
+			case syscall.SIGUSR1:
+				if err := a.setBypassRuntime(true, "signal"); err != nil {
+					log.Printf("temporary bypass enable failed: %v", err)
+				}
+			case syscall.SIGUSR2:
+				if err := a.setBypassRuntime(false, "signal"); err != nil {
+					log.Printf("temporary bypass disable failed: %v", err)
+				}
+			}
+		}
+	}()
+
 	<-ctx.Done()
 	signal.Stop(hup)
 	close(hup)
+	signal.Stop(bypassSig)
+	close(bypassSig)
 	log.Printf("shutting down")
 	<-done
 	return nil
@@ -505,6 +525,28 @@ func (a *agent) reload() error {
 		log.Printf("managed config persist warning: %v", err)
 	} else {
 		log.Printf("managed config updated: %s", a.mcfgPath)
+	}
+	return nil
+}
+
+// setBypassRuntime toggles emergency bypass in-memory only. It intentionally
+// does not write user config or managed config, so the state is ephemeral.
+func (a *agent) setBypassRuntime(bypass bool, reason string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.cfg.Runtime.EmergencyBypass == bypass {
+		log.Printf("temporary bypass unchanged: bypass=%v reason=%s", bypass, reason)
+		return nil
+	}
+	if err := a.loader.SetBypass(bypass); err != nil {
+		return fmt.Errorf("bypass toggle: %w", err)
+	}
+	a.cfg.Runtime.EmergencyBypass = bypass
+	if bypass {
+		log.Printf("temporary bypass ENABLED (reason=%s, not persisted)", reason)
+	} else {
+		log.Printf("temporary bypass DISABLED (reason=%s, not persisted)", reason)
 	}
 	return nil
 }
