@@ -49,6 +49,29 @@ update:
   #     - pre-release -> 從 GitHub Releases 抓最新預發布版
   channel: __UPDATE_CHANNEL__
 
+  # EN: auto_update_download — let kekkai-agent poll the GitHub Releases
+  #     API every auto_update_interval hours and stage newer binaries into
+  #     /var/lib/kekkai/staged/. The currently running agent is NOT touched
+  #     while staging — use `sudo kekkai update` or set auto_update_reload
+  #     below to actually apply the staged binaries.
+  # ZH: 自動下載。true 時 kekkai-agent 會每 auto_update_interval 小時
+  #     檢查 GitHub Releases，有新版就放到 /var/lib/kekkai/staged/，
+  #     不影響運行中的 agent；需透過 auto_update_reload 或手動
+  #     `sudo kekkai update` 才會套用新版。
+  auto_update_download: __AUTO_UPDATE_DOWNLOAD__
+
+  # EN: auto_update_reload — after a successful stage, delegate to
+  #     kekkai.sh to install the new binaries and `systemctl restart`
+  #     the service. XDP detaches for ~1s during restart.
+  #     Requires auto_update_download=true.
+  # ZH: 自動套用。下載後委派 kekkai.sh 安裝新 binary 並 restart service
+  #     (XDP 短暫 detach 約 1 秒)。需先啟用 auto_update_download。
+  auto_update_reload: __AUTO_UPDATE_RELOAD__
+
+  # EN: auto_update_interval — poll cadence in hours, 1..24.
+  # ZH: 自動更新檢查間隔，單位小時，允許 1..24。
+  auto_update_interval: __AUTO_UPDATE_INTERVAL__
+
 # ---------- runtime toggles ----------
 runtime:
   # EN: Emergency bypass loads the eBPF program and maps but does NOT attach

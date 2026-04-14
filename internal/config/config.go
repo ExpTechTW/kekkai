@@ -51,6 +51,28 @@ type UpdateConfig struct {
 	// - release     : latest stable GitHub release asset
 	// - pre-release : latest pre-release GitHub release asset
 	Channel string `yaml:"channel"`
+
+	// AutoUpdateDownload enables the agent's background poll for new
+	// releases. When true, the agent checks the GitHub Releases API every
+	// AutoUpdateInterval hours and, if a strictly newer version exists,
+	// downloads it to /var/lib/kekkai/staged/. Default: true.
+	//
+	// Pointer-bool so Normalize() can distinguish "user set false" from
+	// "omitted", matching the pattern used by filter.allow_icmp etc.
+	AutoUpdateDownload *bool `yaml:"auto_update_download"`
+
+	// AutoUpdateReload enables self-restart after a successful staged
+	// download. When true the agent delegates to kekkai.sh which installs
+	// the staged binaries and `systemctl restart`s the service (brief
+	// XDP detach window during restart). Default: false.
+	//
+	// Requires AutoUpdateDownload=true — Validate() rejects the mismatch
+	// at load time rather than silently ignoring.
+	AutoUpdateReload bool `yaml:"auto_update_reload"`
+
+	// AutoUpdateInterval is the poll cadence in hours. Allowed range:
+	// 1..24. Default: 1.
+	AutoUpdateInterval int `yaml:"auto_update_interval"`
 }
 
 type RuntimeConfig struct {
@@ -312,6 +334,13 @@ func (c *Config) applyDefaults() {
 	if c.Update.Channel == "" {
 		c.Update.Channel = DefaultUpdateChannel
 	}
+	if c.Update.AutoUpdateDownload == nil {
+		v := DefaultAutoUpdateDownload
+		c.Update.AutoUpdateDownload = &v
+	}
+	if c.Update.AutoUpdateInterval == 0 {
+		c.Update.AutoUpdateInterval = DefaultAutoUpdateInterval
+	}
 	if c.Runtime.PerIPTableSize == 0 {
 		c.Runtime.PerIPTableSize = DefaultPerIPTableSize
 	}
@@ -349,6 +378,17 @@ func (c *Config) Validate() error {
 	case "release", "pre-release":
 	default:
 		return fmt.Errorf("update.channel: invalid %q (want release|pre-release)", c.Update.Channel)
+	}
+	if c.Update.AutoUpdateInterval < 1 || c.Update.AutoUpdateInterval > 24 {
+		return fmt.Errorf("update.auto_update_interval: %d out of range (want 1..24 hours)", c.Update.AutoUpdateInterval)
+	}
+	// auto_update_reload implies auto_update_download — you cannot restart
+	// into a binary that was never fetched. Reject the mismatch loudly so
+	// operators notice instead of silently getting download-only behaviour.
+	if c.Update.AutoUpdateReload {
+		if c.Update.AutoUpdateDownload == nil || !*c.Update.AutoUpdateDownload {
+			return errors.New("update.auto_update_reload=true requires update.auto_update_download=true")
+		}
 	}
 
 	tcpSeen, udpSeen := map[uint16]string{}, map[uint16]string{}

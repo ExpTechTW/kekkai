@@ -43,6 +43,7 @@ func Run() *Runner {
 	checkKernel(r)
 	checkNetwork(r, cfg)
 	checkPermissions(r)
+	checkAutoUpdate(r, cfg)
 	checkRuntime(r, cfg)
 
 	return r
@@ -546,6 +547,123 @@ func statusFor(ok bool) Status {
 		return StatusOK
 	}
 	return StatusWarn
+}
+
+// ---------- auto-update --------------------------------------------------
+
+// Paths must stay in sync with cmd/kekkai-agent/autoupdate.go — doctor
+// reads the files the agent writes, so both sides agree on the layout
+// rather than re-importing the agent package.
+const (
+	autoUpdateErrorPath   = "/var/lib/kekkai/auto_update_error.txt"
+	autoUpdateLastRunPath = "/var/lib/kekkai/auto_update_last_run.txt"
+	autoUpdateStagedPath  = "/var/lib/kekkai/staged"
+)
+
+// checkAutoUpdate surfaces the background poller's state so operators
+// see at a glance whether auto-update is enabled, whether the last poll
+// succeeded, and whether there are staged binaries waiting to be applied.
+// Never errors — a silent/absent state file is the happy path.
+func checkAutoUpdate(r *Runner, cfg *config.Config) {
+	sec := r.Section("auto-update")
+
+	if cfg == nil {
+		sec.Add(Result{
+			Status: StatusWarn,
+			Title:  "config",
+			Detail: "not loaded — skipping auto-update checks",
+		})
+		return
+	}
+
+	// Config summary: what the operator asked for.
+	downloadEnabled := cfg.Update.AutoUpdateDownload != nil && *cfg.Update.AutoUpdateDownload
+	mode := "disabled"
+	if downloadEnabled {
+		if cfg.Update.AutoUpdateReload {
+			mode = "download + auto-restart"
+		} else {
+			mode = "download only"
+		}
+	}
+	sec.Add(Result{
+		Status: StatusOK,
+		Title:  "mode",
+		Detail: fmt.Sprintf("%s (channel=%s interval=%dh)",
+			mode, cfg.Update.Channel, cfg.Update.AutoUpdateInterval),
+	})
+
+	// If download is disabled, the remaining checks are moot — any
+	// staged binary or error file would be stale state from when the
+	// feature was previously enabled. Surface it as a single warn so
+	// it's visible but not scary.
+	if !downloadEnabled {
+		return
+	}
+
+	// Last run state file (populated on every tick, success or failure).
+	if data, err := os.ReadFile(autoUpdateLastRunPath); err == nil {
+		state := grep1(string(data), "state")
+		detail := grep1(string(data), "detail")
+		ts := grep1(string(data), "timestamp")
+		st := StatusOK
+		if state == "failed" {
+			st = StatusError
+		}
+		sec.Add(Result{
+			Status: st,
+			Title:  "last run",
+			Detail: fmt.Sprintf("%s (%s) @ %s", state, detail, ts),
+		})
+	} else {
+		sec.Add(Result{
+			Status: StatusWarn,
+			Title:  "last run",
+			Detail: "no poll has run yet — agent may have just started",
+		})
+	}
+
+	// Error file is only present if the latest tick failed. Show the
+	// kind + target so the operator can decide whether to retry or
+	// investigate journalctl.
+	if data, err := os.ReadFile(autoUpdateErrorPath); err == nil {
+		sec.Add(Result{
+			Status: StatusError,
+			Title:  "last error",
+			Detail: fmt.Sprintf("kind=%s target=%s",
+				grep1(string(data), "kind"),
+				grep1(string(data), "target_version")),
+			Suggestions: []string{
+				"sudo journalctl -u kekkai-agent --since=1h",
+				"sudo rm " + autoUpdateErrorPath + "  # clear the MOTD banner",
+			},
+		})
+	}
+
+	// Staged binaries waiting to be applied. In download-only mode this
+	// is the normal "ready for manual apply" path, so it's OK — the
+	// operator explicitly chose not to auto-restart.
+	if data, err := os.ReadFile(autoUpdateStagedPath + "/VERSION"); err == nil {
+		sec.Add(Result{
+			Status: StatusOK,
+			Title:  "staged",
+			Detail: fmt.Sprintf("%s ready — run `sudo kekkai update` to apply",
+				strings.TrimSpace(string(data))),
+		})
+	}
+}
+
+// grep1 returns the value of the first "key=value" line matching key, or
+// "?" if absent. Used to read the flat state files the agent writes
+// without pulling in a full YAML parser for a 3-line format.
+func grep1(body, key string) string {
+	prefix := key + "="
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return "?"
 }
 
 // ---------- runtime ------------------------------------------------------

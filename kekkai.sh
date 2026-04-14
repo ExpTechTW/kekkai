@@ -87,6 +87,10 @@ ROLLBACK_BIN=/usr/local/bin/kekkai-agent.prev
 SCRIPT_INSTALL_PATH=/usr/local/bin/kekkai.sh
 BASH_COMPLETION_DST=/usr/share/bash-completion/completions/kekkai
 ZSH_COMPLETION_DST=/usr/share/zsh/vendor-completions/_kekkai
+MOTD_DST=/etc/update-motd.d/98-kekkai
+STATE_DIR=/var/lib/kekkai
+STAGED_DIR=/var/lib/kekkai/staged
+AUTO_UPDATE_ERROR_FILE=/var/lib/kekkai/auto_update_error.txt
 CONFIG_DIR=/etc/kekkai
 CONFIG_FILE="$CONFIG_DIR/kekkai.yaml"
 STATS_DIR=/var/run/kekkai
@@ -111,6 +115,7 @@ CMD=""
 DO_INSTALL_DEPS=1
 IFACE_OVERRIDE=""
 DO_RUN=0
+FORCE_UPDATE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -119,6 +124,7 @@ while [[ $# -gt 0 ]]; do
     --no-install)  DO_INSTALL_DEPS=0; shift ;;
     --iface)       IFACE_OVERRIDE="$2"; shift 2 ;;
     --run)         DO_RUN=1; shift ;;
+    --force)       FORCE_UPDATE=1; shift ;;
     -h|--help)
       sed -n '2,23p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -142,11 +148,37 @@ else
   C_RESET=""; C_DIM=""; C_BOLD=""; C_OK=""; C_WARN=""; C_ERR=""; C_INFO=""; C_BLUE=""; C_TITLE=""
 fi
 
-step() { printf '\n%s◈ %s%s\n' "$C_TITLE" "$*" "$C_RESET"; }
-log()  { printf '%s[+]%s %s\n' "$C_OK"   "$C_RESET" "$*"; }
-warn() { printf '%s[!]%s %s\n' "$C_WARN" "$C_RESET" "$*"; }
-err()  { printf '%s[x]%s %s\n' "$C_ERR"  "$C_RESET" "$*" >&2; }
-info() { printf '%s[·]%s %s\n' "$C_INFO" "$C_RESET" "$*"; }
+# Persistent log for kekkai.sh operations. Matches the agent's log
+# directory so operators have one place to look when debugging an
+# install / update / repair. We only append plain text (no ANSI) here —
+# the terminal gets the colourised version, the file gets the scraped
+# version.
+KEKKAI_SH_LOG=/var/log/kekkai/kekkai.sh.log
+
+# _kslog_append writes a single already-rendered line into the
+# persistent log file. Best-effort: if the file isn't writable (non-root
+# dev run, missing dir) we silently drop it rather than breaking the
+# visible output. Timestamp format matches the agent's logx handler
+# (UTC, 1-second resolution) so both log streams line up chronologically
+# when they end up in the same terminal scrollback.
+_kslog_append() {
+  local level="$1" msg="$2"
+  [[ -n "$KEKKAI_SH_LOG" ]] || return 0
+  local ts
+  ts="$(date -u '+%Y/%m/%d %H:%M:%S')"
+  # mkdir -p is idempotent and cheap; we do it every call in case the
+  # directory was removed between invocations. The :-"" guard means a
+  # failed mkdir just drops the line instead of erroring out.
+  mkdir -p "$(dirname "$KEKKAI_SH_LOG")" 2>/dev/null || return 0
+  printf '[%s(UTC)][%-5s][kekkai.sh] %s\n' "$ts" "$level" "$msg" \
+    >> "$KEKKAI_SH_LOG" 2>/dev/null || true
+}
+
+step() { printf '\n%s◈ %s%s\n' "$C_TITLE" "$*" "$C_RESET"; _kslog_append STEP "$*"; }
+log()  { printf '%s[+]%s %s\n' "$C_OK"   "$C_RESET" "$*"; _kslog_append INFO "$*"; }
+warn() { printf '%s[!]%s %s\n' "$C_WARN" "$C_RESET" "$*"; _kslog_append WARN "$*"; }
+err()  { printf '%s[x]%s %s\n' "$C_ERR"  "$C_RESET" "$*" >&2; _kslog_append ERROR "$*"; }
+info() { printf '%s[·]%s %s\n' "$C_INFO" "$C_RESET" "$*"; _kslog_append INFO "$*"; }
 die()  { err "$*"; exit 1; }
 
 banner() {
@@ -342,6 +374,7 @@ install_binaries_from() {
   log "installed: $CLI_BIN"
 
   install_completions
+  install_motd
 }
 
 # persist_script_for_updates puts a copy of kekkai.sh at /usr/local/bin/kekkai.sh
@@ -441,6 +474,35 @@ install_completions() {
   if [[ -z "$bash_src" ]] && [[ -z "$zsh_src" ]]; then
     warn "shell completions not installed (no local or remote source)"
   fi
+}
+
+# install_motd drops the auto-update failure notice into
+# /etc/update-motd.d/ and ensures the state directory exists for
+# kekkai-agent's auto-update goroutine. Silently skips if the host
+# doesn't use update-motd.d (mostly non-systemd distros).
+install_motd() {
+  [[ "$OS" == "linux" ]] || return 0
+
+  # State dirs are created unconditionally — agent auto-update and the
+  # rotating logger both need them even on hosts without update-motd.d.
+  $SUDO install -d -m 0755 "$STATE_DIR"
+  $SUDO install -d -m 0755 "$STAGED_DIR"
+  $SUDO install -d -m 0755 /var/log/kekkai
+
+  if [[ ! -d "$(dirname "$MOTD_DST")" ]]; then
+    info "update-motd.d not present — skipping login-warning hook"
+    return 0
+  fi
+
+  local motd_src
+  motd_src="$(fetch_or_copy_asset contrib/motd/98-kekkai)" || motd_src=""
+  if [[ -z "$motd_src" ]]; then
+    warn "motd script not installed (no local or remote source)"
+    return 0
+  fi
+  $SUDO install -D -m 0755 "$motd_src" "$MOTD_DST"
+  log "installed: $MOTD_DST"
+  [[ "$motd_src" != "$ROOT"* ]] && rm -f "$motd_src"
 }
 
 install_binaries() {
@@ -612,7 +674,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=false
-ReadWritePaths=/sys/fs/bpf /var/run /run /etc/kekkai
+ReadWritePaths=/sys/fs/bpf /var/run /run /etc/kekkai /var/log/kekkai /var/lib/kekkai
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=kekkai-agent
@@ -896,6 +958,42 @@ version_is_newer() {
 #
 # Kept separate from binary updates because the script can ship fixes that
 # have no corresponding binary release (this very patch is one such case).
+# use_staged_binaries reports whether /var/lib/kekkai/staged/ holds a
+# complete, strictly-newer release that release_update should consume
+# instead of fetching. Requirements:
+#
+#   - both binaries present and non-empty
+#   - VERSION marker present and parseable
+#   - VERSION strictly newer than the currently installed CLI
+#
+# Conservative on failure (never trust half-staged state): any missing
+# piece → return 1, and release_update falls through to the fetch path.
+use_staged_binaries() {
+  [[ -d "$STAGED_DIR" ]] || return 1
+  [[ -s "$STAGED_DIR/kekkai-agent" && -s "$STAGED_DIR/kekkai" ]] || return 1
+  [[ -f "$STAGED_DIR/VERSION" ]] || return 1
+
+  local staged_ver installed_ver
+  staged_ver="$(cat "$STAGED_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "$staged_ver" ]] || return 1
+
+  # Strip any leading `v` to line up with read_cli_version's format.
+  staged_ver="${staged_ver#v}"
+  installed_ver="$(read_cli_version "$CLI_BIN")"
+
+  # Must be strictly newer — identical tag would mean we're about to
+  # reinstall the same bytes, which is wasted work. Downgrade is
+  # impossible here because the agent's staging logic only writes when
+  # it has proven it's newer.
+  if ! version_is_newer "$staged_ver" "$installed_ver"; then
+    return 1
+  fi
+  # Also require the staged binaries to actually run — catches half-
+  # written files from an interrupted download.
+  "$STAGED_DIR/kekkai-agent" -check /dev/null >/dev/null 2>&1 || return 1
+  return 0
+}
+
 sync_script_from_remote() {
   [[ "$OS" == "linux" ]] || return 10
   command -v curl >/dev/null 2>&1 || return 11
@@ -917,14 +1015,90 @@ sync_script_from_remote() {
   return 0
 }
 
+# pick_max_channel_tag: compare the latest release vs latest pre-release
+# and echo back whichever has the higher version string. Used by --force
+# to pick the genuinely-newest GitHub release regardless of what the
+# config says about the preferred channel.
+#
+# Output: "<channel> <tag>" on stdout, empty string on failure.
+#
+# Implementation note: we deliberately re-use fetch_release_metadata +
+# select_release_assets here rather than parsing inline, so the regex /
+# "find max prerelease" logic stays in one place. The two sub-shell
+# calls are OK cost-wise — both hit GitHub once each, and --force is a
+# one-shot operator action, not a tight loop.
+pick_max_channel_tag() {
+  local rel_meta prerel_meta rel_tag prerel_tag
+  rel_meta="$(fetch_release_metadata release 2>/dev/null || true)"
+  prerel_meta="$(fetch_release_metadata pre-release 2>/dev/null || true)"
+
+  if [[ -n "$rel_meta" ]]; then
+    rel_tag="$(printf '%s' "$rel_meta" | select_release_assets release "$OS" "$ARCH" 2>/dev/null | sed -n '1p')"
+  fi
+  if [[ -n "$prerel_meta" ]]; then
+    prerel_tag="$(printf '%s' "$prerel_meta" | select_release_assets pre-release "$OS" "$ARCH" 2>/dev/null | sed -n '1p')"
+  fi
+
+  # Strip leading v so sort -V compares cleanly.
+  local rel_cmp="${rel_tag#v}" prerel_cmp="${prerel_tag#v}"
+
+  if [[ -z "$rel_cmp" ]] && [[ -z "$prerel_cmp" ]]; then
+    return 1
+  fi
+  if [[ -z "$prerel_cmp" ]]; then
+    echo "release $rel_tag"; return 0
+  fi
+  if [[ -z "$rel_cmp" ]]; then
+    echo "pre-release $prerel_tag"; return 0
+  fi
+
+  # Both present — pick the strictly larger. On tie, prefer `release`
+  # (stable wins the coin flip).
+  local top
+  top="$(printf '%s\n%s\n' "$rel_cmp" "$prerel_cmp" | sort -V | tail -n1)"
+  if [[ "$top" == "$prerel_cmp" ]] && [[ "$rel_cmp" != "$prerel_cmp" ]]; then
+    echo "pre-release $prerel_tag"
+  else
+    echo "release $rel_tag"
+  fi
+}
+
 release_update() {
   local channel="$1"
+  local force_flag="${2:-0}"
   local old_ver
   old_ver="$(read_cli_version "$CLI_BIN")"
 
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  fetch_release_artifacts "$channel" "$tmpdir"
+  # --force resolves the channel fresh, scanning BOTH channels for the
+  # highest version tag. The caller's `channel` argument is ignored in
+  # this mode. We also bypass the staged-binaries short-circuit so the
+  # user always gets a genuine re-download — --force is a "give me
+  # whatever is latest on GitHub right now, no caching" escape hatch.
+  if (( force_flag )); then
+    local picked
+    picked="$(pick_max_channel_tag)" || die "--force: could not fetch release metadata"
+    [[ -n "$picked" ]] || die "--force: no release candidates found"
+    channel="${picked%% *}"
+    info "--force: cross-channel pick → channel=$channel tag=${picked#* }"
+  fi
+
+  # Prefer binaries the running kekkai-agent has already staged into
+  # /var/lib/kekkai/staged/. This skips the second fetch when
+  # auto_update_download has already done the work — the operator running
+  # `sudo kekkai update` by hand just applies what's on disk.
+  # --force always re-fetches so operators who suspect the staged copy
+  # is broken can get a clean reinstall.
+  local tmpdir=""
+  if (( force_flag == 0 )) && use_staged_binaries; then
+    REL_NEW_AGENT="$STAGED_DIR/kekkai-agent"
+    REL_NEW_CLI="$STAGED_DIR/kekkai"
+    REL_TAG="$(cat "$STAGED_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
+    [[ -n "$REL_TAG" ]] || REL_TAG="staged"
+    log "using staged binaries from $STAGED_DIR (tag=$REL_TAG)"
+  else
+    tmpdir="$(mktemp -d)"
+    fetch_release_artifacts "$channel" "$tmpdir"
+  fi
   local new_ver
   new_ver="$(read_cli_version "$REL_NEW_CLI")"
 
@@ -936,14 +1110,23 @@ release_update() {
   # resolves to channel=release (build.4) and rolls them back. We refuse
   # by pretending the binaries didn't change — kekkai.sh sync still runs
   # (script fixes can legitimately ship between releases).
+  #
+  # --force bypasses this check by design (operator explicitly asked for
+  # whatever is latest regardless of direction); a warning is still
+  # printed if the "latest" turns out to be older than what's installed.
   local -a changed_parts=()
   local need_restart=0
   local downgrade_refused=0
 
-  if [[ "$new_ver" != "$old_ver" ]] && ! version_is_newer "$new_ver" "$old_ver"; then
+  if (( force_flag )); then
+    if [[ "$new_ver" != "$old_ver" ]] && ! version_is_newer "$new_ver" "$old_ver"; then
+      warn "--force: installing $new_ver over $old_ver (downgrade protection bypassed)"
+    fi
+  elif [[ "$new_ver" != "$old_ver" ]] && ! version_is_newer "$new_ver" "$old_ver"; then
     downgrade_refused=1
     warn "refusing to downgrade: $channel channel offers $new_ver but installed is $old_ver"
     warn "to switch channels, set update.channel in $CONFIG_FILE or export KEKKAI_UPDATE_CHANNEL"
+    warn "to force override regardless of direction, run: sudo kekkai update --force"
   fi
 
   if (( downgrade_refused == 0 )); then
@@ -967,8 +1150,14 @@ release_update() {
       log "installed: $CLI_BIN"
       install_completions
     fi
+    # Consumed staged binaries — clear the staging dir so the next
+    # auto-update tick starts from a clean slate and doctor's status
+    # reflects the current installed version.
+    if [[ "$tmpdir" == "" ]] && [[ -d "$STAGED_DIR" ]]; then
+      $SUDO rm -f "$STAGED_DIR"/* 2>/dev/null || true
+    fi
   fi
-  rm -rf "$tmpdir"
+  [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
 
   # Script sync: independent of binary changes. Done after binaries
   # because sync_script_from_remote may overwrite the script this very
@@ -1093,11 +1282,15 @@ do_install() {
 
 do_update() {
   banner
-  step "update · $OS/$ARCH"
+  if (( FORCE_UPDATE )); then
+    step "update · $OS/$ARCH · --force (cross-channel latest)"
+  else
+    step "update · $OS/$ARCH"
+  fi
   local channel
   channel="$(resolve_update_channel)"
   log "update channel: $channel"
-  release_update "$channel"
+  release_update "$channel" "$FORCE_UPDATE"
 }
 
 do_repair() {

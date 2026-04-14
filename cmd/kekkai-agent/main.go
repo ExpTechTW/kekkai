@@ -18,12 +18,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/ExpTechTW/kekkai/internal/buildinfo"
 	"github.com/ExpTechTW/kekkai/internal/config"
 	"github.com/ExpTechTW/kekkai/internal/loader"
+	"github.com/ExpTechTW/kekkai/internal/logx"
 	kmaps "github.com/ExpTechTW/kekkai/internal/maps"
 	"github.com/ExpTechTW/kekkai/internal/stats"
 )
@@ -158,7 +160,7 @@ func runReset(path, iface string) int {
 		fmt.Printf("existing config backed up: %s\n", dst)
 	}
 
-	if err := os.MkdirAll(filepathDir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "reset: mkdir: %v\n", err)
 		return 1
 	}
@@ -187,8 +189,8 @@ func detectDefaultIface() string {
 	if err != nil {
 		return ""
 	}
-	for _, line := range splitLines(string(data)) {
-		fields := splitFields(line)
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
 		// Iface Destination Gateway Flags ...
 		// Destination == 00000000 means default route.
 		if len(fields) >= 2 && fields[1] == "00000000" {
@@ -198,65 +200,19 @@ func detectDefaultIface() string {
 	return ""
 }
 
-// filepathDir is a trivial split to avoid importing path/filepath for
-// one call. Kept local so the rest of this file can stay small.
-func filepathDir(p string) string {
-	i := len(p) - 1
-	for i >= 0 && p[i] != '/' {
-		i--
-	}
-	if i < 0 {
-		return "."
-	}
-	if i == 0 {
-		return "/"
-	}
-	return p[:i]
-}
-
-func splitLines(s string) []string {
-	out := []string{}
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			out = append(out, s[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		out = append(out, s[start:])
-	}
-	return out
-}
-
-func splitFields(s string) []string {
-	out := []string{}
-	start := -1
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		space := c == ' ' || c == '\t'
-		if space {
-			if start >= 0 {
-				out = append(out, s[start:i])
-				start = -1
-			}
-		} else if start < 0 {
-			start = i
-		}
-	}
-	if start >= 0 {
-		out = append(out, s[start:])
-	}
-	return out
-}
-
 // agent bundles all the subsystems main() wires together so reload can
 // touch each map through a single handle.
+//
+// log is the module-scoped ("main") logger; subsystems like autoupdate
+// make their own children via log.With("update"). Sharing the root
+// logger across goroutines is safe — logx serialises writes internally.
 type agent struct {
 	cfg       *config.Config
 	cfgPath   string
 	mcfgPath  string
 	loader    *loader.Loader
+	log       *logx.Logger
+	root      *logx.Logger // kept separately so Close() at shutdown stops rotation
 	mu        sync.Mutex
 	blocklist *kmaps.PrefixSet
 	allowlist *kmaps.PrefixSet
@@ -268,60 +224,110 @@ type agent struct {
 }
 
 func run(cfgPath, managedCfgPath string) error {
+	// Build the root logger FIRST so every subsequent event — including
+	// config load failures — goes through the same stream that journald
+	// and the rotated file are already capturing. If file rotation
+	// cannot be set up (disk full, permission), logx.New() degrades to
+	// stderr-only rather than erroring out.
+	root := logx.New()
+	mainLog := root.With("main")
+	mainLog.Info("agent starting", "pid", os.Getpid(), "version", version)
+
 	res, source, err := loadStartupConfig(cfgPath, managedCfgPath)
 	if err != nil {
+		mainLog.Error("config load failed", "path", cfgPath, "err", err.Error())
+		_ = root.Close()
 		return fmt.Errorf("config: %w", err)
 	}
 	cfg := res.Config
-	log.Printf("config source: %s", source)
+	mainLog.Info("config loaded", "source", source, "path", cfgPath)
 
 	if res.Migrated {
-		log.Printf("config migrated v%d → v%d (backup: %s)",
-			res.FromVersion, config.CurrentVersion, res.BackupPath)
+		mainLog.Info("config migrated",
+			"from_version", res.FromVersion,
+			"to_version", config.CurrentVersion,
+			"backup", res.BackupPath)
 	}
 	for _, line := range res.NormalizeLog {
-		log.Printf("normalize: %s", line)
+		mainLog.Info("config normalize", "change", line)
 	}
-	warnIfSSHPublic(cfg)
+	warnIfSSHPublic(cfg, mainLog)
 
-	log.Printf("kekkai-agent starting node=%s region=%s iface=%s xdp_mode=%s bypass=%v",
-		cfg.Node.ID, cfg.Node.Region, cfg.Interface.Name, cfg.Interface.XDPMode, cfg.Runtime.EmergencyBypass)
+	mainLog.Info("kekkai-agent config summary",
+		"node", cfg.Node.ID,
+		"region", cfg.Node.Region,
+		"iface", cfg.Interface.Name,
+		"xdp_mode", cfg.Interface.XDPMode,
+		"bypass", cfg.Runtime.EmergencyBypass)
 
 	iface, err := cfg.ResolveInterface()
 	if err != nil {
+		mainLog.Error("resolve iface", "iface", cfg.Interface.Name, "err", err.Error())
+		_ = root.Close()
 		return fmt.Errorf("lookup iface %s: %w", cfg.Interface.Name, err)
 	}
 
+	loaderLog := root.With("loader")
 	ld := loader.New(cfg.Interface.Name)
 	if err := ld.Attach(iface.Index, loader.Options{
 		PerIPMaxEntries: cfg.Runtime.PerIPTableSize,
 		XDPMode:         cfg.Interface.XDPMode,
 		EmergencyBypass: cfg.Runtime.EmergencyBypass,
 	}); err != nil {
+		loaderLog.Error("xdp attach failed", "iface", cfg.Interface.Name, "err", err.Error())
+		_ = root.Close()
 		return fmt.Errorf("attach xdp: %w", err)
 	}
 	defer ld.Close()
 	if cfg.Runtime.EmergencyBypass {
-		log.Printf("emergency bypass ENABLED: eBPF loaded but not attached to %s", cfg.Interface.Name)
+		loaderLog.Warn("emergency bypass enabled — eBPF loaded but not attached",
+			"iface", cfg.Interface.Name)
 	} else {
-		log.Printf("xdp attached to %s (ifindex=%d)", cfg.Interface.Name, iface.Index)
+		loaderLog.Info("xdp attached",
+			"iface", cfg.Interface.Name,
+			"ifindex", iface.Index,
+			"mode", cfg.Interface.XDPMode)
 	}
 
-	a := &agent{cfg: cfg, cfgPath: cfgPath, mcfgPath: managedCfgPath, loader: ld}
+	a := &agent{
+		cfg:      cfg,
+		cfgPath:  cfgPath,
+		mcfgPath: managedCfgPath,
+		loader:   ld,
+		log:      root.With("reload"),
+		root:     root,
+	}
+	defer func() { _ = root.Close() }()
+
+	mapsLog := root.With("maps")
 	if err := a.openMaps(); err != nil {
+		mapsLog.Error("open maps failed", "err", err.Error())
 		return err
 	}
+	mapsLog.Info("maps opened")
+
 	if err := a.applyFilter(cfg); err != nil {
+		mapsLog.Error("apply filter failed", "err", err.Error())
 		return fmt.Errorf("apply filter: %w", err)
 	}
+	mapsLog.Info("initial filter applied",
+		"public_tcp", len(cfg.Filter.Public.TCP),
+		"public_udp", len(cfg.Filter.Public.UDP),
+		"private_tcp", len(cfg.Filter.Private.TCP),
+		"private_udp", len(cfg.Filter.Private.UDP),
+		"allowlist", len(cfg.Filter.IngressAllowlist),
+		"blocklist", len(cfg.Filter.StaticBlocklist))
+
 	if err := persistManagedConfig(managedCfgPath, cfg); err != nil {
-		log.Printf("managed config persist warning: %v", err)
+		mainLog.Warn("managed config persist failed", "path", managedCfgPath, "err", err.Error())
 	} else {
-		log.Printf("managed config updated: %s", managedCfgPath)
+		mainLog.Info("managed config updated", "path", managedCfgPath)
 	}
 
+	statsLog := root.With("stats")
 	reader, err := openStats(ld, cfg)
 	if err != nil {
+		statsLog.Error("stats reader init failed", "err", err.Error())
 		return err
 	}
 
@@ -331,51 +337,61 @@ func run(cfgPath, managedCfgPath string) error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		statsLog.Info("stats reader started", "file", cfg.Observability.StatsFile)
 		if err := reader.Run(ctx.Done()); err != nil {
-			log.Printf("stats reader: %v", err)
+			statsLog.Error("stats reader exited with error", "err", err.Error())
+		} else {
+			statsLog.Info("stats reader stopped")
 		}
 	}()
-	log.Printf("stats writing to %s (watch -n 1 cat %s)",
-		cfg.Observability.StatsFile, cfg.Observability.StatsFile)
 
 	// SIGHUP → reload
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
 		for range hup {
+			a.log.Info("signal received", "signal", "SIGHUP", "action", "reload")
 			if err := a.reload(); err != nil {
-				log.Printf("reload failed (keeping previous config): %v", err)
+				a.log.Error("reload failed (keeping previous config)", "err", err.Error())
 				continue
 			}
-			log.Printf("reload ok")
+			a.log.Info("reload ok")
 		}
 	}()
 
 	// SIGUSR1/SIGUSR2 → temporary bypass toggle (not persisted to config).
+	bypassLog := root.With("bypass")
 	bypassSig := make(chan os.Signal, 1)
 	signal.Notify(bypassSig, syscall.SIGUSR1, syscall.SIGUSR2)
 	go func() {
 		for sig := range bypassSig {
 			switch sig {
 			case syscall.SIGUSR1:
+				bypassLog.Info("signal received", "signal", "SIGUSR1", "action", "bypass_on")
 				if err := a.setBypassRuntime(true, "signal"); err != nil {
-					log.Printf("temporary bypass enable failed: %v", err)
+					bypassLog.Error("temporary bypass enable failed", "err", err.Error())
 				}
 			case syscall.SIGUSR2:
+				bypassLog.Info("signal received", "signal", "SIGUSR2", "action", "bypass_off")
 				if err := a.setBypassRuntime(false, "signal"); err != nil {
-					log.Printf("temporary bypass disable failed: %v", err)
+					bypassLog.Error("temporary bypass disable failed", "err", err.Error())
 				}
 			}
 		}
 	}()
 
+	// Background release poller. No-op when auto_update_download=false.
+	go a.runAutoUpdate(ctx, version, root.With("update"))
+
 	<-ctx.Done()
+	mainLog.Info("shutdown signal received", "action", "stopping goroutines")
 	signal.Stop(hup)
 	close(hup)
 	signal.Stop(bypassSig)
 	close(bypassSig)
-	log.Printf("shutting down")
+	mainLog.Info("waiting for stats reader to drain")
 	<-done
+	mainLog.Info("agent shutdown complete")
 	return nil
 }
 
@@ -463,14 +479,17 @@ func (a *agent) applyFilter(cfg *config.Config) error {
 	}); err != nil {
 		return err
 	}
-	log.Printf("filter applied: public tcp=%v udp=%v  private tcp=%v udp=%v  allowlist=%d  blocklist=%d",
-		cfg.Filter.Public.TCP, cfg.Filter.Public.UDP,
-		cfg.Filter.Private.TCP, cfg.Filter.Private.UDP,
-		len(cfg.Filter.IngressAllowlist), len(cfg.Filter.StaticBlocklist))
-	log.Printf("runtime policy: allow_icmp=%v allow_arp=%v udp_ephemeral_min=%d",
-		cfg.Filter.AllowICMP != nil && *cfg.Filter.AllowICMP,
-		cfg.Filter.AllowARP != nil && *cfg.Filter.AllowARP,
-		cfg.Filter.UDPEphemeralMin)
+	a.log.Info("filter applied",
+		"public_tcp", fmt.Sprintf("%v", cfg.Filter.Public.TCP),
+		"public_udp", fmt.Sprintf("%v", cfg.Filter.Public.UDP),
+		"private_tcp", fmt.Sprintf("%v", cfg.Filter.Private.TCP),
+		"private_udp", fmt.Sprintf("%v", cfg.Filter.Private.UDP),
+		"allowlist", len(cfg.Filter.IngressAllowlist),
+		"blocklist", len(cfg.Filter.StaticBlocklist))
+	a.log.Info("runtime policy applied",
+		"allow_icmp", cfg.Filter.AllowICMP != nil && *cfg.Filter.AllowICMP,
+		"allow_arp", cfg.Filter.AllowARP != nil && *cfg.Filter.AllowARP,
+		"udp_ephemeral_min", cfg.Filter.UDPEphemeralMin)
 	return nil
 }
 
@@ -502,18 +521,30 @@ func (a *agent) reload() error {
 			a.cfg.Interface.XDPMode, newCfg.Interface.XDPMode)
 	}
 
+	// Emit a field-by-field diff of the running vs new config so the
+	// operator sees exactly what changed during this reload. Done
+	// before the backup/apply steps so the log ordering tells a story:
+	// "we saw these changes → backed up old → applied new".
+	diffs := config.DiffConfigs(a.cfg, newCfg)
+	for _, line := range diffs {
+		a.log.Info("config diff", "change", line)
+	}
+	if len(diffs) == 0 {
+		a.log.Info("config reload noop — no struct changes")
+	}
+
 	// Auto-backup if the struct actually changed. Safe to run even on
 	// failure below — the backup is of the previous good state.
 	if backupPath, bErr := config.AutoBackupIfChanged(a.cfgPath, a.cfg, newCfg); bErr != nil {
-		log.Printf("auto-backup warning: %v", bErr)
+		a.log.Warn("auto-backup failed", "err", bErr.Error())
 	} else if backupPath != "" {
-		log.Printf("auto-backup written: %s", backupPath)
+		a.log.Info("auto-backup written", "path", backupPath)
 	}
 
 	for _, line := range res.NormalizeLog {
-		log.Printf("normalize: %s", line)
+		a.log.Info("config normalize", "change", line)
 	}
-	warnIfSSHPublic(newCfg)
+	warnIfSSHPublic(newCfg, a.log)
 
 	if err := a.applyFilter(newCfg); err != nil {
 		return err
@@ -524,17 +555,17 @@ func (a *agent) reload() error {
 			return fmt.Errorf("bypass toggle: %w", err)
 		}
 		if newCfg.Runtime.EmergencyBypass {
-			log.Printf("reload: emergency bypass ENABLED (XDP detached)")
+			a.log.Warn("emergency bypass enabled via reload", "xdp", "detached")
 		} else {
-			log.Printf("reload: emergency bypass DISABLED (XDP re-attached)")
+			a.log.Info("emergency bypass disabled via reload", "xdp", "reattached")
 		}
 	}
 
 	a.cfg = newCfg
 	if err := persistManagedConfig(a.mcfgPath, newCfg); err != nil {
-		log.Printf("managed config persist warning: %v", err)
+		a.log.Warn("managed config persist failed", "path", a.mcfgPath, "err", err.Error())
 	} else {
-		log.Printf("managed config updated: %s", a.mcfgPath)
+		a.log.Info("managed config updated", "path", a.mcfgPath)
 	}
 	return nil
 }
@@ -546,7 +577,7 @@ func (a *agent) setBypassRuntime(bypass bool, reason string) error {
 	defer a.mu.Unlock()
 
 	if a.cfg.Runtime.EmergencyBypass == bypass {
-		log.Printf("temporary bypass unchanged: bypass=%v reason=%s", bypass, reason)
+		a.log.Info("temporary bypass unchanged", "bypass", bypass, "reason", reason)
 		return nil
 	}
 	if err := a.loader.SetBypass(bypass); err != nil {
@@ -554,9 +585,9 @@ func (a *agent) setBypassRuntime(bypass bool, reason string) error {
 	}
 	a.cfg.Runtime.EmergencyBypass = bypass
 	if bypass {
-		log.Printf("temporary bypass ENABLED (reason=%s, not persisted)", reason)
+		a.log.Warn("temporary bypass enabled", "reason", reason, "persisted", false)
 	} else {
-		log.Printf("temporary bypass DISABLED (reason=%s, not persisted)", reason)
+		a.log.Info("temporary bypass disabled", "reason", reason, "persisted", false)
 	}
 	return nil
 }
@@ -567,8 +598,11 @@ func loadStartupConfig(cfgPath, managedCfgPath string) (*config.LoadResult, stri
 		if mErr == nil {
 			return res, "managed (" + managedCfgPath + ")", nil
 		}
-		log.Printf("managed config invalid (%s): %v", managedCfgPath, mErr)
-		log.Printf("falling back to user config: %s", cfgPath)
+		// No logger here — loadStartupConfig runs before the logger is
+		// built. Stderr is journald-visible so this still lands in
+		// `journalctl -u kekkai-agent`.
+		fmt.Fprintf(os.Stderr, "managed config invalid (%s): %v\n", managedCfgPath, mErr)
+		fmt.Fprintf(os.Stderr, "falling back to user config: %s\n", cfgPath)
 	}
 
 	res, err := config.Load(cfgPath)
@@ -594,16 +628,16 @@ func persistManagedConfig(path string, cfg *config.Config) error {
 }
 
 // warnIfSSHPublic shouts into the log whenever SSH is intentionally
-// exposed via security.allow_ssh_public. Three lines so nobody misses it.
-func warnIfSSHPublic(cfg *config.Config) {
+// exposed via security.allow_ssh_public. WARN level so it lands in the
+// MOTD-reachable slice of journal output.
+func warnIfSSHPublic(cfg *config.Config, l *logx.Logger) {
 	if !cfg.Security.AllowSSHPublic {
 		return
 	}
 	for _, p := range cfg.Filter.Public.TCP {
 		if p == config.SSHPort {
-			log.Printf("=========================================================")
-			log.Printf("SECURITY WARNING: SSH (port 22) is in filter.public.tcp")
-			log.Printf("=========================================================")
+			l.Warn("SECURITY: SSH (port 22) is in filter.public.tcp",
+				"security.allow_ssh_public", true)
 			return
 		}
 	}

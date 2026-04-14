@@ -25,6 +25,10 @@ type Values struct {
 	InterfaceXDPMode string
 	UpdateChannel    string
 
+	AutoUpdateDownload bool
+	AutoUpdateReload   bool
+	AutoUpdateInterval int
+
 	EmergencyBypass bool
 	PerIPTableSize  uint32
 
@@ -49,10 +53,13 @@ type Values struct {
 // fields they have better information for (hostname, detected iface, ...).
 func DefaultValues() Values {
 	return Values{
-		NodeRegion:        "default",
-		InterfaceXDPMode:  DefaultXDPMode,
-		UpdateChannel:     DefaultUpdateChannel,
-		EmergencyBypass:   false,
+		NodeRegion:         "default",
+		InterfaceXDPMode:   DefaultXDPMode,
+		UpdateChannel:      DefaultUpdateChannel,
+		AutoUpdateDownload: DefaultAutoUpdateDownload,
+		AutoUpdateReload:   false,
+		AutoUpdateInterval: DefaultAutoUpdateInterval,
+		EmergencyBypass:    false,
 		PerIPTableSize:    DefaultPerIPTableSize,
 		StatsFile:         DefaultStatsFile,
 		EnforceSSHPrivate: true,
@@ -77,6 +84,9 @@ func Render(v Values) string {
 	}
 	if v.UpdateChannel == "" {
 		v.UpdateChannel = DefaultUpdateChannel
+	}
+	if v.AutoUpdateInterval == 0 {
+		v.AutoUpdateInterval = DefaultAutoUpdateInterval
 	}
 	if v.PerIPTableSize == 0 {
 		v.PerIPTableSize = DefaultPerIPTableSize
@@ -109,6 +119,9 @@ func Render(v Values) string {
 	replace("__INTERFACE_NAME__", v.InterfaceName)
 	replace("__INTERFACE_XDP_MODE__", v.InterfaceXDPMode)
 	replace("__UPDATE_CHANNEL__", v.UpdateChannel)
+	replace("__AUTO_UPDATE_DOWNLOAD__", boolYAML(v.AutoUpdateDownload))
+	replace("__AUTO_UPDATE_RELOAD__", boolYAML(v.AutoUpdateReload))
+	replace("__AUTO_UPDATE_INTERVAL__", strconv.FormatInt(int64(v.AutoUpdateInterval), 10))
 	replace("__RUNTIME_EMERGENCY_BYPASS__", boolYAML(v.EmergencyBypass))
 	replace("__RUNTIME_PERIP_TABLE_SIZE__", strconv.FormatUint(uint64(v.PerIPTableSize), 10))
 	replace("__OBSERVABILITY_STATS_FILE__", v.StatsFile)

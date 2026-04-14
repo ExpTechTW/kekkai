@@ -13,5 +13,11 @@ const (
 	DefaultUpdateChannel   = "release"
 	DefaultUDPEphemeralMin = uint16(32768)
 
+	// Auto-update defaults. Download is on by default so fresh installs
+	// always pick up release fixes without operator action; reload stays
+	// off so nobody gets surprised by an agent self-restart.
+	DefaultAutoUpdateDownload = true
+	DefaultAutoUpdateInterval = 1 // hours
+
 	SSHPort = uint16(22)
 )
