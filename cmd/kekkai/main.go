@@ -25,9 +25,10 @@ import (
 	"github.com/ExpTechTW/kekkai/internal/tui"
 )
 
-// version is injected at build time via -ldflags. Defaults to repository
-// version constant when building with plain `go build`.
-var version = buildinfo.DefaultVersion
+// version is injected at build time via -ldflags:
+//   -X main.version=YYYYMMDD+bN
+// Keep default empty so linker override works reliably.
+var version string
 
 const defaultConfigPath = "/etc/kekkai/kekkai.yaml"
 const agentBinary = "/usr/local/bin/kekkai-agent"
@@ -35,6 +36,10 @@ const agentUnit = "kekkai-agent"
 const bypassUsage = "usage: kekkai bypass on|off [--save] [config]"
 
 func main() {
+	if version == "" {
+		version = buildinfo.DefaultVersion
+	}
+
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)

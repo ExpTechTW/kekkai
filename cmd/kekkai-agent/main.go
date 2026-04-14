@@ -28,11 +28,16 @@ import (
 	"github.com/ExpTechTW/kekkai/internal/stats"
 )
 
-// version is injected at build time via -ldflags. It exists in agent too so
-// release workflows can stamp both binaries from one value.
-var version = buildinfo.DefaultVersion
+// version is injected at build time via -ldflags:
+//   -X main.version=YYYYMMDD+bN
+// Keep default empty so linker override works reliably.
+var version string
 
 func main() {
+	if version == "" {
+		version = buildinfo.DefaultVersion
+	}
+
 	cfgPath := flag.String("config", "/etc/kekkai/kekkai.yaml", "path to edge config")
 	managedCfgPath := flag.String("managed-config", "", "path to agent-managed last-known-good config (default: <config>.agent.yaml)")
 	check := flag.Bool("check", false, "validate config and exit (non-zero on error)")
