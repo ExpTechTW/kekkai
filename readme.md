@@ -39,13 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/scripts/delet
   | sudo bash -s -- --yes --purge-home
 ```
 
-或用 repo 模式（開發者）：
-
-```bash
-git clone git@github.com:ExpTechTW/kekkai.git
-cd kekkai
-bash ./kekkai.sh
-```
+kekkai 已改成純 release 分發：沒有原始碼建置模式，目標機不需要 Go / clang / git。所有安裝／升級都走 GitHub Releases 的預編 binary，由 `kekkai.sh` 一鍵腳本處理。
 
 安裝後建議流程：
 
@@ -67,7 +61,7 @@ sudo kekkai status
 > 注意：預設 `filter.ingress_allowlist` 會先放 `192.168.0.0/16` 避免初次啟動被 SSH 防呆擋住；請務必改成你的實際管理網段。
 
 > 所有指令細節（`status/check/ports/show/backup/reload/bypass/update/reset/doctor`）已移到 [`COMMAND_ZH.md`](COMMAND_ZH.md)。  
-> `kekkai update` 來源可由 `update.channel` 設為 `git:main` / `release` / `pre-release`。
+> `kekkai update` 來源可由 `update.channel` 設為 `release`（預設）或 `pre-release`。
 
 GitHub Releases 會提供各平台檔案（`kekkai-*` 與 `kekkai-agent-*`）：
 

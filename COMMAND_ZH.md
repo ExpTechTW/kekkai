@@ -462,52 +462,60 @@ sudo systemctl reload kekkai-agent
 
 ---
 
-## 七、安裝 / 更新 / 建置
+## 七、安裝 / 更新
 
-所有生命週期動作統一走 `./kekkai.sh`（或 `make` 別名）。單一腳本會自動偵測當前狀態並執行對應 subcommand。
+kekkai 是**純 release 分發**：目標機不需要 Go、git、clang，也不需要 clone repo。所有生命週期動作走 `/usr/local/bin/kekkai.sh`（由一鍵安裝腳本落地），內部只做「下載 GitHub release 資產 → 安裝 → 重啟 service」。
 
 ### 7.1 一鍵安裝（推薦）
 
 ```bash
-cd /path/to/kekkai
-bash ./kekkai.sh                        # 自動偵測狀態
+curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh \
+  | sudo bash -s -- install
 ```
 
-決策流程：
-1. binary 都不存在 → `install`（裝依賴、編譯、安裝、寫 config、裝 systemd、啟動 service）
-2. binary 有但 systemd unit 缺 → `repair`
-3. 全部都在、git 有新 commit → `update`
-4. 全部都在、沒新 commit → `doctor`（只報告不改）
-
-顯式 subcommand：
+若要固定更新通道為 pre-release：
 
 ```bash
-bash ./kekkai.sh install                # 強制走 install
-bash ./kekkai.sh update                 # 強制走 update（依 update.channel 決定來源）
-bash ./kekkai.sh repair                 # 補裝缺失的 binary / unit
-bash ./kekkai.sh doctor                 # read-only 健康檢查
-bash ./kekkai.sh uninstall              # 移除 binary + unit，config 保留
+curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh \
+  | KEKKAI_UPDATE_CHANNEL=pre-release sudo bash -s -- install
 ```
 
-或用 Makefile 別名：`make install` / `make update` / `make repair` / `make doctor` / `make uninstall`
+安裝器會把 `kekkai.sh` 自己也落地到 `/usr/local/bin/kekkai.sh`，之後 `sudo kekkai update` 會找到它。
 
-### 7.2 腳本旗標
+### 7.2 生命週期 subcommand
+
+直接跑 `/usr/local/bin/kekkai.sh`（或用 `sudo kekkai update`）：
 
 ```bash
-bash ./kekkai.sh --no-install           # 跳過 apt 依賴安裝
-bash ./kekkai.sh --iface eth1           # reset/install 時指定網卡
-bash ./kekkai.sh --run                  # 裝完前景跑 agent（debug）
-bash ./kekkai.sh --force                # 略過 dirty tree / branch 不符 / 降級保護
+sudo bash /usr/local/bin/kekkai.sh install     # 強制重裝
+sudo bash /usr/local/bin/kekkai.sh update      # 檢查 release 有無新版
+sudo bash /usr/local/bin/kekkai.sh repair      # 補裝缺失的 binary / unit
+sudo bash /usr/local/bin/kekkai.sh doctor      # read-only 健康檢查
+sudo bash /usr/local/bin/kekkai.sh uninstall   # 移除 binary + unit，config 保留
 ```
 
-`update.channel` 設定在 `/etc/kekkai/kekkai.yaml`：
+`sudo kekkai update` 是 `sudo bash /usr/local/bin/kekkai.sh update` 的等價捷徑。
+
+### 7.3 腳本旗標
+
+```bash
+bash kekkai.sh --no-install     # 跳過 apt 依賴安裝
+bash kekkai.sh --iface eth1     # install 時指定網卡
+bash kekkai.sh --run            # 裝完前景跑 agent（debug）
+```
+
+### 7.4 Update channel
+
+設定在 `/etc/kekkai/kekkai.yaml`：
 
 ```yaml
 update:
-  channel: release     # git:main | release | pre-release
+  channel: release     # release（預設）或 pre-release
 ```
 
-### 7.3 安裝完成後
+或用 env 臨時覆蓋：`sudo KEKKAI_UPDATE_CHANNEL=pre-release kekkai update`
+
+### 7.5 安裝完成後
 
 ```bash
 sudo nano /etc/kekkai/kekkai.yaml             # 填 ingress_allowlist
@@ -522,31 +530,19 @@ sudo kekkai status                              # 看 TUI
 - `kekkai.sh` 安裝時若偵測到管理介面 IP 不在 `192.168.0.0/16`，會印警告。
 - 實際上線前請務必改成你的管理網段（例如 `10.0.0.0/8`、`172.16.0.0/12`、Tailscale 網段）。
 
-### 7.4 更新流程內部細節
+### 7.6 更新流程內部細節
 
-`bash ./kekkai.sh update` 會依 `update.channel` 走不同路徑（都含 rollback）：
+`sudo kekkai update` 做的事：
 
-- `git:main`：
-  1. 還原 `internal/loader/bpf/xdp_filter.o`（避免上次 build 殘留 dirty）
-  2. 檢查 working tree 乾淨，不乾淨列 `git status --short` 後終止
-  3. `git fetch origin main` + `git merge --ff-only`
-  4. `make bpf && make build`
-  5. 用新 binary 跑 `kekkai-agent -check` 驗當前 config（失敗中止）
-  6. 安裝新 `kekkai-agent` + `kekkai`，`systemctl restart`，失敗自動 rollback
+1. 從 `https://github.com/ExpTechTW/kekkai/releases` 抓目標 channel（release / pre-release）的最新資產
+2. 下載 `kekkai-agent-linux-<arch>` 和 `kekkai-linux-<arch>` 到 tmp 目錄
+3. 用新 agent binary 跑 `-check` 驗 `/etc/kekkai/kekkai.yaml`（失敗中止，不動 service）
+4. 三路 diff：agent / cli / kekkai.sh 個別比對 sha256，每個獨立決定要不要更新
+5. agent 有變 → `systemctl restart kekkai-agent`（失敗自動 rollback 到 `kekkai-agent.prev`）
+6. cli 或 kekkai.sh 有變 → 個別覆寫，不 restart service
+7. 最後印藍色 `UPDATED`（有變）或綠色 `ALREADY UP-TO-DATE`（全部沒變）結果區塊
 
-- `release`：
-  1. 從 `https://github.com/ExpTechTW/kekkai/releases` 抓最新 stable release 資產
-  2. 驗 config
-  3. 安裝 binary + restart，失敗自動 rollback
-
-- `pre-release`：
-  1. 從 `https://github.com/ExpTechTW/kekkai/releases` 抓最新 pre-release 資產
-  2. 驗 config
-  3. 安裝 binary + restart，失敗自動 rollback
-
-可臨時覆蓋：`sudo KEKKAI_UPDATE_CHANNEL=release kekkai update`
-
-### 7.5 手動建置
+### 7.7 開發者本機建置（maintainer 用）
 
 ```bash
 make bpf              # 只編 eBPF .o
@@ -688,11 +684,9 @@ journalctl -u kekkai-agent -n 30 --no-pager
 主要會看這些環境變數：
 
 - `NO_COLOR`：關閉彩色輸出
-- `KEKKAI_REPO`：`kekkai update` 在非 repo 目錄時指定 repo 根目錄
-- `KEKKAI_SCRIPT`：直接指定 `kekkai.sh` 路徑
-- `KEKKAI_UPDATE_CHANNEL`：臨時覆蓋 `update.channel`（`release` / `pre-release` / `git:main`）
-- `KEKKAI_GIT_ACCEPT_NEW_HOSTKEY`：控制 update 時 git SSH 的 `accept-new` 行為（`1` 預設啟用）
-- `GIT_SSH_COMMAND`：覆蓋 git SSH 行為（進階用途）
+- `KEKKAI_SCRIPT`：直接指定 `kekkai.sh` 路徑（預設 `/usr/local/bin/kekkai.sh`）
+- `KEKKAI_REPO`：指定 `kekkai.sh` 所在目錄（罕用，大部分人用預設就好）
+- `KEKKAI_UPDATE_CHANNEL`：臨時覆蓋 `update.channel`（`release` / `pre-release`）
 
 ---
 
@@ -774,4 +768,4 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 | `kekkai start/stop/restart/enable/disable` | M7 | systemctl 包裝 |
 | `kekkai stats`                | M7 | 印 `stats.txt` 一次（script 友善） |
 
-`kekkai update` 已整進 CLI，內部仍委派給 `kekkai.sh update`，所以更新/rollback/安全檢查邏輯維持單一來源。找不到 `kekkai.sh` 時，可在 repo root 執行，或設定 `KEKKAI_REPO=/path/to/waf-go`。
+`kekkai update` 已整進 CLI，內部委派給 `/usr/local/bin/kekkai.sh update`（安裝器會自動落地這份腳本）。更新 / rollback / 結果區塊等邏輯全部集中在 `kekkai.sh` 單一來源。

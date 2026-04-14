@@ -41,12 +41,10 @@ interface:
 
 # ---------- update channel ----------
 update:
-  # EN: Select where `kekkai update` gets binaries/code from:
-  #     - git:main    -> use local repo fast-forward + build (developer mode)
-  #     - release     -> download latest stable release from GitHub Releases
-  #     - pre-release -> download latest pre-release from GitHub Releases
-  # ZH: 指定 `kekkai update` 更新來源：
-  #     - git:main    -> 走本地 repo fast-forward + build（開發模式）
+  # EN: Select where `kekkai update` downloads its release assets from:
+  #     - release     -> latest stable release from GitHub Releases
+  #     - pre-release -> latest pre-release from GitHub Releases
+  # ZH: 指定 `kekkai update` 下載來源：
   #     - release     -> 從 GitHub Releases 抓最新穩定版
   #     - pre-release -> 從 GitHub Releases 抓最新預發布版
   channel: __UPDATE_CHANNEL__

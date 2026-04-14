@@ -499,22 +499,11 @@ func cmdUpdate(args []string) int {
 		return 1
 	}
 
-	var c *exec.Cmd
-	if os.Geteuid() == 0 && os.Getenv("SUDO_USER") != "" {
-		// `kekkai` may be aliased to `sudo /usr/local/bin/kekkai`.
-		// Update needs git auth from the real user account, so drop back.
-		realUser := os.Getenv("SUDO_USER")
-		sudoArgs := []string{
-			"-u", realUser,
-			"--preserve-env=KEKKAI_SCRIPT,KEKKAI_REPO,KEKKAI_GIT_ACCEPT_NEW_HOSTKEY,GIT_SSH_COMMAND,KEKKAI_UPDATE_CHANNEL",
-			"bash", script, "update",
-		}
-		sudoArgs = append(sudoArgs, args...)
-		c = exec.Command("sudo", sudoArgs...)
-	} else {
-		cmdArgs := append([]string{script, "update"}, args...)
-		c = exec.Command("bash", cmdArgs...)
-	}
+	// kekkai update pulls prebuilt release assets from GitHub — no git /
+	// SSH key required, so we just run kekkai.sh under the current (root)
+	// uid. requireRoot() above guarantees we're already root.
+	cmdArgs := append([]string{script, "update"}, args...)
+	c := exec.Command("bash", cmdArgs...)
 	return runCommand(c, fmt.Sprintf("run %s update", script))
 }
 
@@ -527,11 +516,11 @@ func resolveUpdateScript() (string, []string) {
 	if repo := strings.TrimSpace(os.Getenv("KEKKAI_REPO")); repo != "" {
 		candidates = append(candidates, filepath.Join(repo, "kekkai.sh"))
 	}
-	// Common default clone location.
+	// Common default clone location (legacy / dev).
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
 		candidates = append(candidates, filepath.Join(home, "kekkai", "kekkai.sh"))
 	}
-	// When launched via sudo alias, prefer the original user's home.
+	// When running as root via sudo, also look in the invoking user's home.
 	if sudoUser := strings.TrimSpace(os.Getenv("SUDO_USER")); sudoUser != "" {
 		candidates = append(candidates, filepath.Join("/home", sudoUser, "kekkai", "kekkai.sh"))
 	}

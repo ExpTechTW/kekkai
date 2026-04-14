@@ -257,8 +257,6 @@ func checkUpdateStatus(channel, current string) (state, latest, hint string) {
 		channel = "release"
 	}
 	switch channel {
-	case "git:main":
-		return "n/a", "", "update check via status is release-only (channel=git:main)"
 	case "release", "pre-release":
 	default:
 		return "error", "", "unsupported update channel: " + channel
