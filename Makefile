@@ -3,7 +3,7 @@ CLI_BIN   := kekkai
 AGENT_PKG := ./cmd/kekkai-agent
 CLI_PKG   := ./cmd/kekkai
 
-DATE_UTC := $(shell date -u +%Y%m%d)
+DATE_UTC := $(shell date -u +%Y.%m.%d)
 GIT_SHA  := $(shell git rev-parse --short HEAD 2>/dev/null || echo nosha)
 VERSION ?= $(DATE_UTC)+$(GIT_SHA)
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"

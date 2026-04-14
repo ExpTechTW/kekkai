@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   meta:
     runs-on: ubuntu-latest
@@ -18,22 +22,59 @@ jobs:
     steps:
       - name: Compute release version
         id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          VERSION="$(date -u +%Y%m%d)+b${GITHUB_RUN_NUMBER}"
+          VERSION="$(python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+          from datetime import datetime, timezone
+
+          token = os.environ.get("GH_TOKEN", "").strip()
+          repo = os.environ.get("GH_REPO", "").strip()
+          if not token or not repo:
+              raise SystemExit("missing GH_TOKEN or GH_REPO")
+
+          day = datetime.now(timezone.utc).strftime("%Y.%m.%d")
+          prefix = f"v{day}+build."
+          max_n = 0
+          page = 1
+          pat = re.compile(rf"^v{re.escape(day)}\+build\.(\d+)$")
+
+          while page <= 5:
+              url = f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}"
+              req = urllib.request.Request(url)
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("Authorization", f"Bearer {token}")
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  data = json.loads(resp.read().decode("utf-8"))
+              if not data:
+                  break
+              for rel in data:
+                  tag = (rel.get("tag_name") or "").strip()
+                  m = pat.match(tag)
+                  if not m:
+                      continue
+                  n = int(m.group(1))
+                  if n > max_n:
+                      max_n = n
+              page += 1
+
+          print(f"{day}+build.{max_n + 1}")
+          PY
+          )"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Decide release mode by branch and commit message
         id: mode
         env:
-          HEAD_MSG: ${{ github.event.head_commit.message }}
           BRANCH_NAME: ${{ github.ref_name }}
         run: |
           if [[ "$BRANCH_NAME" == "main" ]]; then
-            if printf '%s\n' "$HEAD_MSG" | grep -qi 'build:'; then
-              echo "mode=pre-release" >> "$GITHUB_OUTPUT"
-            else
-              echo "mode=none" >> "$GITHUB_OUTPUT"
-            fi
+            echo "mode=pre-release" >> "$GITHUB_OUTPUT"
           elif [[ "$BRANCH_NAME" == "release" ]]; then
             echo "mode=release" >> "$GITHUB_OUTPUT"
           else

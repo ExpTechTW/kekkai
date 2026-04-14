@@ -29,7 +29,7 @@ kekkai status                              # 預設讀 /etc/kekkai/kekkai.yaml
 kekkai status /path/to/kekkai.yaml           # 指定 config 路徑
 ```
 
-需要 root 才能讀 pinned eBPF maps：
+一般情況不需要 root。若主機有額外 LSM/硬化策略擋住 bpffs 讀取，再改用 sudo：
 
 ```bash
 sudo kekkai status
@@ -620,7 +620,7 @@ RPi 的 `macb` / `bcmgenet` driver 沒有 native XDP 支援。這是驅動層限
 
 ### 9.4 `kekkai status` 回報 `open pinned stats map`
 
-代表 agent 沒在跑，或 bpffs 沒掛。
+通常代表 agent 沒在跑、bpffs 沒掛，或主機策略限制了 bpffs 讀取權限。
 
 ```bash
 systemctl is-active kekkai-agent              # 確認 agent 跑著
@@ -629,6 +629,7 @@ ls /sys/fs/bpf/kekkai/                    # 確認 pin 路徑有檔案
 ```
 
 bpffs 沒掛：`sudo mount -t bpf bpf /sys/fs/bpf`。
+若一般使用者仍 permission denied：先試 `sudo kekkai status` 驗證是否純權限問題。
 
 ### 9.5 `kekkai.sh update` 中止且 rollback
 
@@ -716,6 +717,7 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 | 指令 | 實作 | 說明 |
 |---|---|---|
 | `kekkai status [path]`          | ✅ | 互動式 TUI |
+| `kekkai config [path]`          | ✅ | 用 nano 編輯 config，退出後自動 reload |
 | `kekkai doctor`                 | ✅ | 全系統健康檢查（read-only） |
 | `kekkai check [path]`           | ✅ | 驗證 config (read-only) |
 | `kekkai ports [path]`           | ✅ | 彩色列出 public/private port 與 SSH 暴露狀態 |
