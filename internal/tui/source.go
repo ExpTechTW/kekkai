@@ -6,9 +6,12 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 	"sort"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -71,14 +74,12 @@ type Snapshot struct {
 func NewSource(iface string) (*Source, error) {
 	st, err := ebpf.LoadPinnedMap(bpffsRoot+"/stats", nil)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"open pinned stats map: %w\n(is kekkai-agent running? maps are pinned under %s)",
-			err, bpffsRoot)
+		return nil, wrapOpenErr("stats", err)
 	}
 	perip, err := ebpf.LoadPinnedMap(bpffsRoot+"/perip_v4", nil)
 	if err != nil {
 		st.Close()
-		return nil, fmt.Errorf("open pinned perip_v4 map: %w", err)
+		return nil, wrapOpenErr("perip_v4", err)
 	}
 
 	cap := int(perip.MaxEntries())
@@ -95,6 +96,26 @@ func NewSource(iface string) (*Source, error) {
 		perCPU:      make([]uint64, 0, 128),
 		topBuf:      make([]topRow, 0, cap),
 	}, nil
+}
+
+// wrapOpenErr annotates pinned-map open failures. EACCES almost always means
+// the user is non-root on a distro that sets kernel.unprivileged_bpf_disabled
+// (Debian / Ubuntu / Pi OS default), which blocks bpf(BPF_OBJ_GET) regardless
+// of file caps. Tell the operator to rerun with sudo.
+func wrapOpenErr(which string, err error) error {
+	if errors.Is(err, syscall.EACCES) || errors.Is(err, os.ErrPermission) {
+		if os.Geteuid() != 0 {
+			return fmt.Errorf(
+				"open pinned %s map: %w\nkekkai CLI must run as root — retry with: sudo kekkai status",
+				which, err)
+		}
+		return fmt.Errorf(
+			"open pinned %s map: %w\n(kernel.unprivileged_bpf_disabled is set; even root may need sysctl=0 if this persists)",
+			which, err)
+	}
+	return fmt.Errorf(
+		"open pinned %s map: %w\n(is kekkai-agent running? maps are pinned under %s)",
+		which, err, bpffsRoot)
 }
 
 func (s *Source) Close() {

@@ -48,7 +48,6 @@ type InterfaceConfig struct {
 
 type UpdateConfig struct {
 	// Channel controls `kekkai update` source.
-	// - git:main    : fast-forward + local build from repository
 	// - release     : latest stable GitHub release asset
 	// - pre-release : latest pre-release GitHub release asset
 	Channel string `yaml:"channel"`
@@ -347,9 +346,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("interface.xdp_mode: invalid %q (want generic|driver|offload)", c.Interface.XDPMode)
 	}
 	switch c.Update.Channel {
-	case "git:main", "release", "pre-release":
+	case "release", "pre-release":
 	default:
-		return fmt.Errorf("update.channel: invalid %q (want git:main|release|pre-release)", c.Update.Channel)
+		return fmt.Errorf("update.channel: invalid %q (want release|pre-release)", c.Update.Channel)
 	}
 
 	tcpSeen, udpSeen := map[uint16]string{}, map[uint16]string{}

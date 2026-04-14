@@ -12,7 +12,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+
+	"github.com/ExpTechTW/kekkai/internal/buildinfo"
 )
 
 // Status is the traffic-light value for a single check.
@@ -96,6 +99,8 @@ func (r *Runner) Summary() Summary {
 func (r *Runner) Render(w io.Writer, colour bool) {
 	p := newPalette(colour)
 	fmt.Fprintln(w, p.title("  ◈ KEKKAI doctor  結界 ·  diagnostic report"))
+	fmt.Fprintln(w, p.dim(fmt.Sprintf("  kekkai %s · %s/%s",
+		buildinfo.DefaultVersion, runtime.GOOS, runtime.GOARCH)))
 	fmt.Fprintln(w, p.dim("  ---------------------------------------------"))
 	fmt.Fprintln(w)
 

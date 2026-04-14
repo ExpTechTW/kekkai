@@ -4,29 +4,38 @@
 # Usage:
 #   bash kekkai.sh               # auto-detect state and do the right thing
 #   bash kekkai.sh install       # force first-time install
-#   bash kekkai.sh update        # force update (source depends on update.channel)
+#   bash kekkai.sh update        # force update (pulls prebuilt release assets)
 #   bash kekkai.sh repair        # force re-install of binaries + systemd unit
 #   bash kekkai.sh doctor        # read-only health check (delegates to `kekkai doctor`)
 #   bash kekkai.sh uninstall     # remove everything except config
 #
 # Flags (apply to any subcommand):
-#   --force       bypass safety checks (dirty tree, branch mismatch, downgrade)
 #   --no-install  skip apt dependency install
 #   --iface NAME  force a specific interface in the default config
 #   --run         launch the agent in foreground at the end (debugging)
-#   --sudo-shortcut     force enable passwordless `kekkai` sudo + shell alias
-#   --no-sudo-shortcut  disable passwordless sudo shortcut setup
+#
+# Update model: kekkai is distributed as prebuilt GitHub release binaries.
+# `update.channel` may be `release` (default) or `pre-release`. There is no
+# source-build mode — operators never need Go, git, clang, or this repo on
+# the target host.
+#
+# Runtime note: kekkai CLI always runs under sudo (e.g. `sudo kekkai status`)
+# because on Debian/Ubuntu/Pi OS the kernel sysctl
+# `kernel.unprivileged_bpf_disabled` blocks non-root bpf() regardless of caps.
+# The installer writes a sudoers drop-in (/etc/sudoers.d/kekkai-cli-<user>)
+# so `sudo kekkai ...` won't prompt for a password. No shell alias is added —
+# users should type literal `sudo kekkai` to build portable muscle memory.
 #
 # Auto-detect logic (no subcommand):
 #   - no binaries yet            → install
 #   - binaries present but no systemd unit OR unit disabled → repair
-#   - everything installed + update source has new version → update
-#   - everything installed + no new commits → doctor
+#   - otherwise                  → doctor (use `update` subcommand explicitly
+#                                  to check for a new release)
 #
 set -euo pipefail
 
 # ROOT resolution:
-# - repo mode: directory containing kekkai.sh (normal git clone usage)
+# - normal: directory containing kekkai.sh on disk (/usr/local/bin or dev dir)
 # - raw mode (`bash <(curl ...)`): fallback to ~/kekkai (or $KEKKAI_REPO)
 #   because $0 becomes /dev/fd/* and is not a writable project directory.
 resolve_root() {
@@ -75,6 +84,9 @@ persist_self_script
 AGENT_BIN=/usr/local/bin/kekkai-agent
 CLI_BIN=/usr/local/bin/kekkai
 ROLLBACK_BIN=/usr/local/bin/kekkai-agent.prev
+SCRIPT_INSTALL_PATH=/usr/local/bin/kekkai.sh
+BASH_COMPLETION_DST=/usr/share/bash-completion/completions/kekkai
+ZSH_COMPLETION_DST=/usr/share/zsh/vendor-completions/_kekkai
 CONFIG_DIR=/etc/kekkai
 CONFIG_FILE="$CONFIG_DIR/kekkai.yaml"
 STATS_DIR=/var/run/kekkai
@@ -84,33 +96,29 @@ UNIT_SRC="$ROOT/deploy/systemd/kekkai-agent.service"
 UNIT_DST="/etc/systemd/system/$UNIT_NAME"
 SUDOERS_DIR=/etc/sudoers.d
 SUDOERS_FILE_PREFIX=kekkai-cli-
-GO_MIN="1.22"
-GO_DOWNLOAD_VERSION="1.23.4"
+LOCAL_AGENT_BIN="$ROOT/bin/kekkai-agent"
+LOCAL_CLI_BIN="$ROOT/bin/kekkai"
 BRANCH=main
 REPO_OWNER=ExpTechTW
 REPO_NAME=kekkai
 RELEASES_API_BASE="https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases"
+RAW_BASE="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME"
 
 # ---------------------------------------------------------------------------
 # CLI parsing
 # ---------------------------------------------------------------------------
 CMD=""
-FORCE=0
 DO_INSTALL_DEPS=1
 IFACE_OVERRIDE=""
 DO_RUN=0
-SETUP_SUDO_SHORTCUT=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     install|update|repair|doctor|uninstall)
       CMD="$1"; shift ;;
-    --force)       FORCE=1; shift ;;
     --no-install)  DO_INSTALL_DEPS=0; shift ;;
     --iface)       IFACE_OVERRIDE="$2"; shift 2 ;;
     --run)         DO_RUN=1; shift ;;
-    --sudo-shortcut) SETUP_SUDO_SHORTCUT=1; shift ;;
-    --no-sudo-shortcut) SETUP_SUDO_SHORTCUT=0; shift ;;
     -h|--help)
       sed -n '2,23p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -128,9 +136,10 @@ if [[ -t 1 ]] && [[ "${NO_COLOR:-}" == "" ]]; then
   C_WARN=$'\033[1;33m'  # yellow
   C_ERR=$'\033[1;31m'   # red
   C_INFO=$'\033[1;36m'  # cyan
+  C_BLUE=$'\033[1;34m'  # blue — "something changed" accent for update results
   C_TITLE=$'\033[1;35m' # violet — kekkai barrier theme
 else
-  C_RESET=""; C_DIM=""; C_BOLD=""; C_OK=""; C_WARN=""; C_ERR=""; C_INFO=""; C_TITLE=""
+  C_RESET=""; C_DIM=""; C_BOLD=""; C_OK=""; C_WARN=""; C_ERR=""; C_INFO=""; C_BLUE=""; C_TITLE=""
 fi
 
 step() { printf '\n%s◈ %s%s\n' "$C_TITLE" "$*" "$C_RESET"; }
@@ -184,25 +193,15 @@ OS="$(detect_os)"
 ARCH="$(detect_arch)"
 
 # ---------------------------------------------------------------------------
-# Repo / source detection
-# ---------------------------------------------------------------------------
-# If we're inside the kekkai git repo the script can build from source.
-# Otherwise it would need a prebuilt binary — not available yet, so error.
-SOURCE_MODE="repo"
-if [[ ! -d "$ROOT/.git" ]] || [[ ! -f "$ROOT/go.mod" ]]; then
-  SOURCE_MODE="release"
-fi
-
 # ---------------------------------------------------------------------------
 # State detection — which subcommand should auto mode run?
 # ---------------------------------------------------------------------------
 detect_state() {
-  # Returns one of: install / repair / update / healthy.
+  # Returns one of: install / repair / healthy.
   #
-  # "update" is triggered by either:
-  #   a) the remote has commits we don't
-  #   b) the local HEAD is newer than the installed agent binary's
-  #      mtime — meaning the user already pulled but never rebuilt.
+  # Update detection from the installed state is no longer automatic —
+  # operators run `kekkai update` explicitly when they want to check GitHub
+  # releases. The auto-mode path just ensures the local install is sane.
   if [[ ! -x "$AGENT_BIN" ]] || [[ ! -x "$CLI_BIN" ]]; then
     echo install
     return
@@ -222,38 +221,6 @@ detect_state() {
     return
   fi
 
-  if [[ "$SOURCE_MODE" == "repo" ]] && command -v git >/dev/null 2>&1; then
-    git fetch origin "$BRANCH" >/dev/null 2>&1 || true
-
-    local head remote
-    head="$(git rev-parse HEAD 2>/dev/null || echo "")"
-    remote="$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo "")"
-
-    # (a) Remote has new commits → clearly need to update.
-    if [[ -n "$head" ]] && [[ -n "$remote" ]] && [[ "$head" != "$remote" ]]; then
-      echo update
-      return
-    fi
-
-    # (b) Local HEAD is newer than the installed daemon binary. This
-    #     catches "user ran git pull but never rebuilt" — the repo is
-    #     caught up to origin but the binary on disk is stale.
-    if [[ -n "$head" ]]; then
-      local head_ts bin_ts
-      head_ts="$(git show -s --format=%ct "$head" 2>/dev/null || echo 0)"
-      if command -v stat >/dev/null 2>&1; then
-        # Prefer GNU stat, fall back to BSD stat.
-        bin_ts="$(stat -c %Y "$AGENT_BIN" 2>/dev/null || stat -f %m "$AGENT_BIN" 2>/dev/null || echo 0)"
-      else
-        bin_ts=0
-      fi
-      if [[ "$head_ts" != "0" ]] && [[ "$bin_ts" != "0" ]] && (( head_ts > bin_ts )); then
-        echo update
-        return
-      fi
-    fi
-  fi
-
   echo healthy
 }
 
@@ -271,42 +238,6 @@ install_deps() {
   $SUDO apt-get install -y --no-install-recommends \
     clang llvm libbpf-dev "linux-headers-$(uname -r)" \
     make gcc pkg-config ca-certificates curl
-}
-
-install_go() {
-  local tarball="go${GO_DOWNLOAD_VERSION}.${OS}-${ARCH}.tar.gz"
-  log "installing Go ${GO_DOWNLOAD_VERSION} to /usr/local/go"
-  curl -fsSL "https://go.dev/dl/${tarball}" -o "/tmp/${tarball}"
-  $SUDO rm -rf /usr/local/go
-  $SUDO tar -C /usr/local -xzf "/tmp/${tarball}"
-  rm -f "/tmp/${tarball}"
-  export PATH="/usr/local/go/bin:$PATH"
-  if ! grep -q '/usr/local/go/bin' "$HOME/.profile" 2>/dev/null; then
-    echo 'export PATH=/usr/local/go/bin:$PATH' >> "$HOME/.profile"
-  fi
-}
-
-ensure_go() {
-  [[ -x /usr/local/go/bin/go ]] && export PATH="/usr/local/go/bin:$PATH"
-
-  if ! command -v go >/dev/null 2>&1; then
-    warn "go not found"
-    [[ $DO_INSTALL_DEPS -eq 1 ]] || die "install go manually (>= $GO_MIN)"
-    install_go
-    return
-  fi
-  local ver major minor
-  ver="$(go env GOVERSION 2>/dev/null | sed 's/go//')"
-  major="${ver%%.*}"; minor="$(echo "$ver" | awk -F. '{print $2}')"
-  local need_major need_minor
-  need_major="${GO_MIN%%.*}"; need_minor="${GO_MIN##*.}"
-  if (( major < need_major )) || { (( major == need_major )) && (( minor < need_minor )); }; then
-    warn "go $ver too old (need >= $GO_MIN)"
-    [[ $DO_INSTALL_DEPS -eq 1 ]] || die "upgrade go manually"
-    install_go
-  else
-    log "go $ver ok"
-  fi
 }
 
 check_kernel() {
@@ -377,51 +308,19 @@ resolve_update_channel() {
   fi
   [[ -n "$ch" ]] || ch="release"
   case "$ch" in
-    git:main|release|pre-release) ;;
+    release|pre-release) ;;
     *)
-      warn "unknown update.channel '$ch' — fallback to git:main"
-      ch="git:main"
+      warn "unknown update.channel '$ch' — fallback to release"
+      ch="release"
       ;;
   esac
   echo "$ch"
 }
 
 prepare_binaries() {
-  if [[ "$SOURCE_MODE" == "repo" ]]; then
-    ensure_go
-    build_from_source
-    return 0
-  fi
-
   local channel
   channel="$(resolve_update_channel)"
-  case "$channel" in
-    release|pre-release)
-      fetch_release_binaries_to_root_bin "$channel"
-      ;;
-    git:main)
-      die "update.channel=git:main requires repo mode. For raw install use update.channel=release or pre-release."
-      ;;
-    *)
-      die "unsupported update.channel: $channel"
-      ;;
-  esac
-}
-
-# ---------------------------------------------------------------------------
-# Build from source (repo mode)
-# ---------------------------------------------------------------------------
-build_from_source() {
-  [[ "$SOURCE_MODE" == "repo" ]] || \
-    die "release binaries not available yet — clone the repo and run from there"
-
-  log "compiling eBPF object"
-  make bpf
-
-  log "compiling Go binaries (kekkai-agent + kekkai)"
-  make build
-  [[ -x "$ROOT/bin/kekkai-agent" ]] || die "build failed: bin/kekkai-agent missing"
-  [[ -x "$ROOT/bin/kekkai" ]]       || die "build failed: bin/kekkai missing"
+  fetch_release_binaries_to_root_bin "$channel"
 }
 
 install_binaries_from() {
@@ -441,10 +340,111 @@ install_binaries_from() {
 
   $SUDO install -D -m 0755 "$src_cli" "$CLI_BIN"
   log "installed: $CLI_BIN"
+
+  install_completions
+}
+
+# persist_script_for_updates puts a copy of kekkai.sh at /usr/local/bin/kekkai.sh
+# so future `sudo kekkai update` calls can find it via resolveUpdateScript().
+#
+# Three sources, in priority order:
+#   1. $ROOT/kekkai.sh (repo clone or persist_self_script() already worked)
+#   2. $0 itself, if it's a readable regular file (not /dev/fd/*)
+#   3. curl from the main branch on GitHub (last resort for one-shot
+#      `curl | bash` installs where $0 is /dev/fd/* and $ROOT is empty)
+persist_script_for_updates() {
+  [[ "$OS" == "linux" ]] || return 0
+
+  local src=""
+  if [[ -f "$ROOT/kekkai.sh" ]] && [[ -s "$ROOT/kekkai.sh" ]]; then
+    src="$ROOT/kekkai.sh"
+  elif [[ -r "$0" ]] && [[ -f "$0" ]]; then
+    src="$0"
+  fi
+
+  # Skip self-copy: if $0 is already the installed script (common during
+  # `sudo kekkai update`, where kekkai delegates to /usr/local/bin/kekkai.sh),
+  # `install` would error with "same file". Treat that case as already persisted.
+  if [[ -n "$src" ]]; then
+    local src_real dst_real
+    src_real="$(readlink -f "$src" 2>/dev/null || echo "$src")"
+    dst_real="$(readlink -f "$SCRIPT_INSTALL_PATH" 2>/dev/null || echo "$SCRIPT_INSTALL_PATH")"
+    if [[ "$src_real" == "$dst_real" ]]; then
+      return 0
+    fi
+    $SUDO install -D -m 0755 "$src" "$SCRIPT_INSTALL_PATH"
+    log "installed: $SCRIPT_INSTALL_PATH (for future 'sudo kekkai update')"
+    return 0
+  fi
+
+  # Fallback: fetch from GitHub. Acceptable here because we're already
+  # mid-install from curl|bash — the user has implicitly trusted main.
+  if command -v curl >/dev/null 2>&1; then
+    local tmp
+    tmp="$(mktemp)"
+    if curl -fsSL "$RAW_BASE/$BRANCH/kekkai.sh" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      $SUDO install -D -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"
+      rm -f "$tmp"
+      log "installed: $SCRIPT_INSTALL_PATH (fetched from $BRANCH — for future 'sudo kekkai update')"
+      return 0
+    fi
+    rm -f "$tmp"
+  fi
+
+  warn "could not persist kekkai.sh to $SCRIPT_INSTALL_PATH — 'sudo kekkai update' will need KEKKAI_SCRIPT set"
+}
+
+# fetch_or_copy_asset: stage a repo-tracked file at $1 (relative to $ROOT)
+# into a temp path. Prefers the on-disk copy; falls back to curl from
+# $RAW_BASE/$BRANCH/$1. Echoes the staged path on success, empty on failure.
+fetch_or_copy_asset() {
+  local rel="$1"
+  local local_src="$ROOT/$rel"
+  if [[ -f "$local_src" ]] && [[ -s "$local_src" ]]; then
+    echo "$local_src"
+    return 0
+  fi
+  command -v curl >/dev/null 2>&1 || return 1
+  local tmp
+  tmp="$(mktemp)"
+  if curl -fsSL "$RAW_BASE/$BRANCH/$rel" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    echo "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# install_completions drops the bash + zsh completion scripts into the
+# distro's standard vendor paths. Silently skips targets whose parent
+# dir doesn't exist (e.g. systems without zsh installed). Non-fatal.
+install_completions() {
+  [[ "$OS" == "linux" ]] || return 0
+
+  local bash_src zsh_src
+  bash_src="$(fetch_or_copy_asset contrib/completions/kekkai.bash)" || bash_src=""
+  zsh_src="$(fetch_or_copy_asset contrib/completions/_kekkai)"      || zsh_src=""
+
+  if [[ -n "$bash_src" ]] && [[ -d "$(dirname "$BASH_COMPLETION_DST")" ]]; then
+    $SUDO install -D -m 0644 "$bash_src" "$BASH_COMPLETION_DST"
+    log "installed: $BASH_COMPLETION_DST"
+  fi
+  if [[ -n "$zsh_src" ]] && [[ -d "$(dirname "$ZSH_COMPLETION_DST")" ]]; then
+    $SUDO install -D -m 0644 "$zsh_src" "$ZSH_COMPLETION_DST"
+    log "installed: $ZSH_COMPLETION_DST"
+  fi
+
+  # Clean up any temp files fetch_or_copy_asset may have created.
+  [[ -n "$bash_src" && "$bash_src" != "$ROOT"* ]] && rm -f "$bash_src"
+  [[ -n "$zsh_src"  && "$zsh_src"  != "$ROOT"* ]] && rm -f "$zsh_src"
+
+  if [[ -z "$bash_src" ]] && [[ -z "$zsh_src" ]]; then
+    warn "shell completions not installed (no local or remote source)"
+  fi
 }
 
 install_binaries() {
-  install_binaries_from "$ROOT/bin/kekkai-agent" "$ROOT/bin/kekkai"
+  install_binaries_from "$LOCAL_AGENT_BIN" "$LOCAL_CLI_BIN"
 }
 
 read_cli_version() {
@@ -456,61 +456,89 @@ read_cli_version() {
   echo "$v"
 }
 
-print_version_transition() {
-  local old_v="$1"
-  local new_v="$2"
-  info "version: ${old_v} -> ${new_v}"
+
+# print_update_result renders the final coloured summary block that users
+# should scan first after an update. Two states:
+#
+#   state=updated    → blue accent, headline "UPDATED"
+#   state=unchanged  → green accent, headline "ALREADY UP-TO-DATE"
+#
+# Args: state old_ver new_ver tag channel changed
+# `tag` / `channel` / `changed` may be empty. `changed` is a human-readable
+# comma-separated list of components that were actually rewritten (e.g.
+# "agent, cli, kekkai.sh") — only rendered for state=updated.
+print_update_result() {
+  local state="$1" old_v="$2" new_v="$3" tag="$4" channel="$5" changed="$6"
+  local accent headline
+  case "$state" in
+    updated)
+      accent="$C_BLUE"
+      headline="UPDATED"
+      ;;
+    unchanged)
+      accent="$C_OK"
+      headline="ALREADY UP-TO-DATE"
+      ;;
+    *)
+      accent="$C_INFO"
+      headline="$state"
+      ;;
+  esac
+
+  local bar="═══════════════════════════════════════════════"
+  echo
+  printf '%s%s%s\n' "$accent" "$bar" "$C_RESET"
+  printf '%s  ◈ %s%s\n' "$accent" "$headline" "$C_RESET"
+  printf '%s%s%s\n' "$accent" "$bar" "$C_RESET"
+  if [[ "$state" == "unchanged" ]]; then
+    printf '  %sversion%s    %s%s%s  (no change)\n' \
+      "$C_DIM" "$C_RESET" "$C_BOLD" "$new_v" "$C_RESET"
+  else
+    printf '  %sversion%s    %s%s%s  →  %s%s%s\n' \
+      "$C_DIM" "$C_RESET" \
+      "$C_DIM" "$old_v" "$C_RESET" \
+      "$C_BOLD" "$new_v" "$C_RESET"
+  fi
+  if [[ -n "$changed" ]]; then
+    printf '  %schanged%s    %s\n' "$C_DIM" "$C_RESET" "$changed"
+  fi
+  if [[ -n "$tag" ]]; then
+    printf '  %stag%s        %s\n' "$C_DIM" "$C_RESET" "$tag"
+  fi
+  if [[ -n "$channel" ]]; then
+    printf '  %schannel%s    %s\n' "$C_DIM" "$C_RESET" "$channel"
+  fi
+  printf '%s%s%s\n' "$accent" "$bar" "$C_RESET"
+  echo
 }
 
-setup_sudo_shortcut() {
-  [[ $SETUP_SUDO_SHORTCUT -eq 1 ]] || return 0
-  [[ "$OS" == "linux" ]] || { warn "--sudo-shortcut is Linux-only"; return 0; }
+setup_passwordless_sudo() {
+  # Install a sudoers drop-in so `sudo kekkai ...` never prompts for a
+  # password. Intentionally NO shell alias — we want the literal `sudo`
+  # keystrokes so users build the right muscle memory across hosts where
+  # the alias may not exist.
+  [[ "$OS" == "linux" ]] || return 0
 
   local target_user
   target_user="${SUDO_USER:-$USER}"
   if [[ -z "$target_user" ]] || [[ "$target_user" == "root" ]]; then
-    warn "skip sudo shortcut setup for root user"
-    return 0
-  fi
-
-  local target_home
-  target_home="$(eval echo "~$target_user")"
-  if [[ -z "$target_home" ]] || [[ ! -d "$target_home" ]]; then
-    warn "cannot resolve home for user '$target_user'; skip sudo shortcut setup"
+    info "skip sudoers drop-in for root user"
     return 0
   fi
 
   local sudoers_file="$SUDOERS_DIR/${SUDOERS_FILE_PREFIX}${target_user}"
-  local sudoers_line="$target_user ALL=(root) NOPASSWD: $CLI_BIN *"
+  local sudoers_line="$target_user ALL=(root) NOPASSWD: $CLI_BIN, $CLI_BIN *"
   log "configuring passwordless sudo for $CLI_BIN (user=$target_user)"
   $SUDO install -d -m 0755 "$SUDOERS_DIR"
   printf '%s\n' "$sudoers_line" | $SUDO tee "$sudoers_file" >/dev/null
   $SUDO chmod 0440 "$sudoers_file"
   if ! $SUDO visudo -cf "$sudoers_file" >/dev/null; then
     $SUDO rm -f "$sudoers_file"
-    die "invalid sudoers syntax generated; aborted --sudo-shortcut"
+    warn "sudoers syntax check failed; removed $sudoers_file"
+    warn "you will be prompted for a password each time you run: sudo kekkai"
+    return 0
   fi
-
-  local shell_name rc_file alias_line
-  shell_name="$(basename "${SHELL:-}")"
-  case "$shell_name" in
-    zsh)  rc_file="$target_home/.zshrc" ;;
-    bash) rc_file="$target_home/.bashrc" ;;
-    *)    rc_file="$target_home/.profile" ;;
-  esac
-  alias_line="alias kekkai='sudo $CLI_BIN'"
-  if [[ ! -f "$rc_file" ]]; then
-    $SUDO touch "$rc_file"
-    $SUDO chown "$target_user":"$target_user" "$rc_file" 2>/dev/null || true
-  fi
-  if ! $SUDO grep -Fq "$alias_line" "$rc_file" 2>/dev/null; then
-    printf '\n%s\n' "$alias_line" | $SUDO tee -a "$rc_file" >/dev/null
-    $SUDO chown "$target_user":"$target_user" "$rc_file" 2>/dev/null || true
-    log "added alias to $rc_file"
-  else
-    info "alias already present in $rc_file"
-  fi
-  info "open a new shell or run: source $rc_file"
+  info "sudo kekkai will no longer prompt for a password"
 }
 
 install_config() {
@@ -526,6 +554,22 @@ install_config() {
   # We delegate the template to `kekkai-agent -reset` so shell and Go stay
   # in sync on one source of truth for the default config.
   $SUDO "$AGENT_BIN" -reset -config "$CONFIG_FILE" -iface "$iface" >/dev/null
+
+  # Persist KEKKAI_UPDATE_CHANNEL into the fresh config so future
+  # `kekkai update` runs (without the env var) don't flip back to the
+  # default `release` channel. Only apply when the env var is explicitly
+  # set AND it's a supported value — otherwise leave whatever the
+  # template generated.
+  local desired_channel="${KEKKAI_UPDATE_CHANNEL:-}"
+  case "$desired_channel" in
+    release|pre-release)
+      if grep -qE '^[[:space:]]+channel:' "$CONFIG_FILE" 2>/dev/null; then
+        $SUDO sed -i -E "s|^([[:space:]]+channel:[[:space:]]*).*$|\1$desired_channel|" "$CONFIG_FILE"
+        log "update.channel set to $desired_channel (from KEKKAI_UPDATE_CHANNEL)"
+      fi
+      ;;
+  esac
+
   if ! iface_has_default_allowlist_ip "$iface"; then
     warn "detected iface '$iface' is not in default ingress_allowlist 192.168.0.0/16"
     warn "service may reject startup until you set filter.ingress_allowlist to your management subnet"
@@ -612,69 +656,6 @@ enable_and_start() {
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Git update (repo mode only)
-# ---------------------------------------------------------------------------
-git_update() {
-  [[ "$SOURCE_MODE" == "repo" ]] || die "not in a git repo"
-  command -v git >/dev/null 2>&1 || die "git not found"
-
-  # The embedded .o file is tracked but overwritten on every build, so a
-  # prior run leaves it dirty. Restore before sanity check.
-  if git ls-files --error-unmatch internal/loader/bpf/xdp_filter.o >/dev/null 2>&1; then
-    git checkout -- internal/loader/bpf/xdp_filter.o 2>/dev/null || true
-  fi
-
-  if [[ $FORCE -eq 0 ]] && ! git diff --quiet; then
-    echo
-    git status --short
-    echo
-    die "working tree has uncommitted changes. commit, stash, or pass --force"
-  fi
-
-  local current_branch
-  current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)"
-  if [[ "$current_branch" != "$BRANCH" ]] && [[ $FORCE -eq 0 ]]; then
-    die "on branch '$current_branch', expected '$BRANCH'. switch or pass --force"
-  fi
-
-  local before remote
-  before="$(git rev-parse HEAD)"
-  log "current HEAD: ${before:0:12}"
-  log "fetching origin/$BRANCH"
-  # Avoid interactive hangs on first SSH contact with github.com.
-  # Users can disable this behavior by setting:
-  #   KEKKAI_GIT_ACCEPT_NEW_HOSTKEY=0
-  local accept_new_hostkey="${KEKKAI_GIT_ACCEPT_NEW_HOSTKEY:-1}"
-  if [[ "$accept_new_hostkey" == "1" ]]; then
-    GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o StrictHostKeyChecking=accept-new}" \
-      git fetch origin "$BRANCH"
-  else
-    git fetch origin "$BRANCH"
-  fi
-  remote="$(git rev-parse "origin/$BRANCH")"
-
-  if [[ "$before" == "$remote" ]]; then
-    log "already up to date"
-    return 0
-  fi
-
-  log "incoming:     ${remote:0:12}"
-  git --no-pager log --oneline "$before..$remote" | sed 's/^/    /' || true
-
-  # Refuse time-travel (downgrade).
-  local before_ts remote_ts
-  before_ts="$(git show -s --format=%ct "$before")"
-  remote_ts="$(git show -s --format=%ct "$remote")"
-  if (( remote_ts < before_ts )) && [[ $FORCE -eq 0 ]]; then
-    die "remote commit is older than local — refusing to downgrade (pass --force)"
-  fi
-
-  log "fast-forwarding"
-  git merge --ff-only "origin/$BRANCH" || die "fast-forward failed (diverged? use --force + git reset)"
-  return 0
-}
-
 fetch_release_metadata() {
   local channel="$1"
   local endpoint
@@ -698,20 +679,38 @@ select_release_assets() {
   local arch="$3"
   python3 -c '
 import json
+import re
 import sys
 
 channel, os_name, arch = sys.argv[1:4]
 data = json.load(sys.stdin)
 
+# Tag format is fixed by draft-release.yml: vYYYY.MM.DD+build.N
+# Anything that does not match sorts as (0,0,0,0) so it loses to any
+# well-formed tag — we never want to accidentally pick a hand-pushed
+# tag over the CI-generated ones.
+TAG_RE = re.compile(r"^v(\d{4})\.(\d{2})\.(\d{2})\+build\.(\d+)$")
+
+def parse_version(tag):
+    m = TAG_RE.match(tag or "")
+    if not m:
+        return (0, 0, 0, 0)
+    return tuple(int(m.group(i)) for i in range(1, 5))
+
 def pick_release(obj):
+    # release channel: /releases/latest already returns the single
+    # newest non-prerelease release, nothing to sort.
     if channel == "release":
         return obj
-    for rel in obj:
-        if rel.get("draft"):
-            continue
-        if rel.get("prerelease"):
-            return rel
-    return None
+
+    # pre-release channel: the list endpoint is sorted by created_at
+    # (newest first), which is NOT the same as version order — a
+    # re-published older build would hop to the top and shadow the
+    # real latest. Sort by parsed tag version and take the max.
+    candidates = [r for r in obj if not r.get("draft") and r.get("prerelease")]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: parse_version(r.get("tag_name", "")))
 
 release = pick_release(data)
 if not release:
@@ -771,7 +770,8 @@ download_release_binary() {
   local archive="$tmpdir/$(basename "${url%%\?*}")"
   [[ -n "$archive" ]] || die "invalid asset url: $url"
 
-  curl -fsSL "$url" -o "$archive"
+  curl -fL --retry 4 --retry-delay 1 --retry-all-errors --connect-timeout 10 \
+    "$url" -o "$archive" || return 1
 
   local out="$tmpdir/$want_name"
   case "$archive" in
@@ -800,116 +800,275 @@ download_release_binary() {
   esac
 
   chmod +x "$out"
+  # Quick sanity check: broken/partial downloads often crash immediately.
+  # We treat signal exits as corrupted binary and abort update early.
+  "$out" -h >/dev/null 2>&1 || {
+    local rc=$?
+    if (( rc >= 128 )); then
+      err "downloaded $want_name looks corrupted (exit=$rc)"
+      return 1
+    fi
+  }
   echo "$out"
+}
+
+require_release_tools() {
+  command -v curl    >/dev/null 2>&1 || die "curl not found"
+  command -v python3 >/dev/null 2>&1 || die "python3 not found (required for release metadata parsing)"
+}
+
+# fetch_release_artifacts: shared release fetch/parse/download.
+# Inputs:  channel, tmpdir
+# Outputs (via globals): REL_TAG, REL_NEW_AGENT, REL_NEW_CLI
+#
+# Using globals keeps the caller simple (vs. parsing stdout). A trailing
+# `unset` in each caller is unnecessary — install is a one-shot script.
+fetch_release_artifacts() {
+  local channel="$1"
+  local tmpdir="$2"
+
+  require_release_tools
+
+  local meta parsed
+  meta="$(fetch_release_metadata "$channel")" || die "failed to fetch GitHub release metadata"
+  parsed="$(printf '%s' "$meta" | select_release_assets "$channel" "$OS" "$ARCH")" \
+    || die "failed to resolve release assets for $OS/$ARCH"
+
+  REL_TAG="$(printf '%s\n' "$parsed" | sed -n '1p')"
+  local agent_url cli_url
+  agent_url="$(printf '%s\n' "$parsed" | sed -n '2p')"
+  cli_url="$(printf '%s\n' "$parsed"   | sed -n '3p')"
+  [[ -n "$agent_url" && -n "$cli_url" ]] || die "release metadata incomplete"
+
+  log "selected release: $REL_TAG ($channel)"
+  info "agent asset: $(basename "${agent_url%%\?*}")"
+  info "cli asset:   $(basename "${cli_url%%\?*}")"
+
+  REL_NEW_AGENT="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")" \
+    || die "failed to download/verify kekkai-agent binary"
+  REL_NEW_CLI="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")" \
+    || die "failed to download/verify kekkai binary"
+}
+
+# files_match: 0 (true) if both files exist and have identical sha256.
+files_match() {
+  local a="$1" b="$2"
+  [[ -f "$a" && -f "$b" ]] || return 1
+  local a_sha b_sha
+  a_sha="$(sha256sum "$a" | awk '{print $1}')"
+  b_sha="$(sha256sum "$b" | awk '{print $1}')"
+  [[ "$a_sha" == "$b_sha" ]]
+}
+
+# agent_unchanged / cli_unchanged: 0 (true) if the candidate binary matches
+# the currently installed one byte-for-byte. Used to decide whether a
+# release actually needs a service restart (or any write at all).
+agent_unchanged() { files_match "$AGENT_BIN" "$1"; }
+cli_unchanged()   { files_match "$CLI_BIN"   "$1"; }
+
+# version_is_newer: 0 (true) if $1 (candidate) is strictly newer than $2
+# (installed), using natural version sort. Used to refuse downgrades —
+# if somebody runs `kekkai update` while on pre-release build.9, the
+# release channel's build.4 must NOT replace it.
+#
+# Special values:
+#   - "unknown" / "(none)" for the installed version → always accept
+#     (treat as "we don't know what's on disk, trust the candidate")
+#   - "unknown" / "(none)" for the candidate         → always refuse
+#     (can't prove it's newer)
+version_is_newer() {
+  local candidate="$1" installed="$2"
+  [[ "$candidate" == "unknown" || "$candidate" == "(none)" || -z "$candidate" ]] && return 1
+  [[ "$installed" == "unknown" || "$installed" == "(none)" || -z "$installed" ]] && return 0
+  [[ "$candidate" == "$installed" ]] && return 1
+  local top
+  top="$(printf '%s\n%s\n' "$candidate" "$installed" | sort -V | tail -n1)"
+  [[ "$top" == "$candidate" ]]
+}
+
+# sync_script_from_remote: fetch the latest kekkai.sh from $RAW_BASE and
+# compare with the currently installed /usr/local/bin/kekkai.sh.
+#
+# Exit codes:
+#   0   → remote content differs, installed copy was overwritten
+#   10  → remote matches installed copy (no-op)
+#   11  → fetch failed (network / curl missing) — caller should warn but not fail
+#
+# Kept separate from binary updates because the script can ship fixes that
+# have no corresponding binary release (this very patch is one such case).
+sync_script_from_remote() {
+  [[ "$OS" == "linux" ]] || return 10
+  command -v curl >/dev/null 2>&1 || return 11
+
+  local tmp
+  tmp="$(mktemp)"
+  if ! curl -fsSL "$RAW_BASE/$BRANCH/kekkai.sh" -o "$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    return 11
+  fi
+
+  if files_match "$SCRIPT_INSTALL_PATH" "$tmp"; then
+    rm -f "$tmp"
+    return 10
+  fi
+
+  $SUDO install -D -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"
+  rm -f "$tmp"
+  return 0
 }
 
 release_update() {
   local channel="$1"
   local old_ver
   old_ver="$(read_cli_version "$CLI_BIN")"
-  command -v curl >/dev/null 2>&1 || die "curl not found"
-  command -v python3 >/dev/null 2>&1 || die "python3 not found (required for release metadata parsing)"
-
-  local meta
-  meta="$(fetch_release_metadata "$channel")" || die "failed to fetch GitHub release metadata"
-
-  local parsed
-  parsed="$(printf '%s' "$meta" | select_release_assets "$channel" "$OS" "$ARCH")" || die "failed to resolve release assets for $OS/$ARCH"
-  local tag agent_url cli_url
-  tag="$(printf '%s\n' "$parsed" | sed -n '1p')"
-  agent_url="$(printf '%s\n' "$parsed" | sed -n '2p')"
-  cli_url="$(printf '%s\n' "$parsed" | sed -n '3p')"
-  [[ -n "$agent_url" && -n "$cli_url" ]] || die "release metadata incomplete"
-
-  log "selected release: $tag ($channel)"
-  info "agent asset: $(basename "${agent_url%%\?*}")"
-  info "cli asset:   $(basename "${cli_url%%\?*}")"
 
   local tmpdir
   tmpdir="$(mktemp -d)"
-
-  local new_agent new_cli
-  new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")"
-  new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")"
+  fetch_release_artifacts "$channel" "$tmpdir"
   local new_ver
-  new_ver="$(read_cli_version "$new_cli")"
+  new_ver="$(read_cli_version "$REL_NEW_CLI")"
 
-  validate_config_against_new_binary "$new_agent"
+  validate_config_against_new_binary "$REL_NEW_AGENT"
 
-  local old_sha new_sha
-  old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
-  new_sha="$(sha256sum "$new_agent" | awk '{print $1}')"
-  if [[ "$old_sha" == "$new_sha" ]]; then
-    log "up-to-date (binary unchanged — nothing to restart)"
-    print_version_transition "$old_ver" "$new_ver"
-    rm -rf "$tmpdir"
-    return 0
+  # Downgrade guard: `kekkai update` must NEVER replace a newer binary with
+  # an older one. Common footgun: user installs pre-release (build.9), then
+  # forgets to set update.channel=pre-release in config, so the next update
+  # resolves to channel=release (build.4) and rolls them back. We refuse
+  # by pretending the binaries didn't change — kekkai.sh sync still runs
+  # (script fixes can legitimately ship between releases).
+  local -a changed_parts=()
+  local need_restart=0
+  local downgrade_refused=0
+
+  if [[ "$new_ver" != "$old_ver" ]] && ! version_is_newer "$new_ver" "$old_ver"; then
+    downgrade_refused=1
+    warn "refusing to downgrade: $channel channel offers $new_ver but installed is $old_ver"
+    warn "to switch channels, set update.channel in $CONFIG_FILE or export KEKKAI_UPDATE_CHANNEL"
   fi
 
-  install_binaries_from "$new_agent" "$new_cli"
+  if (( downgrade_refused == 0 )); then
+    # Three-way diff: agent binary, CLI binary, and kekkai.sh itself.
+    # Any single one changing counts as "updated". kekkai.sh can ship
+    # fixes independent of a binary release, so we can't gate on agent alone.
+    if ! agent_unchanged "$REL_NEW_AGENT"; then
+      changed_parts+=("agent")
+      need_restart=1
+    fi
+    if ! cli_unchanged "$REL_NEW_CLI"; then
+      changed_parts+=("cli")
+    fi
+
+    if (( need_restart )); then
+      install_binaries_from "$REL_NEW_AGENT" "$REL_NEW_CLI"
+    elif (( ${#changed_parts[@]} > 0 )); then
+      # CLI changed but agent didn't — still need to install the new CLI,
+      # just no service restart.
+      $SUDO install -D -m 0755 "$REL_NEW_CLI" "$CLI_BIN"
+      log "installed: $CLI_BIN"
+      install_completions
+    fi
+  fi
   rm -rf "$tmpdir"
-  setup_sudo_shortcut
-  enable_and_start
-  log "update complete (channel=$channel, tag=$tag)"
-  print_version_transition "$old_ver" "$new_ver"
+
+  # Script sync: independent of binary changes. Done after binaries
+  # because sync_script_from_remote may overwrite the script this very
+  # process is running — bash has already parsed our source, so this is
+  # safe as long as we don't source the file again afterward.
+  #
+  # NOTE: `set -e` would kill us on the non-zero API returns (10/11) if we
+  # called this as a bare statement. The `|| script_rc=$?` idiom isolates
+  # the call from errexit so we can branch on the exit code ourselves.
+  local script_rc=0
+  sync_script_from_remote || script_rc=$?
+  case $script_rc in
+    0)  changed_parts+=("kekkai.sh") ;;
+    10) : ;; # already up-to-date
+    11) warn "could not fetch remote kekkai.sh (network?) — skipped script sync" ;;
+  esac
+
+  if (( need_restart )); then
+    setup_passwordless_sudo
+    enable_and_start
+  fi
+
+  # When a downgrade was refused, kekkai.sh may still have changed (script
+  # sync is orthogonal). Report based on what actually landed — but never
+  # show the `updated` version arrow pointing backwards, because `old_ver`
+  # is still the real installed version.
+  if (( downgrade_refused )); then
+    local changed_str=""
+    if (( ${#changed_parts[@]} > 0 )); then
+      changed_str="${changed_parts[*]}"
+      changed_str="${changed_str// /, } (downgrade refused: $channel offered $new_ver)"
+    fi
+    print_update_result unchanged "$old_ver" "$old_ver" "$REL_TAG" "$channel" "$changed_str"
+  elif (( ${#changed_parts[@]} == 0 )); then
+    print_update_result unchanged "$old_ver" "$new_ver" "$REL_TAG" "$channel" ""
+  else
+    local changed_str="${changed_parts[*]}"
+    changed_str="${changed_str// /, }"
+    print_update_result updated "$old_ver" "$new_ver" "$REL_TAG" "$channel" "$changed_str"
+  fi
 }
 
 fetch_release_binaries_to_root_bin() {
   local channel="$1"
-  command -v curl >/dev/null 2>&1 || die "curl not found"
-  command -v python3 >/dev/null 2>&1 || die "python3 not found (required for release metadata parsing)"
-
-  local meta
-  meta="$(fetch_release_metadata "$channel")" || die "failed to fetch GitHub release metadata"
-
-  local parsed
-  parsed="$(printf '%s' "$meta" | select_release_assets "$channel" "$OS" "$ARCH")" || die "failed to resolve release assets for $OS/$ARCH"
-  local tag agent_url cli_url
-  tag="$(printf '%s\n' "$parsed" | sed -n '1p')"
-  agent_url="$(printf '%s\n' "$parsed" | sed -n '2p')"
-  cli_url="$(printf '%s\n' "$parsed" | sed -n '3p')"
-  [[ -n "$agent_url" && -n "$cli_url" ]] || die "release metadata incomplete"
-
-  log "selected release: $tag ($channel)"
-  info "agent asset: $(basename "${agent_url%%\?*}")"
-  info "cli asset:   $(basename "${cli_url%%\?*}")"
-
   local tmpdir
   tmpdir="$(mktemp -d)"
-  local new_agent new_cli
-  new_agent="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")"
-  new_cli="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")"
+  fetch_release_artifacts "$channel" "$tmpdir"
 
   mkdir -p "$ROOT/bin"
-  cp "$new_agent" "$ROOT/bin/kekkai-agent"
-  cp "$new_cli" "$ROOT/bin/kekkai"
-  chmod +x "$ROOT/bin/kekkai-agent" "$ROOT/bin/kekkai"
+  install -m 0755 "$REL_NEW_AGENT" "$LOCAL_AGENT_BIN"
+  install -m 0755 "$REL_NEW_CLI"   "$LOCAL_CLI_BIN"
   rm -rf "$tmpdir"
 }
 
 validate_config_against_new_binary() {
-  local candidate_bin="${1:-$ROOT/bin/kekkai-agent}"
+  local candidate_bin="${1:-$LOCAL_AGENT_BIN}"
   [[ -f "$CONFIG_FILE" ]] || return 0
   log "validating $CONFIG_FILE against new binary"
-  if ! "$candidate_bin" -check "$CONFIG_FILE" >/tmp/kekkai-check.log 2>&1; then
+
+  # mktemp gives us a per-run log file owned by whoever is executing
+  # this function — avoids the "owned by root from a previous run"
+  # permission denied footgun on a shared /tmp.
+  local log_file
+  log_file="$(mktemp -t kekkai-check.XXXXXX)"
+  local rc=0
+  if "$candidate_bin" -check "$CONFIG_FILE" >"$log_file" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if (( rc != 0 )); then
     echo
-    err "new binary rejects current config:"
-    sed 's/^/    /' /tmp/kekkai-check.log >&2
+    err "new binary validation failed:"
+    sed 's/^/    /' "$log_file" >&2
     echo
+    if (( rc >= 128 )); then
+      err "the new binary crashed during check (exit=$rc), likely corrupted download or bad artifact."
+      err "the installed config was NOT applied; old binary/service stay untouched."
+      echo
+      info "retry update first:"
+      info "  sudo kekkai update"
+      info "if it repeats, pin previous tag or check release artifact health."
+      exit 1
+    fi
     err "the installed config is incompatible with the new binary."
     err "the old binary and service are still running untouched."
     echo
     info "to fix, one of:"
     info "  1. edit the config:        sudo nano $CONFIG_FILE"
     info "  2. reset to a clean template (backs up the broken file first):"
-    info "       sudo $ROOT/bin/kekkai-agent -reset -config $CONFIG_FILE"
+    info "       sudo kekkai reset"
     info "     then edit to add filter.ingress_allowlist, and re-run:"
-    info "       bash ./kekkai.sh update"
+    info "       sudo kekkai update"
     info "  3. restore from an earlier backup:"
     info "       ls /etc/kekkai/kekkai.yaml.*"
     info "       sudo cp /etc/kekkai/kekkai.yaml.<kind>.<ts> $CONFIG_FILE"
+    rm -f "$log_file"
     exit 1
   fi
+  rm -f "$log_file"
   log "config ok"
 }
 
@@ -923,7 +1082,8 @@ do_install() {
   check_kernel
   prepare_binaries
   install_binaries
-  setup_sudo_shortcut
+  persist_script_for_updates
+  setup_passwordless_sudo
   install_config
   install_systemd_unit
   enable_and_start
@@ -934,42 +1094,10 @@ do_install() {
 do_update() {
   banner
   step "update · $OS/$ARCH"
-  local old_ver
-  old_ver="$(read_cli_version "$CLI_BIN")"
   local channel
   channel="$(resolve_update_channel)"
   log "update channel: $channel"
-
-  case "$channel" in
-    git:main)
-      ensure_go
-      git_update
-      build_from_source
-      validate_config_against_new_binary "$ROOT/bin/kekkai-agent"
-      local new_ver
-      new_ver="$(read_cli_version "$ROOT/bin/kekkai")"
-
-      local old_sha new_sha
-      old_sha=""; [[ -f "$AGENT_BIN" ]] && old_sha="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
-      new_sha="$(sha256sum "$ROOT/bin/kekkai-agent" | awk '{print $1}')"
-      if [[ "$old_sha" == "$new_sha" ]]; then
-        log "up-to-date (binary unchanged — nothing to restart)"
-        print_version_transition "$old_ver" "$new_ver"
-        return 0
-      fi
-      install_binaries
-      setup_sudo_shortcut
-      enable_and_start
-      log "update complete (channel=git:main)"
-      print_version_transition "$old_ver" "$new_ver"
-      ;;
-    release|pre-release)
-      release_update "$channel"
-      ;;
-    *)
-      die "unsupported update channel: $channel"
-      ;;
-  esac
+  release_update "$channel"
 }
 
 do_repair() {
@@ -977,7 +1105,8 @@ do_repair() {
   step "repair · $OS/$ARCH"
   prepare_binaries
   install_binaries
-  setup_sudo_shortcut
+  persist_script_for_updates
+  setup_passwordless_sudo
   [[ -f "$CONFIG_FILE" ]] || install_config
   install_systemd_unit
   enable_and_start
@@ -993,13 +1122,12 @@ do_doctor() {
   info "OS:       $OS"
   info "arch:     $ARCH"
   info "kernel:   $(uname -r)"
-  info "source:   $SOURCE_MODE"
   [[ -x "$AGENT_BIN" ]] && log "$AGENT_BIN present" || warn "$AGENT_BIN missing"
   [[ -x "$CLI_BIN"   ]] && log "$CLI_BIN present"   || warn "$CLI_BIN missing"
   [[ -f "$UNIT_DST"  ]] && log "$UNIT_DST present"  || warn "$UNIT_DST missing"
   [[ -f "$CONFIG_FILE" ]] && log "$CONFIG_FILE present" || warn "$CONFIG_FILE missing"
   echo
-  info "run:  bash ./kekkai.sh install"
+  info "run the one-liner installer from the README to bootstrap kekkai"
 }
 
 do_uninstall() {
@@ -1018,12 +1146,12 @@ do_uninstall() {
 
 post_install_hints() {
   echo
-  info "next steps:"
+  info "next steps (always run kekkai with sudo):"
   printf '  %s1.%s edit config:      sudo nano %s\n' "$C_BOLD" "$C_RESET" "$CONFIG_FILE"
-  printf '  %s2.%s validate:         kekkai check\n' "$C_BOLD" "$C_RESET"
+  printf '  %s2.%s validate:         sudo kekkai check\n' "$C_BOLD" "$C_RESET"
   printf '  %s3.%s restart:          sudo systemctl restart kekkai-agent\n' "$C_BOLD" "$C_RESET"
   printf '  %s4.%s watch live:       sudo kekkai status\n' "$C_BOLD" "$C_RESET"
-  printf '  %s5.%s diagnose:         kekkai doctor\n' "$C_BOLD" "$C_RESET"
+  printf '  %s5.%s diagnose:         sudo kekkai doctor\n' "$C_BOLD" "$C_RESET"
   echo
 
   if [[ $DO_RUN -eq 1 ]]; then
@@ -1043,7 +1171,6 @@ if [[ -z "$CMD" ]]; then
   case "$CMD" in
     install) info "detected state: not installed → install" ;;
     repair)  info "detected state: partial install → repair" ;;
-    update)  info "detected state: upstream has new commits → update" ;;
     healthy) info "detected state: healthy → running doctor"; CMD="doctor" ;;
   esac
 fi
