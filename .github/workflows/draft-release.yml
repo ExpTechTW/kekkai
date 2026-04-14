@@ -71,15 +71,10 @@ jobs:
       - name: Decide release mode by branch and commit message
         id: mode
         env:
-          HEAD_MSG: ${{ github.event.head_commit.message }}
           BRANCH_NAME: ${{ github.ref_name }}
         run: |
           if [[ "$BRANCH_NAME" == "main" ]]; then
-            if printf '%s\n' "$HEAD_MSG" | grep -qi 'build:'; then
-              echo "mode=pre-release" >> "$GITHUB_OUTPUT"
-            else
-              echo "mode=none" >> "$GITHUB_OUTPUT"
-            fi
+            echo "mode=pre-release" >> "$GITHUB_OUTPUT"
           elif [[ "$BRANCH_NAME" == "release" ]]; then
             echo "mode=release" >> "$GITHUB_OUTPUT"
           else
