@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/kekkai.sh \
   | KEKKAI_UPDATE_CHANNEL=pre-release bash -s -- install
 ```
 
-完整刪除（建議用 `curl | sudo bash`，避免 `sudo` + `/dev/fd` 問題）：
+完整刪除：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ExpTechTW/kekkai/main/scripts/delete.sh \
@@ -62,12 +62,14 @@ sudo kekkai status
 > `kekkai update` 來源可由 `update.channel` 設為 `git:main` / `release` / `pre-release`。
 
 GitHub Releases 會提供各平台檔案（`kekkai-*` 與 `kekkai-agent-*`）：
+
 - `linux-amd64`
 - `linux-arm64`
 - `darwin-amd64`
 - `darwin-arm64`
 
 版本字串規則：
+
 - git 模式（本地/repo build）：`YYYYMMDD+<shortSHA>`
 - release / draft CI build：`YYYYMMDD+b<build_number>`
 
