@@ -299,8 +299,22 @@ func cmdUpdate(args []string) int {
 		return 1
 	}
 
-	cmdArgs := append([]string{script, "update"}, args...)
-	c := exec.Command("bash", cmdArgs...)
+	var c *exec.Cmd
+	if os.Geteuid() == 0 && os.Getenv("SUDO_USER") != "" {
+		// `kekkai` may be aliased to `sudo /usr/local/bin/kekkai`.
+		// Update needs git auth from the real user account, so drop back.
+		realUser := os.Getenv("SUDO_USER")
+		sudoArgs := []string{
+			"-u", realUser,
+			"--preserve-env=KEKKAI_SCRIPT,KEKKAI_REPO,KEKKAI_GIT_ACCEPT_NEW_HOSTKEY,GIT_SSH_COMMAND",
+			"bash", script, "update",
+		}
+		sudoArgs = append(sudoArgs, args...)
+		c = exec.Command("sudo", sudoArgs...)
+	} else {
+		cmdArgs := append([]string{script, "update"}, args...)
+		c = exec.Command("bash", cmdArgs...)
+	}
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	c.Stdin = os.Stdin
