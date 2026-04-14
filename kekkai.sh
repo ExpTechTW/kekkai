@@ -1027,8 +1027,14 @@ validate_config_against_new_binary() {
   local candidate_bin="${1:-$LOCAL_AGENT_BIN}"
   [[ -f "$CONFIG_FILE" ]] || return 0
   log "validating $CONFIG_FILE against new binary"
+
+  # mktemp gives us a per-run log file owned by whoever is executing
+  # this function — avoids the "owned by root from a previous run"
+  # permission denied footgun on a shared /tmp.
+  local log_file
+  log_file="$(mktemp -t kekkai-check.XXXXXX)"
   local rc=0
-  if "$candidate_bin" -check "$CONFIG_FILE" >/tmp/kekkai-check.log 2>&1; then
+  if "$candidate_bin" -check "$CONFIG_FILE" >"$log_file" 2>&1; then
     rc=0
   else
     rc=$?
@@ -1036,7 +1042,7 @@ validate_config_against_new_binary() {
   if (( rc != 0 )); then
     echo
     err "new binary validation failed:"
-    sed 's/^/    /' /tmp/kekkai-check.log >&2
+    sed 's/^/    /' "$log_file" >&2
     echo
     if (( rc >= 128 )); then
       err "the new binary crashed during check (exit=$rc), likely corrupted download or bad artifact."
@@ -1059,8 +1065,10 @@ validate_config_against_new_binary() {
     info "  3. restore from an earlier backup:"
     info "       ls /etc/kekkai/kekkai.yaml.*"
     info "       sudo cp /etc/kekkai/kekkai.yaml.<kind>.<ts> $CONFIG_FILE"
+    rm -f "$log_file"
     exit 1
   fi
+  rm -f "$log_file"
   log "config ok"
 }
 
