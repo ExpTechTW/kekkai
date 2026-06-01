@@ -281,6 +281,32 @@ func systemctlShow(unit, prop string) string {
 
 // ---------- kernel / bpf -------------------------------------------------
 
+// kernelMajorMinor returns the running kernel's leading major.minor read
+// from /proc/sys/kernel/osrelease. ok is false if it can't be parsed.
+func kernelMajorMinor() (major, minor int, ok bool) {
+	data, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return 0, 0, false
+	}
+	return parseKernelMajorMinor(string(data))
+}
+
+// parseKernelMajorMinor parses the leading major.minor from an osrelease
+// string (e.g. "5.15.0-179-generic" -> 5, 15). ok is false if the string
+// doesn't start with two dot-separated integers.
+func parseKernelMajorMinor(rel string) (major, minor int, ok bool) {
+	parts := strings.SplitN(strings.TrimSpace(rel), ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return maj, min, true
+}
+
 func checkKernel(r *Runner) {
 	sec := r.Section("kernel / ebpf")
 
@@ -293,14 +319,29 @@ func checkKernel(r *Runner) {
 		return
 	}
 
-	// Kernel version.
+	// Kernel version. TCX egress seeding needs >= 6.6, and that seed is the
+	// ONLY thing that lets outbound UDP return traffic (DNS, NTP, ...) back
+	// through the XDP filter — older kernels silently drop those replies.
+	// So treat < 6.6 as a hard error, not a cosmetic note.
 	if data, err := os.ReadFile("/proc/version"); err == nil {
 		line := strings.TrimSpace(string(data))
 		// Full line is verbose; keep first 70 chars.
 		if len(line) > 70 {
 			line = line[:70] + "…"
 		}
-		sec.Add(Result{Status: StatusOK, Title: "kernel version", Detail: line})
+		if major, minor, ok := kernelMajorMinor(); ok && (major < 6 || (major == 6 && minor < 6)) {
+			sec.Add(Result{
+				Status: StatusError,
+				Title:  "kernel version",
+				Detail: fmt.Sprintf("%d.%d too old — TCX egress unsupported (<6.6); outbound UDP return (DNS/NTP) is dropped", major, minor),
+				Suggestions: []string{
+					"upgrade kernel to >= 6.6",
+					"Ubuntu 22.04: sudo apt install --install-recommends linux-generic-hwe-22.04 && sudo reboot",
+				},
+			})
+		} else {
+			sec.Add(Result{Status: StatusOK, Title: "kernel version", Detail: line})
+		}
 	}
 
 	// BTF.

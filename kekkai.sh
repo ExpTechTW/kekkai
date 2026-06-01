@@ -1334,6 +1334,7 @@ do_install() {
   install_systemd_unit
   enable_and_start
   log "install complete"
+  run_post_change_doctor
   post_install_hints
 }
 
@@ -1348,6 +1349,7 @@ do_update() {
   channel="$(resolve_update_channel)"
   log "update channel: $channel"
   release_update "$channel" "$FORCE_UPDATE"
+  run_post_change_doctor
 }
 
 do_repair() {
@@ -1361,6 +1363,17 @@ do_repair() {
   install_systemd_unit
   enable_and_start
   log "repair complete"
+  run_post_change_doctor
+}
+
+# Run a health check after install/update so kernel/UDP/driver problems
+# (e.g. kernel < 6.6 breaking UDP return traffic) surface right away instead
+# of waiting for the operator to think of running `kekkai doctor`. Never
+# aborts the caller — a non-zero "issues detected" exit is expected.
+run_post_change_doctor() {
+  [[ -x "$CLI_BIN" ]] || return 0
+  step "post-change health check (kekkai doctor)"
+  "$CLI_BIN" doctor || true
 }
 
 do_doctor() {
