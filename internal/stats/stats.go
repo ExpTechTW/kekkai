@@ -492,8 +492,12 @@ func (r *Reader) scanPerIPIterate(buf *[]TopEntry) (int, error) {
 	var key uint32
 	iter := r.perip.Iterate()
 	n := 0
-	// Per-CPU iterate: the value sink is a slice with one entry per CPU.
-	for iter.Next(&key, &r.scanPerCPU) {
+	// Per-CPU iterate: pass the pre-sized slice (len == nCPU) by value so the
+	// lookup fills it IN PLACE. Passing &slice instead makes cilium allocate a
+	// fresh slice on every entry. A single perIPStat (non-slice) is rejected
+	// outright with "per-cpu value requires a slice", which is the bug to
+	// avoid here.
+	for iter.Next(&key, r.scanPerCPU) {
 		appendEntry(buf, key, r.scanPerCPU)
 		n++
 	}
