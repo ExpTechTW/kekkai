@@ -255,8 +255,11 @@ static __always_inline void stat_add(__u32 slot, __u64 delta) {
         *v += delta;
 }
 
+// now_ns is passed in (computed once per packet by the caller) instead of
+// each perip_touch call re-invoking bpf_ktime_get_ns() — one helper call per
+// packet instead of two.
 static __always_inline void perip_touch(__u32 saddr, __u64 len, __u8 proto,
-                                         __u8 dropped) {
+                                         __u8 dropped, __u64 now_ns) {
     struct perip_stat *ps = bpf_map_lookup_elem(&perip_v4, &saddr);
     if (ps) {
         ps->pkts += 1;
@@ -266,7 +269,7 @@ static __always_inline void perip_touch(__u32 saddr, __u64 len, __u8 proto,
             ps->bytes_dropped += len;
             ps->blocked = 1;
         }
-        ps->last_seen_ns = bpf_ktime_get_ns();
+        ps->last_seen_ns = now_ns;
         ps->last_proto = proto;
         return;
     }
@@ -275,7 +278,7 @@ static __always_inline void perip_touch(__u32 saddr, __u64 len, __u8 proto,
         .bytes         = len,
         .pkts_dropped  = dropped ? 1 : 0,
         .bytes_dropped = dropped ? len : 0,
-        .last_seen_ns  = bpf_ktime_get_ns(),
+        .last_seen_ns  = now_ns,
         .last_proto    = proto,
         .blocked       = dropped,
     };
@@ -417,6 +420,10 @@ int kekkai_xdp(struct xdp_md *ctx) {
     __u32 saddr = ip->saddr;
     __u8 proto  = ip->protocol;
 
+    // One timestamp per packet, reused by perip_touch, the conntrack fast
+    // path, and flow_upsert (avoids re-calling bpf_ktime_get_ns()).
+    __u64 now_ns = bpf_ktime_get_ns();
+
     // protocol counters (counted before filtering so drops still show)
     switch (proto) {
     case IPPROTO_TCP:
@@ -434,7 +441,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
     if (frag != 0) {
         stat_add(STAT_PASS_FRAGMENT, 1);
         stat_add(STAT_PKTS_PASSED, 1);
-        perip_touch(saddr, pkt_len, proto, 0);
+        perip_touch(saddr, pkt_len, proto, 0, now_ns);
         return XDP_PASS;
     }
 
@@ -444,14 +451,13 @@ int kekkai_xdp(struct xdp_md *ctx) {
         stat_add(STAT_DROP_MALFORMED, 1);
         stat_add(STAT_PKTS_DROPPED, 1);
         stat_add(STAT_BYTES_DROPPED, pkt_len);
-        perip_touch(saddr, pkt_len, proto, 1);
+        perip_touch(saddr, pkt_len, proto, 1, now_ns);
         return XDP_DROP;
     }
     void *l4 = (void *)ip + ihl * 4;
 
     __u16 sport_be = 0, dport_be = 0;
     __u8 tcp_flags = 0;
-    __u64 now_ns = bpf_ktime_get_ns();
 
     // Parse L4 header once (stateful + policy paths reuse these fields).
     if (proto == IPPROTO_TCP) {
@@ -460,7 +466,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
             stat_add(STAT_DROP_MALFORMED, 1);
             stat_add(STAT_PKTS_DROPPED, 1);
             stat_add(STAT_BYTES_DROPPED, pkt_len);
-            perip_touch(saddr, pkt_len, proto, 1);
+            perip_touch(saddr, pkt_len, proto, 1, now_ns);
             return XDP_DROP;
         }
         sport_be = tcp->source;
@@ -472,7 +478,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
             stat_add(STAT_DROP_MALFORMED, 1);
             stat_add(STAT_PKTS_DROPPED, 1);
             stat_add(STAT_BYTES_DROPPED, pkt_len);
-            perip_touch(saddr, pkt_len, proto, 1);
+            perip_touch(saddr, pkt_len, proto, 1, now_ns);
             return XDP_DROP;
         }
         sport_be = udp->source;
@@ -498,7 +504,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
                 stat_add(STAT_PASS_STATEFUL_UDP, 1);
             }
             stat_add(STAT_PKTS_PASSED, 1);
-            perip_touch(saddr, pkt_len, proto, 0);
+            perip_touch(saddr, pkt_len, proto, 0, now_ns);
             return XDP_PASS;
         }
     }
@@ -522,7 +528,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
     if (proto == IPPROTO_ICMP && allow_icmp) {
         stat_add(STAT_PASS_RETURN_ICMP, 1);
         stat_add(STAT_PKTS_PASSED, 1);
-        perip_touch(saddr, pkt_len, proto, 0);
+        perip_touch(saddr, pkt_len, proto, 0, now_ns);
         return XDP_PASS;
     }
     if (proto == IPPROTO_TCP) {
@@ -534,7 +540,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
             flow_upsert(&fkey, now_ns);
             stat_add(STAT_PASS_RETURN_TCP, 1);
             stat_add(STAT_PKTS_PASSED, 1);
-            perip_touch(saddr, pkt_len, proto, 0);
+            perip_touch(saddr, pkt_len, proto, 0, now_ns);
             return XDP_PASS;
         }
     } else if (proto == IPPROTO_UDP) {
@@ -546,7 +552,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
             flow_upsert(&fkey, now_ns);
             stat_add(STAT_PASS_RETURN_UDP, 1);
             stat_add(STAT_PKTS_PASSED, 1);
-            perip_touch(saddr, pkt_len, proto, 0);
+            perip_touch(saddr, pkt_len, proto, 0, now_ns);
             return XDP_PASS;
         }
         // No UDP ephemeral fallback — the stateful fast path already covers
@@ -558,7 +564,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         stat_add(STAT_DROP_NO_POLICY, 1);
         stat_add(STAT_PKTS_DROPPED, 1);
         stat_add(STAT_BYTES_DROPPED, pkt_len);
-        perip_touch(saddr, pkt_len, proto, 1);
+        perip_touch(saddr, pkt_len, proto, 1, now_ns);
         return XDP_DROP;
     }
 
@@ -568,7 +574,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         stat_add(STAT_DROP_BLOCKLIST, 1);
         stat_add(STAT_PKTS_DROPPED, 1);
         stat_add(STAT_BYTES_DROPPED, pkt_len);
-        perip_touch(saddr, pkt_len, proto, 1);
+        perip_touch(saddr, pkt_len, proto, 1, now_ns);
         return XDP_DROP;
     }
 
@@ -578,7 +584,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         stat_add(STAT_DROP_DYN_BLOCK, 1);
         stat_add(STAT_PKTS_DROPPED, 1);
         stat_add(STAT_BYTES_DROPPED, pkt_len);
-        perip_touch(saddr, pkt_len, proto, 1);
+        perip_touch(saddr, pkt_len, proto, 1, now_ns);
         return XDP_DROP;
     }
 
@@ -591,7 +597,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         flow_upsert(&fkey, now_ns);
         stat_add(STAT_PASS_PUBLIC_TCP, 1);
         stat_add(STAT_PKTS_PASSED, 1);
-        perip_touch(saddr, pkt_len, proto, 0);
+        perip_touch(saddr, pkt_len, proto, 0, now_ns);
         return XDP_PASS;
     }
     if (proto == IPPROTO_UDP && port_in(&public_udp_ports, dport_be)) {
@@ -602,7 +608,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         flow_upsert(&fkey, now_ns);
         stat_add(STAT_PASS_PUBLIC_UDP, 1);
         stat_add(STAT_PKTS_PASSED, 1);
-        perip_touch(saddr, pkt_len, proto, 0);
+        perip_touch(saddr, pkt_len, proto, 0, now_ns);
         return XDP_PASS;
     }
 
@@ -626,13 +632,13 @@ int kekkai_xdp(struct xdp_md *ctx) {
             else
                 stat_add(STAT_PASS_PRIVATE_UDP, 1);
             stat_add(STAT_PKTS_PASSED, 1);
-            perip_touch(saddr, pkt_len, proto, 0);
+            perip_touch(saddr, pkt_len, proto, 0, now_ns);
             return XDP_PASS;
         }
         stat_add(STAT_DROP_NOT_ALLOWED, 1);
         stat_add(STAT_PKTS_DROPPED, 1);
         stat_add(STAT_BYTES_DROPPED, pkt_len);
-        perip_touch(saddr, pkt_len, proto, 1);
+        perip_touch(saddr, pkt_len, proto, 1, now_ns);
         return XDP_DROP;
     }
 
@@ -640,7 +646,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
     stat_add(STAT_DROP_NO_POLICY, 1);
     stat_add(STAT_PKTS_DROPPED, 1);
     stat_add(STAT_BYTES_DROPPED, pkt_len);
-    perip_touch(saddr, pkt_len, proto, 1);
+    perip_touch(saddr, pkt_len, proto, 1, now_ns);
     return XDP_DROP;
 }
 

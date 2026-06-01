@@ -504,6 +504,29 @@ func checkNetwork(r *Runner, cfg *config.Config) {
 		})
 	}
 
+	// Multi-core scaling: XDP runs once per RX queue, each on its own CPU.
+	// A single RX queue pins all XDP work to one core regardless of how many
+	// the box has, so flag it.
+	if n, ok := rxQueueCount(iface); ok {
+		if n <= 1 {
+			sec.Add(Result{
+				Status: StatusWarn,
+				Title:  "RX queues",
+				Detail: fmt.Sprintf("%s has 1 RX queue — XDP runs on a single core (no multi-core spread)", iface),
+				Suggestions: []string{
+					"enable multi-queue: sudo ethtool -L " + iface + " combined <N>",
+					"on generic XDP, also spread softirqs with RPS (/sys/class/net/" + iface + "/queues/rx-*/rps_cpus)",
+				},
+			})
+		} else {
+			sec.Add(Result{
+				Status: StatusOK,
+				Title:  "RX queues",
+				Detail: fmt.Sprintf("%d RX queues — XDP can spread across %d cores", n, n),
+			})
+		}
+	}
+
 	// tx sysfs counters.
 	txBytes := sysfsTxPath(iface, "tx_bytes")
 	if _, err := os.Stat(txBytes); err == nil {
@@ -558,6 +581,37 @@ func XDPAttached(iface string) (attached, ok bool) {
 func xdpAttached(iface string) bool {
 	attached, ok := XDPAttached(iface)
 	return ok && attached
+}
+
+// rxQueueCount returns the number of RX queues the kernel exposes for iface,
+// from /sys/class/net/<iface>/queues/ (the rx-N dirs). ok is false if the
+// directory can't be read.
+func rxQueueCount(iface string) (int, bool) {
+	entries, err := os.ReadDir(filepath.Join("/sys/class/net", iface, "queues"))
+	if err != nil {
+		return 0, false
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	n := countRXQueues(names)
+	if n == 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// countRXQueues counts entries named "rx-<n>" (the per-queue dirs under a
+// NIC's queues/ directory). Pure helper so it can be unit-tested.
+func countRXQueues(names []string) int {
+	n := 0
+	for _, name := range names {
+		if strings.HasPrefix(name, "rx-") {
+			n++
+		}
+	}
+	return n
 }
 
 func sysfsTxPath(iface, metric string) string {

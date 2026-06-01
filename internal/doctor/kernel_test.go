@@ -56,6 +56,24 @@ VERSION_CODENAME=jammy`
 	}
 }
 
+func TestCountRXQueues(t *testing.T) {
+	tests := []struct {
+		names []string
+		want  int
+	}{
+		{[]string{"rx-0", "tx-0", "rx-1", "tx-1"}, 2},
+		{[]string{"rx-0"}, 1},                                 // single queue → warn case
+		{[]string{"rx-0", "rx-1", "rx-2", "rx-3", "tx-0"}, 4}, // multi-queue → ok case
+		{[]string{"tx-0", "tx-1"}, 0},                         // no rx dirs
+		{nil, 0},
+	}
+	for _, tt := range tests {
+		if got := countRXQueues(tt.names); got != tt.want {
+			t.Errorf("countRXQueues(%v) = %d, want %d", tt.names, got, tt.want)
+		}
+	}
+}
+
 func TestKernelUpgradeCommandFor(t *testing.T) {
 	tests := []struct {
 		id, idLike string
