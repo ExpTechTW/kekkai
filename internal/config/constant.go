@@ -1,8 +1,10 @@
 package config
 
 // CurrentVersion is the schema version this build writes and expects.
-// v2 is backward-compatible with v1 via migrateIfNeeded().
-const CurrentVersion = 2
+// Older versions are migrated forward via migrateIfNeeded(). v3 folded
+// security.enforce_ssh_private into a single security.allow_ssh_public
+// flag, so v1/v2 documents carrying the dropped key migrate cleanly.
+const CurrentVersion = 3
 
 const (
 	DefaultStatsFile       = "/var/run/kekkai/stats.txt"

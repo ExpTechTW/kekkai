@@ -12,9 +12,8 @@ package config
 //   1. Hand-written, NOT reflect-based. The config struct is small
 //      (seven sections, ~20 fields total) and stable enough that the
 //      duplication is tolerable. Reflect would fire on internal pointer
-//      fields like *bool vs bool oddities, hidden YAML aliases, and
-//      the helper methods (EnforceSSHPrivateValue) would be invisible
-//      to it. Explicit beats clever here.
+//      fields like *bool vs bool oddities and hidden YAML aliases.
+//      Explicit beats clever here.
 //
 //   2. Every diff line is plain text that the logger emits as a
 //      `change="..."` attr. The format mirrors how humans describe
@@ -72,11 +71,8 @@ func DiffConfigs(old, newCfg *Config) []string {
 	out = appendScalarDiff(out, "observability.stats_file",
 		old.Observability.StatsFile, newCfg.Observability.StatsFile)
 
-	// security — EnforceSSHPrivate is a pointer with a "default-true"
-	// getter, so compare via the getter to match the on-disk truth.
-	out = appendScalarDiff(out, "security.enforce_ssh_private",
-		boolStr(old.Security.EnforceSSHPrivateValue()),
-		boolStr(newCfg.Security.EnforceSSHPrivateValue()))
+	// security — allow_ssh_public is the single flag deciding where port 22
+	// is auto-placed (public vs private).
 	out = appendScalarDiff(out, "security.allow_ssh_public",
 		boolStr(old.Security.AllowSSHPublic), boolStr(newCfg.Security.AllowSSHPublic))
 
@@ -144,6 +140,7 @@ func appendStringListDiff(out []string, path string, before, after []string) []s
 // diffUint16Sets returns (added, removed) where:
 //   - added = elements in after but not in before
 //   - removed = elements in before but not in after
+//
 // Both slices are sorted ascending for readability.
 func diffUint16Sets(before, after []uint16) (added, removed []uint16) {
 	bset := make(map[uint16]struct{}, len(before))

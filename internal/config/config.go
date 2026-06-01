@@ -84,29 +84,17 @@ type ObservabilityConfig struct {
 	StatsFile string `yaml:"stats_file"`
 }
 
-// SecurityConfig carries opt-in / opt-out toggles that protect the agent
-// itself from foot-guns like accidentally locking SSH out.
+// SecurityConfig carries the single toggle that decides where port 22 is
+// auto-placed when the user hasn't listed it explicitly.
 type SecurityConfig struct {
-	// EnforceSSHPrivate forces port 22 into filter.private.tcp on startup
-	// (and each reload). If the user hasn't listed 22 anywhere, it is
-	// auto-added to private.tcp. Works together with ingress_allowlist to
-	// guarantee SSH is never accidentally exposed.
-	EnforceSSHPrivate *bool `yaml:"enforce_ssh_private"`
-
-	// AllowSSHPublic lets the user intentionally place port 22 in
-	// filter.public.tcp. Without this flag, 22 in public.tcp is a fatal
-	// validation error. With it, 22 is allowed in public.tcp but emits a
-	// loud WARNING at startup and on every reload.
+	// AllowSSHPublic decides which port group SSH (port 22) is auto-added
+	// to on every load/reload when the user hasn't listed 22 anywhere:
+	//   - true  -> auto-add 22 to filter.public.tcp (open to the internet)
+	//   - false -> auto-add 22 to filter.private.tcp (ingress_allowlist only)
+	// When true and 22 ends up in public.tcp, startup emits a loud WARNING.
+	// This flag replaces the old enforce_ssh_private + allow_ssh_public
+	// pair (which were two ways of expressing the same choice).
 	AllowSSHPublic bool `yaml:"allow_ssh_public"`
-}
-
-// EnforceSSHPrivateValue returns the effective value, defaulting to true
-// when the field is absent from the config file.
-func (s SecurityConfig) EnforceSSHPrivateValue() bool {
-	if s.EnforceSSHPrivate == nil {
-		return true
-	}
-	return *s.EnforceSSHPrivate
 }
 
 type FilterConfig struct {
@@ -286,10 +274,6 @@ func ValuesFromConfig(cfg *Config) Values {
 	if autoUpdateInterval == 0 {
 		autoUpdateInterval = DefaultAutoUpdateInterval
 	}
-	enforce := true
-	if c.Security.EnforceSSHPrivate != nil {
-		enforce = *c.Security.EnforceSSHPrivate
-	}
 	allowICMP := true
 	if c.Filter.AllowICMP != nil {
 		allowICMP = *c.Filter.AllowICMP
@@ -316,7 +300,6 @@ func ValuesFromConfig(cfg *Config) Values {
 		EmergencyBypass:    c.Runtime.EmergencyBypass,
 		PerIPTableSize:     c.Runtime.PerIPTableSize,
 		StatsFile:          c.Observability.StatsFile,
-		EnforceSSHPrivate:  enforce,
 		AllowSSHPublic:     c.Security.AllowSSHPublic,
 		PublicTCP:          c.Filter.Public.TCP,
 		PublicUDP:          c.Filter.Public.UDP,
@@ -454,44 +437,34 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("filter.udp_ephemeral_min: invalid %d (want >= 1024)", c.Filter.UDPEphemeralMin)
 	}
 
-	// --- SSH safety rules -------------------------------------------------
-
-	sshInPublic := containsPort(c.Filter.Public.TCP, SSHPort)
-	sshInPrivate := containsPort(c.Filter.Private.TCP, SSHPort)
-
-	if sshInPublic && !c.Security.AllowSSHPublic {
-		return errors.New(
-			"filter.public.tcp contains 22 but security.allow_ssh_public is false — " +
-				"set security.allow_ssh_public: true to override, or move 22 to filter.private.tcp")
-	}
-	if sshInPublic && sshInPrivate {
-		return errors.New("port 22 cannot appear in both filter.public.tcp and filter.private.tcp")
-	}
-
-	// If SSH is protected by private.tcp but the allowlist is empty we
-	// would lock out every caller. Refuse to start.
-	if sshInPrivate && len(c.Filter.IngressAllowlist) == 0 {
-		return errors.New(
-			"filter.private.tcp contains 22 but filter.ingress_allowlist is empty — " +
-				"this would lock SSH out. add your management network to ingress_allowlist")
-	}
+	// Port 22 landing in both filter.public.tcp and filter.private.tcp is
+	// already rejected by the generic same-port-twice check in
+	// registerProto above ("port 22 appears in both ..."), so no SSH-
+	// specific rule is needed here: security.allow_ssh_public alone decides
+	// which single group Normalize places 22 in.
 	return nil
 }
 
 // Normalize applies schema-level transformations the user shouldn't have
-// to write by hand — notably auto-adding port 22 to private.tcp when
-// security.enforce_ssh_private is set. Returns human-readable log lines
+// to write by hand — notably auto-placing port 22 according to
+// security.allow_ssh_public. If the user already listed 22 in either group
+// their choice is left untouched. Returns human-readable log lines
 // describing each change.
 func (c *Config) Normalize() []string {
 	var logs []string
-	if c.Security.EnforceSSHPrivateValue() {
-		inPublic := containsPort(c.Filter.Public.TCP, SSHPort)
-		inPrivate := containsPort(c.Filter.Private.TCP, SSHPort)
-		if !inPublic && !inPrivate {
-			c.Filter.Private.TCP = append(c.Filter.Private.TCP, SSHPort)
-			logs = append(logs,
-				"auto-added port 22 to filter.private.tcp (security.enforce_ssh_private=true)")
-		}
+	inPublic := containsPort(c.Filter.Public.TCP, SSHPort)
+	inPrivate := containsPort(c.Filter.Private.TCP, SSHPort)
+	if inPublic || inPrivate {
+		return logs
+	}
+	if c.Security.AllowSSHPublic {
+		c.Filter.Public.TCP = append(c.Filter.Public.TCP, SSHPort)
+		logs = append(logs,
+			"auto-added port 22 to filter.public.tcp (security.allow_ssh_public=true)")
+	} else {
+		c.Filter.Private.TCP = append(c.Filter.Private.TCP, SSHPort)
+		logs = append(logs,
+			"auto-added port 22 to filter.private.tcp (security.allow_ssh_public=false)")
 	}
 	return logs
 }

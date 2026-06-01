@@ -67,18 +67,12 @@ func TestValuesFromConfig_NilConfigFallsBackToDefaults(t *testing.T) {
 
 func TestValuesFromConfig_DefaultsNilBoolPointers(t *testing.T) {
 	cfg := &Config{
-		Security: SecurityConfig{
-			EnforceSSHPrivate: nil,
-		},
 		Filter: FilterConfig{
 			AllowICMP: nil,
 			AllowARP:  nil,
 		},
 	}
 	v := ValuesFromConfig(cfg)
-	if !v.EnforceSSHPrivate {
-		t.Fatalf("ValuesFromConfig EnforceSSHPrivate=false, want true")
-	}
 	if !v.AllowICMP {
 		t.Fatalf("ValuesFromConfig AllowICMP=false, want true")
 	}

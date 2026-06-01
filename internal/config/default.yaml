@@ -1,10 +1,12 @@
 # kekkai edge agent configuration.
 #
-# EN: Validation is strict. Unknown keys, invalid ports, bad CIDRs, or rules
-#     that would lock SSH out cause the agent to refuse to start. Use
-#     `kekkai check /path/to/kekkai.yaml` to validate without launching.
-# ZH: 驗證採嚴格模式。未知欄位、非法 port、壞 CIDR、或會鎖掉 SSH 的規則
-#     都會讓 agent 拒絕啟動。可用 `kekkai check <path>` 離線驗證。
+# EN: Validation is strict. Unknown keys, invalid ports, bad CIDRs, or the
+#     same port in both public and private cause the agent to refuse to
+#     start. Use `kekkai check /path/to/kekkai.yaml` to validate without
+#     launching.
+# ZH: 驗證採嚴格模式。未知欄位、非法 port、壞 CIDR、或同一 port 同時出現在
+#     public 與 private 都會讓 agent 拒絕啟動。可用 `kekkai check <path>`
+#     離線驗證。
 #
 # EN: Schema version. Reserved for future migrations.
 # ZH: Schema 版本號。保留給未來的 migration 機制使用。
@@ -101,22 +103,23 @@ observability:
 
 # ---------- security ----------
 security:
-  # EN: Force SSH (port 22) into filter.private.tcp on every load/reload.
-  #     If the user hasn't listed 22 anywhere, it's auto-added. Works with
-  #     ingress_allowlist to guarantee SSH is never accidentally exposed.
-  #     Set to false only if you want full manual control of port 22.
-  # ZH: 強制把 SSH (port 22) 放進 filter.private.tcp。每次載入/reload 都
-  #     檢查。user 沒寫的話會自動加入。搭配 ingress_allowlist 確保 SSH 不
-  #     會意外暴露。設 false 才會完全由 user 自行決定 22 的處置。
-  enforce_ssh_private: __SECURITY_ENFORCE_SSH_PRIVATE__
-
-  # EN: Allow SSH (port 22) to appear in filter.public.tcp. Default false —
-  #     22 in public.tcp is a fatal validation error. Set true only for
-  #     bastion hosts / honeypots / deliberate public SSH; startup emits a
-  #     loud WARNING log when this is enabled with 22 in public.
-  # ZH: 允許 SSH (port 22) 出現在 filter.public.tcp。預設 false — 放 22
-  #     在 public.tcp 會拒絕啟動。true 代表你明確知道要把 SSH 開給全網
-  #     (bastion / honeypot / 測試機)，啟動時會印三行 WARN log。
+  # EN: Single switch for where SSH (port 22) is auto-placed when you
+  #     haven't listed 22 in filter.public.tcp or filter.private.tcp
+  #     yourself. Checked on every load/reload:
+  #       - true  -> auto-add 22 to filter.public.tcp (open to the internet);
+  #                  startup emits a loud WARNING log.
+  #       - false -> auto-add 22 to filter.private.tcp (ingress_allowlist only).
+  #     If you list 22 in a group manually, that choice is left untouched.
+  #     The same port may not appear in both public and private — that is a
+  #     fatal validation error.
+  # ZH: 決定 SSH (port 22) 自動歸到哪個 group 的單一開關。當你沒有自己把
+  #     22 寫進 filter.public.tcp 或 filter.private.tcp 時，每次載入/reload
+  #     會依此處理：
+  #       - true  -> 自動把 22 加進 filter.public.tcp (對全網開放)，
+  #                  啟動時會印一行 WARN log。
+  #       - false -> 自動把 22 加進 filter.private.tcp (只允許 allowlist)。
+  #     你若手動把 22 列進某個 group，就會尊重你的設定不動。
+  #     同一個 port 不能同時出現在 public 與 private，否則拒絕啟動。
   allow_ssh_public: __SECURITY_ALLOW_SSH_PUBLIC__
 
 # ---------- filter rules ----------
@@ -182,10 +185,9 @@ __FILTER_PUBLIC_UDP__
 
   private:
     # EN: Services only ingress_allowlist can reach. Everyone else dropped.
-    #     Port 22 is auto-added here when security.enforce_ssh_private is
-    #     true (the default).
+    #     Port 22 is auto-added here when security.allow_ssh_public is false.
     # ZH: 只允許 ingress_allowlist 連線的服務 port。其他全 DROP。
-    #     security.enforce_ssh_private=true 時 22 會自動加進來。
+    #     security.allow_ssh_public=false 時 22 會自動加進來。
     tcp:
 __FILTER_PRIVATE_TCP__
     udp:

@@ -36,8 +36,7 @@ type Values struct {
 
 	StatsFile string
 
-	EnforceSSHPrivate bool
-	AllowSSHPublic    bool
+	AllowSSHPublic bool
 
 	PublicTCP        []uint16
 	PublicUDP        []uint16
@@ -65,12 +64,11 @@ func DefaultValues() Values {
 		EmergencyBypass:    false,
 		PerIPTableSize:     DefaultPerIPTableSize,
 		StatsFile:          DefaultStatsFile,
-		EnforceSSHPrivate:  true,
-		AllowSSHPublic:     false,
+		AllowSSHPublic:     true,
 		AllowICMP:          true,
 		AllowARP:           true,
 		UDPEphemeralMin:    DefaultUDPEphemeralMin,
-		PublicTCP:          []uint16{80, 443},
+		PublicTCP:          []uint16{22, 80, 443},
 		IngressAllowlist:   []string{"192.168.0.0/16"},
 	}
 }
@@ -132,7 +130,6 @@ func Render(v Values) string {
 	replace("__RUNTIME_EMERGENCY_BYPASS__", boolYAML(v.EmergencyBypass))
 	replace("__RUNTIME_PERIP_TABLE_SIZE__", strconv.FormatUint(uint64(v.PerIPTableSize), 10))
 	replace("__OBSERVABILITY_STATS_FILE__", v.StatsFile)
-	replace("__SECURITY_ENFORCE_SSH_PRIVATE__", boolYAML(v.EnforceSSHPrivate))
 	replace("__SECURITY_ALLOW_SSH_PUBLIC__", boolYAML(v.AllowSSHPublic))
 	replace("__FILTER_ALLOW_ICMP__", boolYAML(v.AllowICMP))
 	replace("__FILTER_ALLOW_ARP__", boolYAML(v.AllowARP))
