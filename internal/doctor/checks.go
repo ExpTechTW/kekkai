@@ -155,44 +155,31 @@ func checkConfig(r *Runner) *config.Config {
 		Detail: "schema ok, ports unique, CIDRs parse",
 	})
 
-	// Security sanity checks.
-	hasSSHPrivate := false
-	for _, p := range cfg.Filter.Private.TCP {
-		if p == 22 {
-			hasSSHPrivate = true
-			break
-		}
-	}
-	hasSSHPublic := false
-	for _, p := range cfg.Filter.Public.TCP {
-		if p == 22 {
-			hasSSHPublic = true
-			break
-		}
-	}
-
+	// Security sanity checks. SSH (port 22) is applied to the running filter
+	// implicitly per security.allow_ssh_public — it is never listed in the
+	// config port groups — so the flag is the source of truth here.
 	switch {
-	case hasSSHPublic:
+	case cfg.SSHIsPublic():
 		sec.Add(Result{
 			Status: StatusWarn,
 			Title:  "SSH exposure",
-			Detail: "port 22 in filter.public.tcp — accessible from anywhere",
+			Detail: "SSH (port 22) reachable from any source (allow_ssh_public=true)",
 			Suggestions: []string{
-				"consider moving 22 to filter.private.tcp and setting an allowlist",
+				"set security.allow_ssh_public: false to gate SSH behind ingress_allowlist",
 			},
 		})
-	case hasSSHPrivate && len(cfg.Filter.IngressAllowlist) == 0:
+	case len(cfg.Filter.IngressAllowlist) == 0:
 		sec.Add(Result{
 			Status:      StatusError,
 			Title:       "SSH allowlist",
-			Detail:      "private.tcp contains 22 but ingress_allowlist is empty",
+			Detail:      "SSH gated to private (allow_ssh_public=false) but ingress_allowlist is empty — SSH is locked out",
 			Suggestions: []string{"add your management network to filter.ingress_allowlist"},
 		})
-	case hasSSHPrivate:
+	default:
 		sec.Add(Result{
 			Status: StatusOK,
 			Title:  "SSH allowlist",
-			Detail: fmt.Sprintf("%d allowlist entries gate port 22", len(cfg.Filter.IngressAllowlist)),
+			Detail: fmt.Sprintf("%d allowlist entries gate SSH (port 22)", len(cfg.Filter.IngressAllowlist)),
 		})
 	}
 
@@ -294,6 +281,111 @@ func systemctlShow(unit, prop string) string {
 
 // ---------- kernel / bpf -------------------------------------------------
 
+// kernelMajorMinor returns the running kernel's leading major.minor read
+// from /proc/sys/kernel/osrelease. ok is false if it can't be parsed.
+func kernelMajorMinor() (major, minor int, ok bool) {
+	data, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return 0, 0, false
+	}
+	return parseKernelMajorMinor(string(data))
+}
+
+// parseKernelMajorMinor parses the leading major.minor from an osrelease
+// string (e.g. "5.15.0-179-generic" -> 5, 15). ok is false if the string
+// doesn't start with two dot-separated integers.
+func parseKernelMajorMinor(rel string) (major, minor int, ok bool) {
+	parts := strings.SplitN(strings.TrimSpace(rel), ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return maj, min, true
+}
+
+// kernelUpgradeSteps returns the ordered remediation a < 6.6 box needs.
+// Outbound UDP (DNS) is broken right now, so the package manager can't fetch
+// until the filter is bypassed — hence `kekkai bypass on` comes FIRST. That
+// bypass is transient (SIGUSR1, not persisted), so a reboot brings the
+// filter back automatically on the new kernel; no `bypass off` needed.
+func kernelUpgradeSteps() []string {
+	return []string{
+		"DNS is blocked now — bypass the filter first so the package manager can fetch:",
+		"1) sudo kekkai bypass on   (transient; auto-clears on reboot)",
+		"2) " + kernelUpgradeCommand(),
+		"3) sudo reboot   (filter returns on the new kernel; verify: uname -r >= 6.6)",
+	}
+}
+
+// kernelUpgradeCommand returns the distro-appropriate command to install a
+// kernel >= 6.6, derived from /etc/os-release. Best-effort — unknown distros
+// get a generic pointer.
+func kernelUpgradeCommand() string {
+	id, idLike := osReleaseIDs()
+	return kernelUpgradeCommandFor(id, idLike)
+}
+
+func osReleaseIDs() (id, idLike string) {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return "", ""
+	}
+	return parseOSReleaseIDs(string(data))
+}
+
+// parseOSReleaseIDs pulls the ID= and ID_LIKE= values out of os-release
+// content, stripping the optional surrounding quotes.
+func parseOSReleaseIDs(content string) (id, idLike string) {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "ID="):
+			id = strings.Trim(strings.TrimPrefix(line, "ID="), `"'`)
+		case strings.HasPrefix(line, "ID_LIKE="):
+			idLike = strings.Trim(strings.TrimPrefix(line, "ID_LIKE="), `"'`)
+		}
+	}
+	return id, idLike
+}
+
+// kernelUpgradeCommandFor maps a distro id (+ ID_LIKE families) to the right
+// kernel-install command. Matched most-specific first.
+func kernelUpgradeCommandFor(id, idLike string) string {
+	has := func(want string) bool {
+		if id == want {
+			return true
+		}
+		for _, f := range strings.Fields(idLike) {
+			if f == want {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case id == "ubuntu":
+		return "sudo apt update && sudo apt install --install-recommends linux-generic-hwe-22.04"
+	case has("debian"):
+		return "sudo apt update && sudo apt install -t $(. /etc/os-release; echo $VERSION_CODENAME)-backports linux-image-amd64   (enable backports first)"
+	case id == "fedora":
+		return "sudo dnf upgrade --refresh kernel"
+	case id == "centos" || id == "rocky" || id == "almalinux" || has("rhel"):
+		return "sudo dnf upgrade kernel   (RHEL-family stock kernels lag; ELRepo kernel-ml gives >= 6.6)"
+	case has("arch"):
+		return "sudo pacman -Syu linux"
+	case strings.HasPrefix(id, "opensuse") || has("suse"):
+		return "sudo zypper refresh && sudo zypper install kernel-default"
+	case id == "alpine":
+		return "sudo apk update && sudo apk add linux-lts"
+	default:
+		return "upgrade your distro's kernel package to >= 6.6 (see your distro's docs)"
+	}
+}
+
 func checkKernel(r *Runner) {
 	sec := r.Section("kernel / ebpf")
 
@@ -306,14 +398,26 @@ func checkKernel(r *Runner) {
 		return
 	}
 
-	// Kernel version.
+	// Kernel version. TCX egress seeding needs >= 6.6, and that seed is the
+	// ONLY thing that lets outbound UDP return traffic (DNS, NTP, ...) back
+	// through the XDP filter — older kernels silently drop those replies.
+	// So treat < 6.6 as a hard error, not a cosmetic note.
 	if data, err := os.ReadFile("/proc/version"); err == nil {
 		line := strings.TrimSpace(string(data))
 		// Full line is verbose; keep first 70 chars.
 		if len(line) > 70 {
 			line = line[:70] + "…"
 		}
-		sec.Add(Result{Status: StatusOK, Title: "kernel version", Detail: line})
+		if major, minor, ok := kernelMajorMinor(); ok && (major < 6 || (major == 6 && minor < 6)) {
+			sec.Add(Result{
+				Status:      StatusError,
+				Title:       "kernel version",
+				Detail:      fmt.Sprintf("%d.%d too old — TCX egress unsupported (<6.6); outbound UDP return (DNS/NTP) is dropped", major, minor),
+				Suggestions: kernelUpgradeSteps(),
+			})
+		} else {
+			sec.Add(Result{Status: StatusOK, Title: "kernel version", Detail: line})
+		}
 	}
 
 	// BTF.
@@ -439,12 +543,21 @@ func nativeCapable(driver string) bool {
 	return native[driver]
 }
 
-func xdpAttached(iface string) bool {
+// XDPAttached reports whether an XDP program is attached to iface (covers
+// native, generic "xdpgeneric", and offload modes). ok is false when
+// attachment can't be determined — e.g. `ip` is missing — in which case the
+// attached bool is meaningless and callers should not infer "bypassed".
+func XDPAttached(iface string) (attached, ok bool) {
 	out, err := exec.Command("ip", "-o", "link", "show", "dev", iface).Output()
 	if err != nil {
-		return false
+		return false, false
 	}
-	return strings.Contains(string(out), "xdp")
+	return strings.Contains(string(out), "xdp"), true
+}
+
+func xdpAttached(iface string) bool {
+	attached, ok := XDPAttached(iface)
+	return ok && attached
 }
 
 func sysfsTxPath(iface, metric string) string {

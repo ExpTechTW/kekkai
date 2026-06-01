@@ -30,14 +30,14 @@ func cmdPorts(args []string) int {
 }
 
 func renderPortsView(cfgPath string, cfg *config.Config, color bool) string {
+	bypassed, reason := filterBypassed(cfg)
+
 	if !color {
-		ssh := "port 22 not present in either list"
-		if hasPort(cfg.Filter.Public.TCP, config.SSHPort) {
-			ssh = "port 22 is in public.tcp"
-		} else if hasPort(cfg.Filter.Private.TCP, config.SSHPort) {
-			ssh = "port 22 is in private.tcp (allowlist-gated)"
+		ssh := "port 22 private (allowlist-gated) — allow_ssh_public=false"
+		if cfg.SSHIsPublic() {
+			ssh = "port 22 public (any source) — allow_ssh_public=true"
 		}
-		return fmt.Sprintf(
+		body := fmt.Sprintf(
 			"kekkai ports  %s\nPUBLIC  tcp: %s  udp: %s\nPRIVATE tcp: %s  udp: %s\nSSH exposure: %s\ningress_allowlist entries: %d",
 			cfgPath,
 			formatPortList(cfg.Filter.Public.TCP),
@@ -47,6 +47,10 @@ func renderPortsView(cfgPath string, cfg *config.Config, color bool) string {
 			ssh,
 			len(cfg.Filter.IngressAllowlist),
 		)
+		if bypassed {
+			return bypassBanner(reason, false) + "\n" + body
+		}
+		return body
 	}
 
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a78bfa")).
@@ -85,24 +89,25 @@ func renderPortsView(cfgPath string, cfg *config.Config, color bool) string {
 			label.Render("udp") + val.Render(formatPortList(cfg.Filter.Private.UDP)),
 		}, "\n"))
 
-	sshLine := "SSH exposure: port 22 not present in either list"
-	sshStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#94a3b8"))
-	if hasPort(cfg.Filter.Public.TCP, config.SSHPort) {
-		sshLine = "SSH exposure: port 22 is in public.tcp"
+	sshLine := "SSH exposure: port 22 private (allowlist-gated) — allow_ssh_public=false"
+	sshStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#22d3ee"))
+	if cfg.SSHIsPublic() {
+		sshLine = "SSH exposure: port 22 public (any source) — allow_ssh_public=true"
 		sshStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f43f5e"))
-	} else if hasPort(cfg.Filter.Private.TCP, config.SSHPort) {
-		sshLine = "SSH exposure: port 22 is in private.tcp (allowlist-gated)"
-		sshStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#22d3ee"))
 	}
 	allowLine := lipgloss.NewStyle().Foreground(lipgloss.Color("#64748b")).
 		Render(fmt.Sprintf("ingress_allowlist entries: %d", len(cfg.Filter.IngressAllowlist)))
 
-	return strings.Join([]string{
+	sections := []string{
 		title + "  " + pathLine,
 		lipgloss.JoinHorizontal(lipgloss.Top, publicBox, " ", privateBox),
 		sshStyle.Render(sshLine),
 		allowLine,
-	}, "\n")
+	}
+	if bypassed {
+		sections = append([]string{bypassBanner(reason, true)}, sections...)
+	}
+	return strings.Join(sections, "\n")
 }
 
 func formatPortList(ports []uint16) string {
@@ -116,13 +121,4 @@ func formatPortList(ports []uint16) string {
 		out = append(out, strconv.FormatUint(uint64(p), 10))
 	}
 	return strings.Join(out, ",")
-}
-
-func hasPort(list []uint16, p uint16) bool {
-	for _, v := range list {
-		if v == p {
-			return true
-		}
-	}
-	return false
 }

@@ -57,7 +57,7 @@ type UpdateConfig struct {
 	// AutoUpdateInterval hours and, if a strictly newer version exists,
 	// downloads it to /var/lib/kekkai/staged/. Default: true.
 	//
-	// Pointer-bool so Normalize() can distinguish "user set false" from
+	// Pointer-bool so applyDefaults can distinguish "user set false" from
 	// "omitted", matching the pattern used by filter.allow_icmp etc.
 	AutoUpdateDownload *bool `yaml:"auto_update_download"`
 
@@ -115,12 +115,10 @@ type PortGroup struct {
 // LoadResult carries the loaded config and any side-effects of loading
 // (migrations, backups) so main.go can log them.
 type LoadResult struct {
-	Config       *Config
-	Migrated     bool   // true if version was bumped during load
-	FromVersion  int    // version found on disk
-	BackupPath   string // non-empty if a migration backup was written
-	Normalized   bool   // true if Normalize() auto-added anything
-	NormalizeLog []string
+	Config      *Config
+	Migrated    bool   // true if version was bumped during load
+	FromVersion int    // version found on disk
+	BackupPath  string // non-empty if a migration backup was written
 }
 
 // LoadOptions tune the loader for different CLI entry points.
@@ -195,23 +193,12 @@ func LoadWith(path string, opts LoadOptions) (*LoadResult, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	logs := cfg.Normalize()
-	if len(logs) > 0 {
-		res.Normalized = true
-		res.NormalizeLog = logs
-		// Re-validate after normalization to catch any issues the
-		// auto-inserted values might introduce (they shouldn't, but belt
-		// and braces).
-		if err := cfg.Validate(); err != nil {
-			return nil, fmt.Errorf("post-normalize validation: %w", err)
-		}
-	}
 	return res, nil
 }
 
-// Parse decodes a byte slice into a Config and runs the full validate +
-// normalize pipeline. Used by the -check and -show CLI flags and by tests.
-// It does NOT touch the filesystem.
+// Parse decodes a byte slice into a Config and runs the full migrate +
+// default + validate pipeline. Used by the -check and -show CLI flags and
+// by tests. It does NOT touch the filesystem.
 func Parse(data []byte) (*Config, error) {
 	fromVersion, err := peekVersion(data)
 	if err != nil {
@@ -223,15 +210,6 @@ func Parse(data []byte) (*Config, error) {
 	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-	if _, err := func() ([]string, error) {
-		logs := cfg.Normalize()
-		if err := cfg.Validate(); err != nil {
-			return logs, fmt.Errorf("post-normalize validation: %w", err)
-		}
-		return logs, nil
-	}(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -370,8 +348,8 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// Validate enforces the schema rules. Called after every Load and after
-// every Normalize.
+// Validate enforces the schema rules. Called after applyDefaults on every
+// Load and Parse.
 func (c *Config) Validate() error {
 	if c.Version != 0 && c.Version > CurrentVersion {
 		return fmt.Errorf("config version %d is newer than agent supports (max %d)", c.Version, CurrentVersion)
@@ -438,42 +416,56 @@ func (c *Config) Validate() error {
 	}
 
 	// Port 22's manual placement must agree with security.allow_ssh_public.
-	// Leaving 22 unlisted is fine — Normalize places it per the flag — but
-	// listing it in the group that contradicts the flag is almost always an
-	// accident, so reject it loudly instead of silently picking a side.
-	// (22 in BOTH groups is already caught by the generic same-port-twice
-	// check in registerProto above.)
+	// Leaving 22 unlisted is fine — it is applied to the running filter per
+	// the flag (never written to config) — but listing it in the group that
+	// contradicts the flag is almost always an accident, so reject it loudly
+	// instead of silently picking a side. (22 in BOTH groups is already
+	// caught by the generic same-port-twice check in registerProto above.)
 	if c.Security.AllowSSHPublic && containsPort(c.Filter.Private.TCP, SSHPort) {
 		return errors.New(
 			"filter.private.tcp contains 22 but security.allow_ssh_public is true — " +
-				"remove 22 from private.tcp (it is auto-added to public.tcp), " +
+				"remove 22 from private.tcp (allow_ssh_public:true already allows SSH on public), " +
 				"or set security.allow_ssh_public: false")
 	}
 	if !c.Security.AllowSSHPublic && containsPort(c.Filter.Public.TCP, SSHPort) {
 		return errors.New(
 			"filter.public.tcp contains 22 but security.allow_ssh_public is false — " +
-				"remove 22 from public.tcp (it is auto-added to private.tcp), " +
+				"remove 22 from public.tcp (allow_ssh_public:false already allows SSH on private), " +
 				"or set security.allow_ssh_public: true")
 	}
 	return nil
 }
 
-// Normalize applies schema-level transformations the user shouldn't have
-// to write by hand — notably auto-placing port 22 according to
-// security.allow_ssh_public when it isn't listed anywhere. If 22 is already
-// listed it can only be in the group that agrees with the flag (Validate
-// rejects the contradicting placement first), so it is left untouched.
-// Returns human-readable log lines describing each change.
-func (c *Config) Normalize() []string {
-	if containsPort(c.Filter.Public.TCP, SSHPort) || containsPort(c.Filter.Private.TCP, SSHPort) {
-		return nil
+// SSHIsPublic reports whether SSH (port 22) is reachable from any source.
+// Validate guarantees 22 never sits in the group that contradicts
+// security.allow_ssh_public, so the flag alone is the source of truth: true
+// means 22 is (or will be) in the public set, false means the private set.
+func (c *Config) SSHIsPublic() bool { return c.Security.AllowSSHPublic }
+
+// EffectivePublicTCP returns the TCP ports to program into the public
+// port-set map: the user's configured ports plus SSH (port 22) when
+// allow_ssh_public is true. The implicit SSH port lives only in the running
+// filter — it is never written back to the config file. Use this (not
+// Filter.Public.TCP) when populating the eBPF maps.
+func (c *Config) EffectivePublicTCP() []uint16 {
+	return withImplicitSSH(c.Filter.Public.TCP, c.Security.AllowSSHPublic)
+}
+
+// EffectivePrivateTCP is the private-group counterpart of EffectivePublicTCP:
+// it adds SSH (port 22) when allow_ssh_public is false.
+func (c *Config) EffectivePrivateTCP() []uint16 {
+	return withImplicitSSH(c.Filter.Private.TCP, !c.Security.AllowSSHPublic)
+}
+
+// withImplicitSSH returns ports with SSHPort appended when add is true and
+// it isn't already present. The input slice is never mutated.
+func withImplicitSSH(ports []uint16, add bool) []uint16 {
+	if !add || containsPort(ports, SSHPort) {
+		return ports
 	}
-	if c.Security.AllowSSHPublic {
-		c.Filter.Public.TCP = append(c.Filter.Public.TCP, SSHPort)
-		return []string{"auto-added port 22 to filter.public.tcp (security.allow_ssh_public=true)"}
-	}
-	c.Filter.Private.TCP = append(c.Filter.Private.TCP, SSHPort)
-	return []string{"auto-added port 22 to filter.private.tcp (security.allow_ssh_public=false)"}
+	out := make([]uint16, len(ports), len(ports)+1)
+	copy(out, ports)
+	return append(out, SSHPort)
 }
 
 // ResolveInterface fetches the *net.Interface for the configured name.

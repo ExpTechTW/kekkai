@@ -96,7 +96,7 @@ sudo kekkai ports /tmp/new-kekkai.yaml          # 指定檔案
 
 ### 2.4 kekkai show
 
-印出正規化後的 config（post-migrate, post-defaults, post-normalize），**read-only**。輸入是舊版 v1 時顯示遷移後的 v2，但不會寫回磁碟。
+印出正規化後的 config（post-migrate, post-defaults），**read-only**。輸入是舊版時顯示遷移後的版本，但不會寫回磁碟。注意：SSH (22) 是隱式套用到執行中的 filter，**不會**出現在這份輸出裡。
 
 ```bash
 sudo kekkai show > /tmp/current.yaml       # 看 agent 實際在用什麼
@@ -104,8 +104,8 @@ sudo kekkai show /tmp/test.yaml            # 指定檔案
 ```
 
 用途：
-- 檢查 `security.allow_ssh_public` 把 22 自動加進 `public.tcp` 還是 `private.tcp`
-- v1 遷移時預覽新版長怎樣（但要 daemon 正式啟動才會真的寫回）
+- 確認使用者顯式寫進 config 的 port（22 不在內，由 `allow_ssh_public` 隱式處理）
+- 舊版遷移時預覽新版長怎樣（但要 daemon 正式啟動才會真的寫回）
 - Diff 兩個 config 找差異
 
 ### 2.5 kekkai backup
@@ -297,9 +297,9 @@ journalctl -u kekkai-agent -p err            # 只看 error 級別
 ```
 
 Reload 成功時 journal 會記：
-- `filter applied: public tcp=[...] udp=[...] ...`
+- `filter applied: public tcp=[...] udp=[...] ...`（這裡的 port 集合是「有效值」，含隱式套用的 SSH 22）
 - `auto-backup written: /etc/kekkai/kekkai.yaml.auto_backup.20260414T...`（如果 struct 有變化）
-- `normalize: auto-added port 22 to filter.public.tcp (security.allow_ssh_public=true)`（如果 Normalize 動到 config；`allow_ssh_public=false` 時則加進 `filter.private.tcp`）
+- `SECURITY: SSH (port 22) is reachable from any source`（當 `allow_ssh_public=true`）
 
 ### 4.3 熱重載 vs 重啟
 
@@ -372,16 +372,16 @@ observability:
   stats_file: /var/run/kekkai/stats.txt
 
 security:
-  allow_ssh_public: true     # true=自動把 22 放 public.tcp（預設）；false=放 private.tcp
+  allow_ssh_public: true     # true=SSH 開 public（預設）；false=SSH 開 private。22 不寫進 config
 
 filter:
   public:
-    tcp:                     # allow_ssh_public=true 時 22 會被 normalize 自動加
+    tcp:                     # 只列你要開的 service port；SSH 22 由 allow_ssh_public 隱式處理
       - 80
       - 443
     udp:
   private:
-    tcp:                     # allow_ssh_public=false 時 22 改加在這
+    tcp:
     udp:
   ingress_allowlist:         # private 服務的來源白名單
     - 10.0.0.0/8
@@ -419,14 +419,19 @@ Load / reload 都會跑：
 - 所有 port 在 1..65535
 - 同一 proto 的 port 不能在 public 和 private 同時出現
 - 所有 CIDR 必須解析成功
-- SSH (port 22) 歸位必須和 `allow_ssh_public` 一致（不填則自動歸位）：
+- 若你「顯式」寫了 SSH (port 22)，它的 group 必須和 `allow_ssh_public` 一致：
   - `allow_ssh_public: true` 但 22 在 `private.tcp` → **拒絕啟動**
   - `allow_ssh_public: false` 但 22 在 `public.tcp` → **拒絕啟動**
   - 22 同時在 `public.tcp` 和 `private.tcp` → **拒絕啟動**（一般「同 port 不能跨 public/private」規則）
 
-### 5.6 Normalize 行為
+### 5.6 SSH (port 22) 的隱式套用
 
-`security.allow_ssh_public` 決定 22 自動歸到哪個 group：若 22 既不在 `public.tcp` 也不在 `private.tcp`，`true`（預設）時自動加進 `public.tcp`、`false` 時加進 `private.tcp`。你若已手動列入某個 group 則不動。log 會記 `normalize: auto-added port 22 to filter.public.tcp`（或 `.private.tcp`）。
+agent **不會**把任何 port 主動寫進 config——只有使用者自己寫的才會出現在檔案裡。SSH 22 由 `security.allow_ssh_public` 控制，且**只**套用到執行中的 eBPF filter，不寫回 config：
+
+- `true`（預設）→ SSH 開在 public（任何來源），啟動印 WARN。
+- `false` → SSH 開在 private（只允許 `ingress_allowlist`）。
+
+因此 `kekkai show` / `kekkai ports` 看到的 config port 清單不含 22；`kekkai-agent` 的 `filter applied` log 則會顯示含 22 的「有效」清單。你也可以選擇顯式把 22 寫進和 flag 一致的 group（見上面驗證規則），但通常不需要。
 
 ---
 

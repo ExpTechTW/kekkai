@@ -68,8 +68,10 @@ func DefaultValues() Values {
 		AllowICMP:          true,
 		AllowARP:           true,
 		UDPEphemeralMin:    DefaultUDPEphemeralMin,
-		PublicTCP:          []uint16{22, 80, 443},
-		IngressAllowlist:   []string{"192.168.0.0/16"},
+		// 22 is intentionally NOT listed — allow_ssh_public:true applies it
+		// to the running filter implicitly. We never write 22 into config.
+		PublicTCP:        []uint16{80, 443},
+		IngressAllowlist: []string{"192.168.0.0/16"},
 	}
 }
 
