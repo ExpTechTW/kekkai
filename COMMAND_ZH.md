@@ -104,7 +104,7 @@ sudo kekkai show /tmp/test.yaml            # 指定檔案
 ```
 
 用途：
-- 檢查 `security.enforce_ssh_private` 是否把 22 自動加進 `private.tcp`
+- 檢查 `security.allow_ssh_public` 把 22 自動加進 `public.tcp` 還是 `private.tcp`
 - v1 遷移時預覽新版長怎樣（但要 daemon 正式啟動才會真的寫回）
 - Diff 兩個 config 找差異
 
@@ -299,7 +299,7 @@ journalctl -u kekkai-agent -p err            # 只看 error 級別
 Reload 成功時 journal 會記：
 - `filter applied: public tcp=[...] udp=[...] ...`
 - `auto-backup written: /etc/kekkai/kekkai.yaml.auto_backup.20260414T...`（如果 struct 有變化）
-- `normalize: auto-added port 22 to filter.private.tcp (security.enforce_ssh_private=true)`（如果 Normalize 動到 config）
+- `normalize: auto-added port 22 to filter.public.tcp (security.allow_ssh_public=true)`（如果 Normalize 動到 config；`allow_ssh_public=false` 時則加進 `filter.private.tcp`）
 
 ### 4.3 熱重載 vs 重啟
 
@@ -372,17 +372,16 @@ observability:
   stats_file: /var/run/kekkai/stats.txt
 
 security:
-  enforce_ssh_private: true  # 自動把 22 放進 private.tcp
-  allow_ssh_public: false    # 允許 22 放 public.tcp（危險）
+  allow_ssh_public: true     # true=自動把 22 放 public.tcp（預設）；false=放 private.tcp
 
 filter:
   public:
-    tcp:
+    tcp:                     # allow_ssh_public=true 時 22 會被 normalize 自動加
       - 80
       - 443
     udp:
   private:
-    tcp:                     # 22 會被 normalize 自動加
+    tcp:                     # allow_ssh_public=false 時 22 改加在這
     udp:
   ingress_allowlist:         # private 服務的來源白名單
     - 10.0.0.0/8
@@ -420,14 +419,14 @@ Load / reload 都會跑：
 - 所有 port 在 1..65535
 - 同一 proto 的 port 不能在 public 和 private 同時出現
 - 所有 CIDR 必須解析成功
-- SSH 安全檢查：
-  - `allow_ssh_public=false` 時 22 在 `public.tcp` → **拒絕啟動**
-  - 22 同時在 public 和 private → **拒絕啟動**
-  - 22 在 `private.tcp` 且 `ingress_allowlist` 空 → **拒絕啟動**（SSH lockout 防護）
+- SSH (port 22) 歸位必須和 `allow_ssh_public` 一致（不填則自動歸位）：
+  - `allow_ssh_public: true` 但 22 在 `private.tcp` → **拒絕啟動**
+  - `allow_ssh_public: false` 但 22 在 `public.tcp` → **拒絕啟動**
+  - 22 同時在 `public.tcp` 和 `private.tcp` → **拒絕啟動**（一般「同 port 不能跨 public/private」規則）
 
 ### 5.6 Normalize 行為
 
-`security.enforce_ssh_private: true`（預設）時，若 22 既不在 `public.tcp` 也不在 `private.tcp`，會自動加進 `private.tcp`。log 會記 `normalize: auto-added port 22 to filter.private.tcp`。
+`security.allow_ssh_public` 決定 22 自動歸到哪個 group：若 22 既不在 `public.tcp` 也不在 `private.tcp`，`true`（預設）時自動加進 `public.tcp`、`false` 時加進 `private.tcp`。你若已手動列入某個 group 則不動。log 會記 `normalize: auto-added port 22 to filter.public.tcp`（或 `.private.tcp`）。
 
 ---
 
@@ -537,10 +536,11 @@ sudo kekkai status                              # 看 TUI
 1. 從 `https://github.com/ExpTechTW/kekkai/releases` 抓目標 channel（release / pre-release）的最新資產
 2. 下載 `kekkai-agent-linux-<arch>` 和 `kekkai-linux-<arch>` 到 tmp 目錄
 3. 用新 agent binary 跑 `-check` 驗 `/etc/kekkai/kekkai.yaml`（失敗中止，不動 service）
-4. 三路 diff：agent / cli / kekkai.sh 個別比對 sha256，每個獨立決定要不要更新
-5. agent 有變 → `systemctl restart kekkai-agent`（失敗自動 rollback 到 `kekkai-agent.prev`）
-6. cli 或 kekkai.sh 有變 → 個別覆寫，不 restart service
-7. 最後印藍色 `UPDATED`（有變）或綠色 `ALREADY UP-TO-DATE`（全部沒變）結果區塊
+4. 只有在 `config version` 變更時，才用新 agent binary 產生 canonical config；先備份再寫回 `/etc/kekkai/kekkai.yaml`（保留原有值並補新欄位）
+5. 三路 diff：agent / cli / kekkai.sh 個別比對 sha256，每個獨立決定要不要更新
+6. agent 有變 → `systemctl restart kekkai-agent`（失敗自動 rollback 到 `kekkai-agent.prev`）
+7. cli 或 kekkai.sh 有變 → 個別覆寫，不 restart service
+8. 最後印藍色 `UPDATED`（有變）或綠色 `ALREADY UP-TO-DATE`（全部沒變）結果區塊
 
 ### 7.7 開發者本機建置（maintainer 用）
 
@@ -594,14 +594,15 @@ journalctl -u kekkai-agent -n 50 --no-pager
 |---|---|
 | `interface.name is required` | config 少 `interface.name` 欄位 |
 | `lookup iface eth0: ...` | 網卡名錯誤，用 `ip -br link` 查 |
-| `this would lock SSH out` | `private.tcp` 有 22 但 `ingress_allowlist` 空，補上你的管理網段 |
-| `filter.public.tcp contains 22 but security.allow_ssh_public is false` | 把 22 搬到 `private.tcp`，或 `security.allow_ssh_public: true` |
-| `unknown field` | config 有拼錯的欄位（`KnownFields(true)` 嚴格檢查） |
+| `port 22 appears in both filter.public.tcp and filter.private.tcp` | 22 只能在其中一個 group，移除其一（或交給 `allow_ssh_public` 自動歸位） |
+| `filter.private.tcp contains 22 but security.allow_ssh_public is true` | 22 從 private 移除（會自動進 public），或把 `allow_ssh_public` 改 false |
+| `filter.public.tcp contains 22 but security.allow_ssh_public is false` | 22 從 public 移除（會自動進 private），或把 `allow_ssh_public` 改 true |
+| `unknown field` | config 有拼錯的欄位（`KnownFields(true)` 嚴格檢查；舊版 `enforce_ssh_private` 會在 migration 時自動移除，不會報這個） |
 | `attach xdp: ...` | kernel 不支援 XDP、網卡 driver 不合、或 `CAP_BPF` 不夠 |
 
 ### 9.2 SSH 連不上
 
-先確認你的來源 IP 在 `ingress_allowlist` 範圍內：
+先確認 22 在哪個 group：`allow_ssh_public: true`（預設）時 22 在 `public.tcp`，任何來源都能連，連不上多半是別的問題（XDP 沒 attach、走錯介面、`static_blocklist` 命中）。若你設成 `false`，22 在 `private.tcp`，要先確認來源 IP 在 `ingress_allowlist` 範圍內：
 
 ```bash
 who                                # 目前 SSH session 來源

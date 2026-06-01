@@ -18,6 +18,8 @@ func DefaultTemplate() string { return defaultTemplate }
 // optional — empty values fall back to conservative defaults so the
 // output is always valid YAML.
 type Values struct {
+	Version int
+
 	NodeID     string
 	NodeRegion string
 
@@ -25,13 +27,16 @@ type Values struct {
 	InterfaceXDPMode string
 	UpdateChannel    string
 
+	AutoUpdateDownload bool
+	AutoUpdateReload   bool
+	AutoUpdateInterval int
+
 	EmergencyBypass bool
 	PerIPTableSize  uint32
 
 	StatsFile string
 
-	EnforceSSHPrivate bool
-	AllowSSHPublic    bool
+	AllowSSHPublic bool
 
 	PublicTCP        []uint16
 	PublicUDP        []uint16
@@ -49,19 +54,22 @@ type Values struct {
 // fields they have better information for (hostname, detected iface, ...).
 func DefaultValues() Values {
 	return Values{
-		NodeRegion:        "default",
-		InterfaceXDPMode:  DefaultXDPMode,
-		UpdateChannel:     DefaultUpdateChannel,
-		EmergencyBypass:   false,
-		PerIPTableSize:    DefaultPerIPTableSize,
-		StatsFile:         DefaultStatsFile,
-		EnforceSSHPrivate: true,
-		AllowSSHPublic:    false,
-		AllowICMP:         true,
-		AllowARP:          true,
-		UDPEphemeralMin:   DefaultUDPEphemeralMin,
-		PublicTCP:         []uint16{80, 443},
-		IngressAllowlist:  []string{"192.168.0.0/16"},
+		Version:            CurrentVersion,
+		NodeRegion:         "default",
+		InterfaceXDPMode:   DefaultXDPMode,
+		UpdateChannel:      DefaultUpdateChannel,
+		AutoUpdateDownload: DefaultAutoUpdateDownload,
+		AutoUpdateReload:   false,
+		AutoUpdateInterval: DefaultAutoUpdateInterval,
+		EmergencyBypass:    false,
+		PerIPTableSize:     DefaultPerIPTableSize,
+		StatsFile:          DefaultStatsFile,
+		AllowSSHPublic:     true,
+		AllowICMP:          true,
+		AllowARP:           true,
+		UDPEphemeralMin:    DefaultUDPEphemeralMin,
+		PublicTCP:          []uint16{22, 80, 443},
+		IngressAllowlist:   []string{"192.168.0.0/16"},
 	}
 }
 
@@ -69,6 +77,9 @@ func DefaultValues() Values {
 // document. Placeholders unfilled by v fall back to hard defaults so the
 // result always parses (modulo validation errors like empty allowlist).
 func Render(v Values) string {
+	if v.Version <= 0 {
+		v.Version = CurrentVersion
+	}
 	if v.NodeRegion == "" {
 		v.NodeRegion = "default"
 	}
@@ -77,6 +88,9 @@ func Render(v Values) string {
 	}
 	if v.UpdateChannel == "" {
 		v.UpdateChannel = DefaultUpdateChannel
+	}
+	if v.AutoUpdateInterval == 0 {
+		v.AutoUpdateInterval = DefaultAutoUpdateInterval
 	}
 	if v.PerIPTableSize == 0 {
 		v.PerIPTableSize = DefaultPerIPTableSize
@@ -104,15 +118,18 @@ func Render(v Values) string {
 		replace(placeholder, value)
 	}
 
+	replace("__VERSION__", strconv.FormatInt(int64(v.Version), 10))
 	replace("__NODE_ID__", v.NodeID)
 	replace("__NODE_REGION__", v.NodeRegion)
 	replace("__INTERFACE_NAME__", v.InterfaceName)
 	replace("__INTERFACE_XDP_MODE__", v.InterfaceXDPMode)
 	replace("__UPDATE_CHANNEL__", v.UpdateChannel)
+	replace("__AUTO_UPDATE_DOWNLOAD__", boolYAML(v.AutoUpdateDownload))
+	replace("__AUTO_UPDATE_RELOAD__", boolYAML(v.AutoUpdateReload))
+	replace("__AUTO_UPDATE_INTERVAL__", strconv.FormatInt(int64(v.AutoUpdateInterval), 10))
 	replace("__RUNTIME_EMERGENCY_BYPASS__", boolYAML(v.EmergencyBypass))
 	replace("__RUNTIME_PERIP_TABLE_SIZE__", strconv.FormatUint(uint64(v.PerIPTableSize), 10))
 	replace("__OBSERVABILITY_STATS_FILE__", v.StatsFile)
-	replace("__SECURITY_ENFORCE_SSH_PRIVATE__", boolYAML(v.EnforceSSHPrivate))
 	replace("__SECURITY_ALLOW_SSH_PUBLIC__", boolYAML(v.AllowSSHPublic))
 	replace("__FILTER_ALLOW_ICMP__", boolYAML(v.AllowICMP))
 	replace("__FILTER_ALLOW_ARP__", boolYAML(v.AllowARP))

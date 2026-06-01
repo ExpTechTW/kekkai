@@ -51,6 +51,28 @@ type UpdateConfig struct {
 	// - release     : latest stable GitHub release asset
 	// - pre-release : latest pre-release GitHub release asset
 	Channel string `yaml:"channel"`
+
+	// AutoUpdateDownload enables the agent's background poll for new
+	// releases. When true, the agent checks the GitHub Releases API every
+	// AutoUpdateInterval hours and, if a strictly newer version exists,
+	// downloads it to /var/lib/kekkai/staged/. Default: true.
+	//
+	// Pointer-bool so Normalize() can distinguish "user set false" from
+	// "omitted", matching the pattern used by filter.allow_icmp etc.
+	AutoUpdateDownload *bool `yaml:"auto_update_download"`
+
+	// AutoUpdateReload enables self-restart after a successful staged
+	// download. When true the agent delegates to kekkai.sh which installs
+	// the staged binaries and `systemctl restart`s the service (brief
+	// XDP detach window during restart). Default: false.
+	//
+	// Requires AutoUpdateDownload=true — Validate() rejects the mismatch
+	// at load time rather than silently ignoring.
+	AutoUpdateReload bool `yaml:"auto_update_reload"`
+
+	// AutoUpdateInterval is the poll cadence in hours. Allowed range:
+	// 1..24. Default: 1.
+	AutoUpdateInterval int `yaml:"auto_update_interval"`
 }
 
 type RuntimeConfig struct {
@@ -62,29 +84,17 @@ type ObservabilityConfig struct {
 	StatsFile string `yaml:"stats_file"`
 }
 
-// SecurityConfig carries opt-in / opt-out toggles that protect the agent
-// itself from foot-guns like accidentally locking SSH out.
+// SecurityConfig carries the single toggle that decides where port 22 is
+// auto-placed when the user hasn't listed it explicitly.
 type SecurityConfig struct {
-	// EnforceSSHPrivate forces port 22 into filter.private.tcp on startup
-	// (and each reload). If the user hasn't listed 22 anywhere, it is
-	// auto-added to private.tcp. Works together with ingress_allowlist to
-	// guarantee SSH is never accidentally exposed.
-	EnforceSSHPrivate *bool `yaml:"enforce_ssh_private"`
-
-	// AllowSSHPublic lets the user intentionally place port 22 in
-	// filter.public.tcp. Without this flag, 22 in public.tcp is a fatal
-	// validation error. With it, 22 is allowed in public.tcp but emits a
-	// loud WARNING at startup and on every reload.
+	// AllowSSHPublic decides which port group SSH (port 22) is auto-added
+	// to on every load/reload when the user hasn't listed 22 anywhere:
+	//   - true  -> auto-add 22 to filter.public.tcp (open to the internet)
+	//   - false -> auto-add 22 to filter.private.tcp (ingress_allowlist only)
+	// When true and 22 ends up in public.tcp, startup emits a loud WARNING.
+	// This flag replaces the old enforce_ssh_private + allow_ssh_public
+	// pair (which were two ways of expressing the same choice).
 	AllowSSHPublic bool `yaml:"allow_ssh_public"`
-}
-
-// EnforceSSHPrivateValue returns the effective value, defaulting to true
-// when the field is absent from the config file.
-func (s SecurityConfig) EnforceSSHPrivateValue() bool {
-	if s.EnforceSSHPrivate == nil {
-		return true
-	}
-	return *s.EnforceSSHPrivate
 }
 
 type FilterConfig struct {
@@ -241,43 +251,65 @@ func Marshal(cfg *Config) ([]byte, error) {
 // zero-valued fields so an in-memory Config built from partial YAML still
 // renders cleanly.
 func ValuesFromConfig(cfg *Config) Values {
-	enforce := true
-	if cfg.Security.EnforceSSHPrivate != nil {
-		enforce = *cfg.Security.EnforceSSHPrivate
+	if cfg == nil {
+		return DefaultValues()
+	}
+
+	// Work on a local copy so defaulting logic is centralized and we don't
+	// accidentally mutate the caller's in-memory config.
+	c := *cfg
+	c.applyDefaults()
+
+	defaults := DefaultValues()
+
+	version := cfg.Version
+	if version <= 0 {
+		version = CurrentVersion
+	}
+	autoUpdateDownload := defaults.AutoUpdateDownload
+	if c.Update.AutoUpdateDownload != nil {
+		autoUpdateDownload = *c.Update.AutoUpdateDownload
+	}
+	autoUpdateInterval := c.Update.AutoUpdateInterval
+	if autoUpdateInterval == 0 {
+		autoUpdateInterval = DefaultAutoUpdateInterval
 	}
 	allowICMP := true
-	if cfg.Filter.AllowICMP != nil {
-		allowICMP = *cfg.Filter.AllowICMP
+	if c.Filter.AllowICMP != nil {
+		allowICMP = *c.Filter.AllowICMP
 	}
 	allowARP := true
-	if cfg.Filter.AllowARP != nil {
-		allowARP = *cfg.Filter.AllowARP
+	if c.Filter.AllowARP != nil {
+		allowARP = *c.Filter.AllowARP
 	}
 	hostname, _ := os.Hostname()
-	nodeID := cfg.Node.ID
+	nodeID := c.Node.ID
 	if nodeID == "" {
 		nodeID = hostname
 	}
 	return Values{
-		NodeID:            nodeID,
-		NodeRegion:        cfg.Node.Region,
-		InterfaceName:     cfg.Interface.Name,
-		InterfaceXDPMode:  cfg.Interface.XDPMode,
-		UpdateChannel:     cfg.Update.Channel,
-		EmergencyBypass:   cfg.Runtime.EmergencyBypass,
-		PerIPTableSize:    cfg.Runtime.PerIPTableSize,
-		StatsFile:         cfg.Observability.StatsFile,
-		EnforceSSHPrivate: enforce,
-		AllowSSHPublic:    cfg.Security.AllowSSHPublic,
-		PublicTCP:         cfg.Filter.Public.TCP,
-		PublicUDP:         cfg.Filter.Public.UDP,
-		PrivateTCP:        cfg.Filter.Private.TCP,
-		PrivateUDP:        cfg.Filter.Private.UDP,
-		AllowICMP:         allowICMP,
-		AllowARP:          allowARP,
-		UDPEphemeralMin:   cfg.Filter.UDPEphemeralMin,
-		IngressAllowlist:  cfg.Filter.IngressAllowlist,
-		StaticBlocklist:   cfg.Filter.StaticBlocklist,
+		Version:            version,
+		NodeID:             nodeID,
+		NodeRegion:         c.Node.Region,
+		InterfaceName:      c.Interface.Name,
+		InterfaceXDPMode:   c.Interface.XDPMode,
+		UpdateChannel:      c.Update.Channel,
+		AutoUpdateDownload: autoUpdateDownload,
+		AutoUpdateReload:   c.Update.AutoUpdateReload,
+		AutoUpdateInterval: autoUpdateInterval,
+		EmergencyBypass:    c.Runtime.EmergencyBypass,
+		PerIPTableSize:     c.Runtime.PerIPTableSize,
+		StatsFile:          c.Observability.StatsFile,
+		AllowSSHPublic:     c.Security.AllowSSHPublic,
+		PublicTCP:          c.Filter.Public.TCP,
+		PublicUDP:          c.Filter.Public.UDP,
+		PrivateTCP:         c.Filter.Private.TCP,
+		PrivateUDP:         c.Filter.Private.UDP,
+		AllowICMP:          allowICMP,
+		AllowARP:           allowARP,
+		UDPEphemeralMin:    c.Filter.UDPEphemeralMin,
+		IngressAllowlist:   c.Filter.IngressAllowlist,
+		StaticBlocklist:    c.Filter.StaticBlocklist,
 	}
 }
 
@@ -311,6 +343,13 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Update.Channel == "" {
 		c.Update.Channel = DefaultUpdateChannel
+	}
+	if c.Update.AutoUpdateDownload == nil {
+		v := DefaultAutoUpdateDownload
+		c.Update.AutoUpdateDownload = &v
+	}
+	if c.Update.AutoUpdateInterval == 0 {
+		c.Update.AutoUpdateInterval = DefaultAutoUpdateInterval
 	}
 	if c.Runtime.PerIPTableSize == 0 {
 		c.Runtime.PerIPTableSize = DefaultPerIPTableSize
@@ -350,6 +389,17 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("update.channel: invalid %q (want release|pre-release)", c.Update.Channel)
 	}
+	if c.Update.AutoUpdateInterval < 1 || c.Update.AutoUpdateInterval > 24 {
+		return fmt.Errorf("update.auto_update_interval: %d out of range (want 1..24 hours)", c.Update.AutoUpdateInterval)
+	}
+	// auto_update_reload implies auto_update_download — you cannot restart
+	// into a binary that was never fetched. Reject the mismatch loudly so
+	// operators notice instead of silently getting download-only behaviour.
+	if c.Update.AutoUpdateReload {
+		if c.Update.AutoUpdateDownload == nil || !*c.Update.AutoUpdateDownload {
+			return errors.New("update.auto_update_reload=true requires update.auto_update_download=true")
+		}
+	}
 
 	tcpSeen, udpSeen := map[uint16]string{}, map[uint16]string{}
 	registerProto := func(list []uint16, bucket map[uint16]string, label string) error {
@@ -387,46 +437,43 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("filter.udp_ephemeral_min: invalid %d (want >= 1024)", c.Filter.UDPEphemeralMin)
 	}
 
-	// --- SSH safety rules -------------------------------------------------
-
-	sshInPublic := containsPort(c.Filter.Public.TCP, SSHPort)
-	sshInPrivate := containsPort(c.Filter.Private.TCP, SSHPort)
-
-	if sshInPublic && !c.Security.AllowSSHPublic {
+	// Port 22's manual placement must agree with security.allow_ssh_public.
+	// Leaving 22 unlisted is fine — Normalize places it per the flag — but
+	// listing it in the group that contradicts the flag is almost always an
+	// accident, so reject it loudly instead of silently picking a side.
+	// (22 in BOTH groups is already caught by the generic same-port-twice
+	// check in registerProto above.)
+	if c.Security.AllowSSHPublic && containsPort(c.Filter.Private.TCP, SSHPort) {
+		return errors.New(
+			"filter.private.tcp contains 22 but security.allow_ssh_public is true — " +
+				"remove 22 from private.tcp (it is auto-added to public.tcp), " +
+				"or set security.allow_ssh_public: false")
+	}
+	if !c.Security.AllowSSHPublic && containsPort(c.Filter.Public.TCP, SSHPort) {
 		return errors.New(
 			"filter.public.tcp contains 22 but security.allow_ssh_public is false — " +
-				"set security.allow_ssh_public: true to override, or move 22 to filter.private.tcp")
-	}
-	if sshInPublic && sshInPrivate {
-		return errors.New("port 22 cannot appear in both filter.public.tcp and filter.private.tcp")
-	}
-
-	// If SSH is protected by private.tcp but the allowlist is empty we
-	// would lock out every caller. Refuse to start.
-	if sshInPrivate && len(c.Filter.IngressAllowlist) == 0 {
-		return errors.New(
-			"filter.private.tcp contains 22 but filter.ingress_allowlist is empty — " +
-				"this would lock SSH out. add your management network to ingress_allowlist")
+				"remove 22 from public.tcp (it is auto-added to private.tcp), " +
+				"or set security.allow_ssh_public: true")
 	}
 	return nil
 }
 
 // Normalize applies schema-level transformations the user shouldn't have
-// to write by hand — notably auto-adding port 22 to private.tcp when
-// security.enforce_ssh_private is set. Returns human-readable log lines
-// describing each change.
+// to write by hand — notably auto-placing port 22 according to
+// security.allow_ssh_public when it isn't listed anywhere. If 22 is already
+// listed it can only be in the group that agrees with the flag (Validate
+// rejects the contradicting placement first), so it is left untouched.
+// Returns human-readable log lines describing each change.
 func (c *Config) Normalize() []string {
-	var logs []string
-	if c.Security.EnforceSSHPrivateValue() {
-		inPublic := containsPort(c.Filter.Public.TCP, SSHPort)
-		inPrivate := containsPort(c.Filter.Private.TCP, SSHPort)
-		if !inPublic && !inPrivate {
-			c.Filter.Private.TCP = append(c.Filter.Private.TCP, SSHPort)
-			logs = append(logs,
-				"auto-added port 22 to filter.private.tcp (security.enforce_ssh_private=true)")
-		}
+	if containsPort(c.Filter.Public.TCP, SSHPort) || containsPort(c.Filter.Private.TCP, SSHPort) {
+		return nil
 	}
-	return logs
+	if c.Security.AllowSSHPublic {
+		c.Filter.Public.TCP = append(c.Filter.Public.TCP, SSHPort)
+		return []string{"auto-added port 22 to filter.public.tcp (security.allow_ssh_public=true)"}
+	}
+	c.Filter.Private.TCP = append(c.Filter.Private.TCP, SSHPort)
+	return []string{"auto-added port 22 to filter.private.tcp (security.allow_ssh_public=false)"}
 }
 
 // ResolveInterface fetches the *net.Interface for the configured name.

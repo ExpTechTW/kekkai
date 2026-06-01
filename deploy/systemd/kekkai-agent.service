@@ -31,7 +31,9 @@ RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=false
 # Writable paths the agent actually needs.
-ReadWritePaths=/sys/fs/bpf /var/run /run /etc/kekkai
+#   /var/log/kekkai  — logx rotated log files (kekkai-agent.log + archives)
+#   /var/lib/kekkai  — auto-update state, staged binaries, error file
+ReadWritePaths=/sys/fs/bpf /var/run /run /etc/kekkai /var/log/kekkai /var/lib/kekkai
 
 # Logging
 StandardOutput=journal

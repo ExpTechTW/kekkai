@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/ExpTechTW/kekkai/internal/version"
 )
 
 // Page identifies the currently-visible screen.
@@ -48,7 +48,8 @@ type Model struct {
 	statefulUDPHist []float64
 
 	// startup metadata
-	startedAt time.Time
+	agentStartedAt   time.Time
+	sessionStartedAt time.Time
 	nodeID    string
 	iface     string
 	xdpMode   string
@@ -62,11 +63,16 @@ type Model struct {
 
 // NewModel wires a Source to a Model. The Source is owned by the Model
 // and closed when the program exits.
-func NewModel(src *Source, nodeID, iface, xdpMode, version, updateChannel string) *Model {
+func NewModel(
+	src *Source,
+	nodeID, iface, xdpMode, version, updateChannel string,
+	agentStartedAt time.Time,
+) *Model {
 	return &Model{
 		src:       src,
 		page:      PageOverview,
-		startedAt: time.Now(),
+		agentStartedAt:   agentStartedAt,
+		sessionStartedAt: time.Now(),
 		nodeID:    nodeID,
 		iface:     iface,
 		xdpMode:   xdpMode,
@@ -242,12 +248,18 @@ func pushSeries(series []float64, v float64, max int) []float64 {
 	return series
 }
 
-// uptime formats how long the TUI itself has been running. The agent
-// uptime is not directly visible to kekkai (maps are pinned but have no
-// start timestamp), so this is "session uptime" which is good enough for
-// an operator glancing at the screen.
+// uptime prefers agent runtime (from systemd ActiveEnterTimestampUSec as
+// provided by cmd/kekkai status). If unavailable, fall back to TUI session
+// time so non-systemd/manual runs still show a useful counter.
 func (m *Model) uptime() string {
-	d := time.Since(m.startedAt).Truncate(time.Second)
+	startAt := m.agentStartedAt
+	if startAt.IsZero() {
+		startAt = m.sessionStartedAt
+	}
+	d := time.Since(startAt).Truncate(time.Second)
+	if d < 0 {
+		d = 0
+	}
 	return fmt.Sprintf("%s", d)
 }
 
@@ -270,17 +282,15 @@ func checkUpdateStatus(channel, current string) (state, latest, hint string) {
 		return "error", "", "check failed: empty release tag"
 	}
 
-	curNorm, curOK := normalizeSemver(current)
-	latestNorm, latestOK := normalizeSemver(tag)
+	curVer, curOK := version.Parse(current)
+	latestVer, latestOK := version.Parse(tag)
 	if !curOK || !latestOK {
-		return "n/a", tag, "local version is non-semver; latest release=" + tag
+		return "n/a", tag, "local version has unknown format; latest release=" + tag
 	}
-	switch compareSemver(curNorm, latestNorm) {
-	case -1:
+	if version.IsNewer(latestVer, curVer) {
 		return "update-available", tag, "new release available"
-	default:
-		return "up-to-date", tag, "already latest"
 	}
+	return "up-to-date", tag, "already latest"
 }
 
 func fetchLatestReleaseTag(channel string) (string, error) {
@@ -336,57 +346,3 @@ func fetchLatestReleaseTag(channel string) (string, error) {
 	return "", fmt.Errorf("no pre-release found")
 }
 
-func normalizeSemver(v string) (string, bool) {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return "", false
-	}
-	v = strings.TrimPrefix(v, "v")
-	core := v
-	if i := strings.IndexAny(core, "-+"); i >= 0 {
-		core = core[:i]
-	}
-
-	// Backward compatibility:
-	// older builds used YYYYMMDD(+meta), e.g. 20260414+b8.
-	// Convert to loose semver-like core: YYYY.MM.DD so update checks still work.
-	if isEightDigits(core) {
-		return fmt.Sprintf("%s.%s.%s", core[:4], core[4:6], core[6:8]), true
-	}
-
-	parts := strings.Split(core, ".")
-	if len(parts) != 3 {
-		return "", false
-	}
-	for _, p := range parts {
-		if p == "" {
-			return "", false
-		}
-		if _, err := strconv.Atoi(p); err != nil {
-			return "", false
-		}
-	}
-	return core, true
-}
-
-var eightDigitsRe = regexp.MustCompile(`^\d{8}$`)
-
-func isEightDigits(s string) bool {
-	return eightDigitsRe.MatchString(s)
-}
-
-func compareSemver(a, b string) int {
-	pa := strings.Split(a, ".")
-	pb := strings.Split(b, ".")
-	for i := 0; i < 3; i++ {
-		ai, _ := strconv.Atoi(pa[i])
-		bi, _ := strconv.Atoi(pb[i])
-		if ai < bi {
-			return -1
-		}
-		if ai > bi {
-			return 1
-		}
-	}
-	return 0
-}
