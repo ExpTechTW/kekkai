@@ -10,6 +10,7 @@
 package stats
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -78,8 +79,8 @@ type Global struct {
 	PassStatefulTCP, PassStatefulUDP uint64
 }
 
-// perIPStat mirrors `struct perip_stat` in the eBPF program. Size: 48 bytes.
-type perIPStat struct {
+// PerIPStat mirrors `struct perip_stat` in the eBPF program. Size: 48 bytes.
+type PerIPStat struct {
 	Pkts         uint64
 	Bytes        uint64
 	PktsDropped  uint64
@@ -141,12 +142,12 @@ type Reader struct {
 
 	// ----- slow path state (touched only by runSlow goroutine) -----
 	bufA, bufB []TopEntry // double-buffered top-N storage
-	// perip_v4 is a PER-CPU LRU hash, so reads return one perIPStat per
+	// perip_v4 is a PER-CPU LRU hash, so reads return one PerIPStat per
 	// possible CPU and must be summed. numCPU is that fan-out factor.
 	numCPU           int
 	scanKeys         []uint32    // BatchLookup key scratch (len batchSize)
-	scanVals         []perIPStat // BatchLookup value scratch (len batchSize*numCPU, entry-major)
-	scanPerCPU       []perIPStat // Iterate per-entry per-CPU scratch (len numCPU)
+	scanVals         []PerIPStat // BatchLookup value scratch (len batchSize*numCPU, entry-major)
+	scanPerCPU       []PerIPStat // Iterate per-entry per-CPU scratch (len numCPU)
 	batchUnsupported bool        // fall back to Iterate if kernel rejects batch
 
 	// ----- cross-goroutine handoff -----
@@ -170,13 +171,10 @@ func NewReader(global, perip *ebpf.Map, nodeID, iface, outPath string) *Reader {
 	const batchSize = 4096
 
 	// perip_v4 is per-CPU: each lookup yields one value per possible CPU.
-	// Default to 1 when we can't ask the kernel (stub / non-Linux tests,
-	// where perip is nil anyway).
+	// Default to 1 when there's no map (stub / non-Linux tests).
 	numCPU := 1
 	if perip != nil {
-		if n, err := ebpf.PossibleCPU(); err == nil && n > 0 {
-			numCPU = n
-		}
+		numCPU = PossibleCPUOr1()
 	}
 
 	r := &Reader{
@@ -195,8 +193,8 @@ func NewReader(global, perip *ebpf.Map, nodeID, iface, outPath string) *Reader {
 		bufA:         make([]TopEntry, 0, peripCap),
 		bufB:         make([]TopEntry, 0, peripCap),
 		scanKeys:     make([]uint32, batchSize),
-		scanVals:     make([]perIPStat, batchSize*numCPU),
-		scanPerCPU:   make([]perIPStat, numCPU),
+		scanVals:     make([]PerIPStat, batchSize*numCPU),
+		scanPerCPU:   make([]PerIPStat, numCPU),
 	}
 	r.txBytes = fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface))
 	r.txPkts = fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface))
@@ -313,72 +311,106 @@ func (r *Reader) readGlobal() (Global, error) {
 		if err := r.global.Lookup(&slot, &r.globalPerCPU); err != nil {
 			return g, fmt.Errorf("lookup slot %d: %w", slot, err)
 		}
-		var sum uint64
-		for _, v := range r.globalPerCPU {
-			sum += v
-		}
-		switch slot {
-		case SlotPktsTotal:
-			g.PktsTotal = sum
-		case SlotPktsPassed:
-			g.PktsPassed = sum
-		case SlotPktsDropped:
-			g.PktsDropped = sum
-		case SlotBytesTotal:
-			g.BytesTotal = sum
-		case SlotBytesDropped:
-			g.BytesDropped = sum
-		case SlotPktsTCP:
-			g.PktsTCP = sum
-		case SlotPktsUDP:
-			g.PktsUDP = sum
-		case SlotPktsICMP:
-			g.PktsICMP = sum
-		case SlotPktsOtherL4:
-			g.PktsOtherL4 = sum
-		case SlotBytesTCP:
-			g.BytesTCP = sum
-		case SlotBytesUDP:
-			g.BytesUDP = sum
-		case SlotBytesICMP:
-			g.BytesICMP = sum
-		case SlotBytesOtherL4:
-			g.BytesOtherL4 = sum
-		case SlotDropNonIPv4:
-			g.DropNonIPv4 = sum
-		case SlotDropMalformed:
-			g.DropMalformed = sum
-		case SlotDropBlocklist:
-			g.DropBlocklist = sum
-		case SlotDropDynBlock:
-			g.DropDynBlock = sum
-		case SlotDropNotAllowed:
-			g.DropNotAllowed = sum
-		case SlotDropNoPolicy:
-			g.DropNoPolicy = sum
-		case SlotPassFragment:
-			g.PassFragment = sum
-		case SlotPassReturnTCP:
-			g.PassReturnTCP = sum
-		case SlotPassReturnUDP:
-			g.PassReturnUDP = sum
-		case SlotPassReturnICMP:
-			g.PassReturnICMP = sum
-		case SlotPassPublicTCP:
-			g.PassPublicTCP = sum
-		case SlotPassPublicUDP:
-			g.PassPublicUDP = sum
-		case SlotPassPrivateTCP:
-			g.PassPrivateTCP = sum
-		case SlotPassPrivateUDP:
-			g.PassPrivateUDP = sum
-		case SlotPassStatefulTCP:
-			g.PassStatefulTCP = sum
-		case SlotPassStatefulUDP:
-			g.PassStatefulUDP = sum
-		}
+		AssignSlot(&g, slot, SumPerCPU(r.globalPerCPU))
 	}
 	return g, nil
+}
+
+// SumPerCPU sums a PERCPU map value (one entry per possible CPU).
+func SumPerCPU(vals []uint64) uint64 {
+	var sum uint64
+	for _, v := range vals {
+		sum += v
+	}
+	return sum
+}
+
+// AssignSlot writes one summed global-stats slot into g. Shared by the agent
+// reader and the TUI so the slot→field wiring lives in exactly one place.
+func AssignSlot(g *Global, slot uint32, sum uint64) {
+	switch slot {
+	case SlotPktsTotal:
+		g.PktsTotal = sum
+	case SlotPktsPassed:
+		g.PktsPassed = sum
+	case SlotPktsDropped:
+		g.PktsDropped = sum
+	case SlotBytesTotal:
+		g.BytesTotal = sum
+	case SlotBytesDropped:
+		g.BytesDropped = sum
+	case SlotPktsTCP:
+		g.PktsTCP = sum
+	case SlotPktsUDP:
+		g.PktsUDP = sum
+	case SlotPktsICMP:
+		g.PktsICMP = sum
+	case SlotPktsOtherL4:
+		g.PktsOtherL4 = sum
+	case SlotBytesTCP:
+		g.BytesTCP = sum
+	case SlotBytesUDP:
+		g.BytesUDP = sum
+	case SlotBytesICMP:
+		g.BytesICMP = sum
+	case SlotBytesOtherL4:
+		g.BytesOtherL4 = sum
+	case SlotDropNonIPv4:
+		g.DropNonIPv4 = sum
+	case SlotDropMalformed:
+		g.DropMalformed = sum
+	case SlotDropBlocklist:
+		g.DropBlocklist = sum
+	case SlotDropDynBlock:
+		g.DropDynBlock = sum
+	case SlotDropNotAllowed:
+		g.DropNotAllowed = sum
+	case SlotDropNoPolicy:
+		g.DropNoPolicy = sum
+	case SlotPassFragment:
+		g.PassFragment = sum
+	case SlotPassReturnTCP:
+		g.PassReturnTCP = sum
+	case SlotPassReturnUDP:
+		g.PassReturnUDP = sum
+	case SlotPassReturnICMP:
+		g.PassReturnICMP = sum
+	case SlotPassPublicTCP:
+		g.PassPublicTCP = sum
+	case SlotPassPublicUDP:
+		g.PassPublicUDP = sum
+	case SlotPassPrivateTCP:
+		g.PassPrivateTCP = sum
+	case SlotPassPrivateUDP:
+		g.PassPrivateUDP = sum
+	case SlotPassStatefulTCP:
+		g.PassStatefulTCP = sum
+	case SlotPassStatefulUDP:
+		g.PassStatefulUDP = sum
+	}
+}
+
+// PossibleCPUOr1 returns the kernel's possible-CPU count for sizing per-CPU
+// map scratch, or 1 if it can't be determined.
+func PossibleCPUOr1() int {
+	if n, err := ebpf.PossibleCPU(); err == nil && n > 0 {
+		return n
+	}
+	return 1
+}
+
+// CheckPerIPMap verifies a pinned perip_v4 handle matches what the decoder
+// expects: a per-CPU LRU hash whose value is the size of PerIPStat. It turns
+// a kernel↔userspace (or agent↔CLI build) drift into a clear startup error
+// instead of a silent mis-decode or a per-tick "requires a slice" failure.
+func CheckPerIPMap(m *ebpf.Map) error {
+	if m.Type() != ebpf.LRUCPUHash {
+		return fmt.Errorf("perip_v4 map type is %s, expected per-CPU LRU hash (agent/CLI build mismatch?)", m.Type())
+	}
+	if want := uint32(binary.Size(PerIPStat{})); m.ValueSize() != want {
+		return fmt.Errorf("perip_v4 value size %d, decoder expects %d (struct layout drift)", m.ValueSize(), want)
+	}
+	return nil
 }
 
 func (r *Reader) readTx() (uint64, uint64) {
@@ -494,7 +526,7 @@ func (r *Reader) scanPerIPIterate(buf *[]TopEntry) (int, error) {
 	n := 0
 	// Per-CPU iterate: pass the pre-sized slice (len == nCPU) by value so the
 	// lookup fills it IN PLACE. Passing &slice instead makes cilium allocate a
-	// fresh slice on every entry. A single perIPStat (non-slice) is rejected
+	// fresh slice on every entry. A single PerIPStat (non-slice) is rejected
 	// outright with "per-cpu value requires a slice", which is the bug to
 	// avoid here.
 	for iter.Next(&key, r.scanPerCPU) {
@@ -504,12 +536,12 @@ func (r *Reader) scanPerIPIterate(buf *[]TopEntry) (int, error) {
 	return n, iter.Err()
 }
 
-// appendEntry folds one source IP's per-CPU perIPStat slice into a single
-// TopEntry and appends it. Counters sum across CPUs, Blocked is OR-ed, and
-// Proto is taken from the CPU with the most recent last_seen. The buffer must
-// have enough capacity to avoid reallocation — callers size it to
-// perip_max_entries.
-func appendEntry(buf *[]TopEntry, key uint32, perCPU []perIPStat) {
+// FoldPerIP folds one source IP's per-CPU PerIPStat slice (as read from the
+// per-CPU perip_v4 map) into a single TopEntry: counters sum across CPUs,
+// Blocked is OR-ed, and Proto comes from the CPU with the freshest last_seen.
+// Shared by the agent's stats reader and the TUI so the decode lives in one
+// place — see CheckPerIPMap for the matching layout/type guard.
+func FoldPerIP(key uint32, perCPU []PerIPStat) TopEntry {
 	var e TopEntry
 	var newestSeen uint64
 	for i := range perCPU {
@@ -531,7 +563,11 @@ func appendEntry(buf *[]TopEntry, key uint32, perCPU []perIPStat) {
 	e.Addr[1] = byte(key >> 8)
 	e.Addr[2] = byte(key >> 16)
 	e.Addr[3] = byte(key >> 24)
-	*buf = append(*buf, e)
+	return e
+}
+
+func appendEntry(buf *[]TopEntry, key uint32, perCPU []PerIPStat) {
+	*buf = append(*buf, FoldPerIP(key, perCPU))
 }
 
 // --- file rendering ---------------------------------------------------------

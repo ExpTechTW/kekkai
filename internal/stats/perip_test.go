@@ -6,7 +6,7 @@ import "testing"
 // perip_v4 map: counters sum across CPUs, Blocked OR-s, and Proto comes from
 // the CPU with the freshest last_seen.
 func TestAppendEntryPerCPU(t *testing.T) {
-	perCPU := []perIPStat{
+	perCPU := []PerIPStat{
 		{Pkts: 10, Bytes: 100, PktsDropped: 1, BytesDropped: 10, LastSeenNS: 5, LastProto: 6, Blocked: 0}, // cpu0: TCP
 		{Pkts: 0, Bytes: 0}, // cpu1: idle
 		{Pkts: 3, Bytes: 30, PktsDropped: 3, BytesDropped: 30, LastSeenNS: 9, LastProto: 17, Blocked: 1}, // cpu2: UDP, newest, blocked
@@ -41,7 +41,7 @@ func TestAppendEntryPerCPU(t *testing.T) {
 // any CPU still folds cleanly to a zero row.
 func TestAppendEntryAllIdle(t *testing.T) {
 	var buf []TopEntry
-	appendEntry(&buf, 0, []perIPStat{{}, {}})
+	appendEntry(&buf, 0, []PerIPStat{{}, {}})
 	if len(buf) != 1 || buf[0].Pkts != 0 || buf[0].Blocked {
 		t.Fatalf("idle fold = %+v, want zero row", buf)
 	}

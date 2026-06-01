@@ -36,27 +36,21 @@ type Source struct {
 	// scratch for PERCPU_ARRAY lookups
 	perCPU []uint64
 
-	// preallocated top-N scratch; cap sized to perip MaxEntries
-	topBuf []topRow
-}
+	// perip_v4 is a PER-CPU LRU hash: each lookup yields one perIPStat per
+	// possible CPU. peripCPU is the pre-sized (len == numCPU) sink the
+	// iterate fills in place; values are summed across CPUs per source IP.
+	numCPU   int
+	peripCPU []stats.PerIPStat
 
-// topRow mirrors stats.perIPStat on the eBPF side but with only what the
-// TUI needs.
-type topRow struct {
-	Addr         [4]byte
-	Pkts         uint64
-	Bytes        uint64
-	PktsDropped  uint64
-	BytesDropped uint64
-	Proto        uint8
-	Blocked      bool
+	// preallocated top-N scratch; cap sized to perip MaxEntries
+	topBuf []stats.TopEntry
 }
 
 // Snapshot is what the Bubble Tea Model consumes each tick.
 type Snapshot struct {
 	At     time.Time
 	Global stats.Global
-	Top    []topRow
+	Top    []stats.TopEntry
 
 	// Deltas computed between consecutive snapshots.
 	PPS, DPS                 float64
@@ -81,11 +75,21 @@ func NewSource(iface string) (*Source, error) {
 		st.Close()
 		return nil, wrapOpenErr("perip_v4", err)
 	}
+	// Fail loudly if the agent's pinned map doesn't match our decoder (e.g.
+	// CLI and agent built from different schemas) instead of mis-decoding.
+	if err := stats.CheckPerIPMap(perip); err != nil {
+		st.Close()
+		perip.Close()
+		return nil, err
+	}
 
 	cap := int(perip.MaxEntries())
 	if cap == 0 {
 		cap = 65536
 	}
+
+	// perip_v4 is per-CPU; size the lookup sink to the possible-CPU count.
+	numCPU := stats.PossibleCPUOr1()
 
 	return &Source{
 		statsMap:    st,
@@ -94,7 +98,9 @@ func NewSource(iface string) (*Source, error) {
 		txBytes:     fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface)),
 		txPkts:      fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface)),
 		perCPU:      make([]uint64, 0, 128),
-		topBuf:      make([]topRow, 0, cap),
+		numCPU:      numCPU,
+		peripCPU:    make([]stats.PerIPStat, numCPU),
+		topBuf:      make([]stats.TopEntry, 0, cap),
 	}, nil
 }
 
@@ -173,18 +179,12 @@ func (s *Source) Read(prev *Snapshot) (Snapshot, error) {
 	// complexity isn't worth it here.
 	s.topBuf = s.topBuf[:0]
 	var k uint32
-	var v perIPStat
 	iter := s.peripMap.Iterate()
-	for iter.Next(&k, &v) {
-		s.topBuf = append(s.topBuf, topRow{
-			Addr:         unpackAddr(k),
-			Pkts:         v.Pkts,
-			Bytes:        v.Bytes,
-			PktsDropped:  v.PktsDropped,
-			BytesDropped: v.BytesDropped,
-			Proto:        v.LastProto,
-			Blocked:      v.Blocked != 0,
-		})
+	// Per-CPU iterate: pass the pre-sized slice (len == numCPU) by value so
+	// the lookup fills it in place. A single perIPStat is rejected with
+	// "per-cpu value requires a slice".
+	for iter.Next(&k, s.peripCPU) {
+		s.topBuf = append(s.topBuf, stats.FoldPerIP(k, s.peripCPU))
 	}
 	if err := iter.Err(); err != nil {
 		return snap, fmt.Errorf("perip iterate: %w", err)
@@ -197,20 +197,8 @@ func (s *Source) Read(prev *Snapshot) (Snapshot, error) {
 	return snap, nil
 }
 
-// perIPStat mirrors struct perip_stat in bpf/xdp_filter.c. Duplicated here
-// rather than imported from internal/stats because that package keeps it
-// unexported.
-type perIPStat struct {
-	Pkts         uint64
-	Bytes        uint64
-	PktsDropped  uint64
-	BytesDropped uint64
-	LastSeenNS   uint64
-	LastProto    uint8
-	Blocked      uint8
-	_            [6]uint8
-}
-
+// readGlobal sums each PERCPU_ARRAY slot and maps it onto Global using the
+// shared stats helpers — no per-field wiring duplicated here.
 func (s *Source) readGlobal() (stats.Global, error) {
 	var g stats.Global
 	for slot := uint32(0); slot < stats.SlotCount; slot++ {
@@ -218,78 +206,9 @@ func (s *Source) readGlobal() (stats.Global, error) {
 		if err := s.statsMap.Lookup(&slot, &s.perCPU); err != nil {
 			return g, fmt.Errorf("lookup slot %d: %w", slot, err)
 		}
-		var sum uint64
-		for _, v := range s.perCPU {
-			sum += v
-		}
-		assignSlot(&g, slot, sum)
+		stats.AssignSlot(&g, slot, stats.SumPerCPU(s.perCPU))
 	}
 	return g, nil
-}
-
-// assignSlot maps a slot index to the corresponding field on Global.
-// Centralised so both the agent and the TUI use the same wiring.
-func assignSlot(g *stats.Global, slot uint32, sum uint64) {
-	switch slot {
-	case stats.SlotPktsTotal:
-		g.PktsTotal = sum
-	case stats.SlotPktsPassed:
-		g.PktsPassed = sum
-	case stats.SlotPktsDropped:
-		g.PktsDropped = sum
-	case stats.SlotBytesTotal:
-		g.BytesTotal = sum
-	case stats.SlotBytesDropped:
-		g.BytesDropped = sum
-	case stats.SlotPktsTCP:
-		g.PktsTCP = sum
-	case stats.SlotPktsUDP:
-		g.PktsUDP = sum
-	case stats.SlotPktsICMP:
-		g.PktsICMP = sum
-	case stats.SlotPktsOtherL4:
-		g.PktsOtherL4 = sum
-	case stats.SlotBytesTCP:
-		g.BytesTCP = sum
-	case stats.SlotBytesUDP:
-		g.BytesUDP = sum
-	case stats.SlotBytesICMP:
-		g.BytesICMP = sum
-	case stats.SlotBytesOtherL4:
-		g.BytesOtherL4 = sum
-	case stats.SlotDropNonIPv4:
-		g.DropNonIPv4 = sum
-	case stats.SlotDropMalformed:
-		g.DropMalformed = sum
-	case stats.SlotDropBlocklist:
-		g.DropBlocklist = sum
-	case stats.SlotDropDynBlock:
-		g.DropDynBlock = sum
-	case stats.SlotDropNotAllowed:
-		g.DropNotAllowed = sum
-	case stats.SlotDropNoPolicy:
-		g.DropNoPolicy = sum
-	case stats.SlotPassFragment:
-		g.PassFragment = sum
-	case stats.SlotPassReturnTCP:
-		g.PassReturnTCP = sum
-	case stats.SlotPassReturnUDP:
-		g.PassReturnUDP = sum
-	case stats.SlotPassReturnICMP:
-		g.PassReturnICMP = sum
-	case stats.SlotPassPublicTCP:
-		g.PassPublicTCP = sum
-	case stats.SlotPassPublicUDP:
-		g.PassPublicUDP = sum
-	case stats.SlotPassPrivateTCP:
-		g.PassPrivateTCP = sum
-	case stats.SlotPassPrivateUDP:
-		g.PassPrivateUDP = sum
-	case stats.SlotPassStatefulTCP:
-		g.PassStatefulTCP = sum
-	case stats.SlotPassStatefulUDP:
-		g.PassStatefulUDP = sum
-	}
 }
 
 func (s *Source) readTx() (uint64, uint64) {
@@ -301,15 +220,6 @@ func (s *Source) readTx() (uint64, uint64) {
 		p, _ = s.txPkts.Read()
 	}
 	return b, p
-}
-
-func unpackAddr(key uint32) [4]byte {
-	return [4]byte{
-		byte(key),
-		byte(key >> 8),
-		byte(key >> 16),
-		byte(key >> 24),
-	}
 }
 
 // FormatAddr renders a [4]byte as dotted-quad. Lives here because both
