@@ -46,6 +46,7 @@ func cmdStatus(args []string) int {
 		version,
 		cfg.Update.Channel,
 		readAgentActiveSince(),
+		func() bool { bypassed, _ := filterBypassed(cfg); return bypassed },
 	)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {

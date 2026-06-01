@@ -59,6 +59,12 @@ type Model struct {
 	updateLatest  string
 	updateHint    string
 	errMsg    string // non-fatal error from the last tick
+
+	// bypassCheck reports whether the XDP filter is currently NOT attached
+	// (emergency bypass on, or agent detached). Re-run every tick so the
+	// banner appears/clears live. nil => never bypassed.
+	bypassCheck func() bool
+	bypassed    bool
 }
 
 // NewModel wires a Source to a Model. The Source is owned by the Model
@@ -67,6 +73,7 @@ func NewModel(
 	src *Source,
 	nodeID, iface, xdpMode, version, updateChannel string,
 	agentStartedAt time.Time,
+	bypassCheck func() bool,
 ) *Model {
 	return &Model{
 		src:       src,
@@ -78,6 +85,7 @@ func NewModel(
 		xdpMode:   xdpMode,
 		version:   version,
 		updateChannel: updateChannel,
+		bypassCheck:   bypassCheck,
 		updateState:   "checking",
 		ppsHist:   make([]float64, 0, 120),
 		dpsHist:   make([]float64, 0, 120),
@@ -116,7 +124,20 @@ func (m *Model) Init() tea.Cmd {
 		tickCmd(),
 		m.doRead(),
 		m.doUpdateCheck(),
+		m.doBypassCheck(),
 	)
+}
+
+// bypassMsg carries the latest filter-attachment state.
+type bypassMsg bool
+
+func (m *Model) doBypassCheck() tea.Cmd {
+	return func() tea.Msg {
+		if m.bypassCheck == nil {
+			return bypassMsg(false)
+		}
+		return bypassMsg(m.bypassCheck())
+	}
 }
 
 func (m *Model) doRead() tea.Cmd {
@@ -147,7 +168,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.paused {
 			return m, tickCmd()
 		}
-		return m, tea.Batch(tickCmd(), m.doRead())
+		return m, tea.Batch(tickCmd(), m.doRead(), m.doBypassCheck())
+
+	case bypassMsg:
+		m.bypassed = bool(msg)
+		return m, nil
 
 	case readMsg:
 		if msg.err != nil {

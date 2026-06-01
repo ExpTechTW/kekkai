@@ -1,6 +1,9 @@
 package doctor
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseKernelMajorMinor(t *testing.T) {
 	tests := []struct {
@@ -32,6 +35,50 @@ func TestParseKernelMajorMinor(t *testing.T) {
 			tcxOK := !(major < 6 || (major == 6 && minor < 6))
 			if tcxOK != tt.tcxOK {
 				t.Fatalf("%q: tcxOK=%v, want %v", tt.rel, tcxOK, tt.tcxOK)
+			}
+		})
+	}
+}
+
+func TestParseOSReleaseIDs(t *testing.T) {
+	const ubuntu = `NAME="Ubuntu"
+ID=ubuntu
+ID_LIKE=debian
+VERSION_CODENAME=jammy`
+	id, like := parseOSReleaseIDs(ubuntu)
+	if id != "ubuntu" || like != "debian" {
+		t.Fatalf("got id=%q id_like=%q, want ubuntu/debian", id, like)
+	}
+	// Quoted ID_LIKE with multiple families.
+	id, like = parseOSReleaseIDs("ID=rocky\nID_LIKE=\"rhel centos fedora\"\n")
+	if id != "rocky" || like != "rhel centos fedora" {
+		t.Fatalf("got id=%q id_like=%q", id, like)
+	}
+}
+
+func TestKernelUpgradeCommandFor(t *testing.T) {
+	tests := []struct {
+		id, idLike string
+		wantSub    string
+	}{
+		{"ubuntu", "debian", "linux-generic-hwe-22.04"},
+		{"debian", "", "-backports"},
+		{"raspbian", "debian", "-backports"}, // matched via ID_LIKE
+		{"fedora", "", "dnf upgrade --refresh kernel"},
+		{"rocky", "rhel centos fedora", "ELRepo"},
+		{"arch", "", "pacman -Syu linux"},
+		{"manjaro", "arch", "pacman -Syu linux"}, // ID_LIKE=arch
+		{"opensuse-leap", "suse opensuse", "zypper"},
+		{"alpine", "", "apk add linux-lts"},
+		{"voidlinux", "", "see your distro's docs"}, // unknown fallback
+		{"", "", "see your distro's docs"},          // os-release missing
+	}
+	for _, tt := range tests {
+		t.Run(tt.id+"/"+tt.idLike, func(t *testing.T) {
+			got := kernelUpgradeCommandFor(tt.id, tt.idLike)
+			if !strings.Contains(got, tt.wantSub) {
+				t.Fatalf("kernelUpgradeCommandFor(%q,%q) = %q, want substring %q",
+					tt.id, tt.idLike, got, tt.wantSub)
 			}
 		})
 	}

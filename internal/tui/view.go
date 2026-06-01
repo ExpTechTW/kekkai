@@ -115,13 +115,32 @@ func (m *Model) View() string {
 		body = m.viewCharts()
 	}
 
-	return strings.Join([]string{
+	sections := []string{
 		m.viewBanner(),
 		m.viewHeader(),
 		m.viewTabs(),
 		body,
 		m.viewFooter(),
-	}, "\n")
+	}
+	if m.bypassed {
+		sections = append([]string{m.viewBypassBanner()}, sections...)
+	}
+	return strings.Join(sections, "\n")
+}
+
+// viewBypassBanner is the unmissable red strip shown when the XDP filter is
+// not attached — every packet is passing unfiltered.
+func (m *Model) viewBypassBanner() string {
+	body := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fecaca")).
+		Render("⚠  FILTER BYPASSED — NETWORK UNPROTECTED  ⚠\n" +
+			"XDP is detached on " + m.iface + "; every packet passes unfiltered.\n" +
+			"re-enable: sudo kekkai bypass off")
+	return lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(cCritical).
+		Background(lipgloss.Color("#7f1d1d")).
+		Padding(0, 2).
+		Render(body)
 }
 
 // ---------- chrome --------------------------------------------------------
