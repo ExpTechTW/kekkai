@@ -1334,7 +1334,7 @@ do_install() {
   install_systemd_unit
   enable_and_start
   log "install complete"
-  run_post_change_doctor
+  prompt_run_doctor
   post_install_hints
 }
 
@@ -1349,7 +1349,7 @@ do_update() {
   channel="$(resolve_update_channel)"
   log "update channel: $channel"
   release_update "$channel" "$FORCE_UPDATE"
-  run_post_change_doctor
+  prompt_run_doctor
 }
 
 do_repair() {
@@ -1363,17 +1363,26 @@ do_repair() {
   install_systemd_unit
   enable_and_start
   log "repair complete"
-  run_post_change_doctor
+  prompt_run_doctor
 }
 
-# Run a health check after install/update so kernel/UDP/driver problems
-# (e.g. kernel < 6.6 breaking UDP return traffic) surface right away instead
-# of waiting for the operator to think of running `kekkai doctor`. Never
-# aborts the caller — a non-zero "issues detected" exit is expected.
-run_post_change_doctor() {
+# After install/update, prompt the operator (loudly) to run the health
+# check themselves. We deliberately do NOT run `kekkai doctor` here: it
+# requires root and, in a delegated / non-root invocation, even our own log
+# append fails. So just print a big, impossible-to-miss banner. Plain printf
+# only — no step/log helpers, so this never touches the root-owned log file
+# and never errors regardless of who runs the script.
+prompt_run_doctor() {
   [[ -x "$CLI_BIN" ]] || return 0
-  step "post-change health check (kekkai doctor)"
-  "$CLI_BIN" doctor || true
+  printf '%s\n' "$C_WARN"
+  printf '  ┌────────────────────────────────────────────────────────┐\n'
+  printf '  │  ◈  NEXT STEP — run a health check                       │\n'
+  printf '  │                                                          │\n'
+  printf '  │        sudo kekkai doctor                                │\n'
+  printf '  │                                                          │\n'
+  printf '  │  verifies kernel >= 6.6 (UDP/DNS), filter attach, config │\n'
+  printf '  └────────────────────────────────────────────────────────┘\n'
+  printf '%s' "$C_RESET"
 }
 
 do_doctor() {
