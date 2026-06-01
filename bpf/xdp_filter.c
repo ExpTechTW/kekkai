@@ -43,6 +43,11 @@ char __license[] SEC("license") = "GPL";
 #define EVENTS_RINGBUF_BYTES      (1 << 18)
 #define FLOW_TCP_TTL_NS           (5ULL * 60ULL * 1000000000ULL)
 #define FLOW_UDP_TTL_NS           (120ULL * 1000000000ULL)
+// Multi-core: flowtrack_v4 is a shared map, so writing last_seen on every
+// packet dirties a cache line that bounces between cores. The TTL is minutes,
+// so refreshing the timestamp at most once/sec per flow keeps the entry alive
+// while cutting the per-packet shared write to ~0 on high-pps flows.
+#define FLOW_REFRESH_NS           (1ULL * 1000000000ULL)
 #define LEGACY_DHCP_CLIENT_PORT   68
 
 // --- global stats slots -----------------------------------------------------
@@ -216,8 +221,14 @@ struct {
     __uint(max_entries, STAT_SLOTS);
 } stats SEC(".maps");
 
+// Per-source-IP stats. PER-CPU so the per-packet read-modify-write in
+// perip_touch() stays core-local — this map is touched on EVERY packet, so a
+// shared hash would be the dominant multi-core contention point (bucket locks
+// + cache-line bouncing). Each CPU keeps its own counters; userspace sums
+// across CPUs when rendering (same pattern as the `stats` map). Cost: kernel
+// memory is now per-entry × nCPU.
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
     __type(key, __u32);
     __type(value, struct perip_stat);
     __uint(max_entries, PERIP_MAX_ENTRIES);
@@ -301,7 +312,10 @@ static __always_inline int flow_lookup_alive(struct flow4_key *k, __u64 now_ns) 
     if (!v)
         return 0;
     if (now_ns - v->last_seen_ns <= flow_ttl_ns(k->proto)) {
-        v->last_seen_ns = now_ns;
+        // Throttle the shared-cache-line write: only refresh once the
+        // timestamp has gone stale enough to matter (see FLOW_REFRESH_NS).
+        if (now_ns - v->last_seen_ns >= FLOW_REFRESH_NS)
+            v->last_seen_ns = now_ns;
         return 1;
     }
     bpf_map_delete_elem(&flowtrack_v4, k);

@@ -12,7 +12,8 @@ type Loader struct {
 // Options tune runtime-adjustable knobs applied to the eBPF spec or to the
 // attach step. Zero values keep compile-time defaults.
 type Options struct {
-	// PerIPMaxEntries overrides the LRU hash size for perip_v4.
+	// PerIPMaxEntries overrides the entry count for perip_v4 (a per-CPU LRU
+	// hash; kernel memory is roughly this × nCPU × entry size).
 	PerIPMaxEntries uint32
 
 	// XDPMode is one of "generic", "driver", "offload". Empty defaults to

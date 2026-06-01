@@ -140,9 +140,13 @@ type Reader struct {
 	fileBuf      strings.Builder
 
 	// ----- slow path state (touched only by runSlow goroutine) -----
-	bufA, bufB       []TopEntry  // double-buffered top-N storage
-	scanKeys         []uint32    // BatchLookup key scratch
-	scanVals         []perIPStat // BatchLookup value scratch
+	bufA, bufB []TopEntry // double-buffered top-N storage
+	// perip_v4 is a PER-CPU LRU hash, so reads return one perIPStat per
+	// possible CPU and must be summed. numCPU is that fan-out factor.
+	numCPU           int
+	scanKeys         []uint32    // BatchLookup key scratch (len batchSize)
+	scanVals         []perIPStat // BatchLookup value scratch (len batchSize*numCPU, entry-major)
+	scanPerCPU       []perIPStat // Iterate per-entry per-CPU scratch (len numCPU)
 	batchUnsupported bool        // fall back to Iterate if kernel rejects batch
 
 	// ----- cross-goroutine handoff -----
@@ -165,6 +169,16 @@ func NewReader(global, perip *ebpf.Map, nodeID, iface, outPath string) *Reader {
 	// cadence comfortably.
 	const batchSize = 4096
 
+	// perip_v4 is per-CPU: each lookup yields one value per possible CPU.
+	// Default to 1 when we can't ask the kernel (stub / non-Linux tests,
+	// where perip is nil anyway).
+	numCPU := 1
+	if perip != nil {
+		if n, err := ebpf.PossibleCPU(); err == nil && n > 0 {
+			numCPU = n
+		}
+	}
+
 	r := &Reader{
 		global:       global,
 		perip:        perip,
@@ -176,11 +190,13 @@ func NewReader(global, perip *ebpf.Map, nodeID, iface, outPath string) *Reader {
 		topN:         10,
 		peripCap:     peripCap,
 		startedAt:    time.Now(),
+		numCPU:       numCPU,
 		globalPerCPU: make([]uint64, 0, 128),
 		bufA:         make([]TopEntry, 0, peripCap),
 		bufB:         make([]TopEntry, 0, peripCap),
 		scanKeys:     make([]uint32, batchSize),
-		scanVals:     make([]perIPStat, batchSize),
+		scanVals:     make([]perIPStat, batchSize*numCPU),
+		scanPerCPU:   make([]perIPStat, numCPU),
 	}
 	r.txBytes = fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface))
 	r.txPkts = fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface))
@@ -455,9 +471,12 @@ func (r *Reader) scanPerIPBatch(buf *[]TopEntry) (int, error) {
 	total := 0
 	cursor := ebpf.MapBatchCursor{}
 	for {
+		// Per-CPU batch: valuesOut is a flat entry-major slice of length
+		// len(keys)*numCPU; entry i's per-CPU values are
+		// scanVals[i*numCPU : (i+1)*numCPU].
 		n, err := r.perip.BatchLookup(&cursor, r.scanKeys, r.scanVals, nil)
 		for i := 0; i < n; i++ {
-			appendEntry(buf, r.scanKeys[i], &r.scanVals[i])
+			appendEntry(buf, r.scanKeys[i], r.scanVals[i*r.numCPU:(i+1)*r.numCPU])
 		}
 		total += n
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -471,27 +490,37 @@ func (r *Reader) scanPerIPBatch(buf *[]TopEntry) (int, error) {
 
 func (r *Reader) scanPerIPIterate(buf *[]TopEntry) (int, error) {
 	var key uint32
-	var val perIPStat
 	iter := r.perip.Iterate()
 	n := 0
-	for iter.Next(&key, &val) {
-		appendEntry(buf, key, &val)
+	// Per-CPU iterate: the value sink is a slice with one entry per CPU.
+	for iter.Next(&key, &r.scanPerCPU) {
+		appendEntry(buf, key, r.scanPerCPU)
 		n++
 	}
 	return n, iter.Err()
 }
 
-// appendEntry translates one eBPF perIPStat into a TopEntry and appends to
-// the provided buffer. The buffer must have enough capacity to avoid
-// reallocation — callers guarantee this by sizing to perip_max_entries.
-func appendEntry(buf *[]TopEntry, key uint32, val *perIPStat) {
-	e := TopEntry{
-		Pkts:         val.Pkts,
-		Bytes:        val.Bytes,
-		PktsDropped:  val.PktsDropped,
-		BytesDropped: val.BytesDropped,
-		Proto:        val.LastProto,
-		Blocked:      val.Blocked != 0,
+// appendEntry folds one source IP's per-CPU perIPStat slice into a single
+// TopEntry and appends it. Counters sum across CPUs, Blocked is OR-ed, and
+// Proto is taken from the CPU with the most recent last_seen. The buffer must
+// have enough capacity to avoid reallocation — callers size it to
+// perip_max_entries.
+func appendEntry(buf *[]TopEntry, key uint32, perCPU []perIPStat) {
+	var e TopEntry
+	var newestSeen uint64
+	for i := range perCPU {
+		c := &perCPU[i]
+		e.Pkts += c.Pkts
+		e.Bytes += c.Bytes
+		e.PktsDropped += c.PktsDropped
+		e.BytesDropped += c.BytesDropped
+		if c.Blocked != 0 {
+			e.Blocked = true
+		}
+		if c.LastSeenNS > newestSeen {
+			newestSeen = c.LastSeenNS
+			e.Proto = c.LastProto
+		}
 	}
 	// key is __u32 in network byte order — bytes 0..3 already correct.
 	e.Addr[0] = byte(key)
