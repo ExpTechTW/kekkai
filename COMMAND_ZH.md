@@ -419,7 +419,10 @@ Load / reload 都會跑：
 - 所有 port 在 1..65535
 - 同一 proto 的 port 不能在 public 和 private 同時出現
 - 所有 CIDR 必須解析成功
-- 22 同時在 `public.tcp` 和 `private.tcp` → **拒絕啟動**（即一般「同 port 不能跨 public/private」規則）
+- SSH (port 22) 歸位必須和 `allow_ssh_public` 一致（不填則自動歸位）：
+  - `allow_ssh_public: true` 但 22 在 `private.tcp` → **拒絕啟動**
+  - `allow_ssh_public: false` 但 22 在 `public.tcp` → **拒絕啟動**
+  - 22 同時在 `public.tcp` 和 `private.tcp` → **拒絕啟動**（一般「同 port 不能跨 public/private」規則）
 
 ### 5.6 Normalize 行為
 
@@ -592,6 +595,8 @@ journalctl -u kekkai-agent -n 50 --no-pager
 | `interface.name is required` | config 少 `interface.name` 欄位 |
 | `lookup iface eth0: ...` | 網卡名錯誤，用 `ip -br link` 查 |
 | `port 22 appears in both filter.public.tcp and filter.private.tcp` | 22 只能在其中一個 group，移除其一（或交給 `allow_ssh_public` 自動歸位） |
+| `filter.private.tcp contains 22 but security.allow_ssh_public is true` | 22 從 private 移除（會自動進 public），或把 `allow_ssh_public` 改 false |
+| `filter.public.tcp contains 22 but security.allow_ssh_public is false` | 22 從 public 移除（會自動進 private），或把 `allow_ssh_public` 改 true |
 | `unknown field` | config 有拼錯的欄位（`KnownFields(true)` 嚴格檢查；舊版 `enforce_ssh_private` 會在 migration 時自動移除，不會報這個） |
 | `attach xdp: ...` | kernel 不支援 XDP、網卡 driver 不合、或 `CAP_BPF` 不夠 |
 

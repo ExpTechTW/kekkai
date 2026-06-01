@@ -109,17 +109,19 @@ security:
   #       - true  -> auto-add 22 to filter.public.tcp (open to the internet);
   #                  startup emits a loud WARNING log.
   #       - false -> auto-add 22 to filter.private.tcp (ingress_allowlist only).
-  #     If you list 22 in a group manually, that choice is left untouched.
-  #     The same port may not appear in both public and private — that is a
-  #     fatal validation error.
+  #     You may leave 22 unlisted and let this flag place it. If you DO list
+  #     22 manually it must match the flag — listing it in the contradicting
+  #     group (22 in public.tcp with false, or 22 in private.tcp with true)
+  #     is a fatal validation error, as is listing it in both groups.
   # ZH: 決定 SSH (port 22) 自動歸到哪個 group 的單一開關。當你沒有自己把
   #     22 寫進 filter.public.tcp 或 filter.private.tcp 時，每次載入/reload
   #     會依此處理：
   #       - true  -> 自動把 22 加進 filter.public.tcp (對全網開放)，
   #                  啟動時會印一行 WARN log。
   #       - false -> 自動把 22 加進 filter.private.tcp (只允許 allowlist)。
-  #     你若手動把 22 列進某個 group，就會尊重你的設定不動。
-  #     同一個 port 不能同時出現在 public 與 private，否則拒絕啟動。
+  #     你可以不填 22，交給這個 flag 自動歸位；若你手動填，就必須和 flag 一致
+  #     ——填進矛盾的 group（false 卻把 22 放 public.tcp、或 true 卻放
+  #     private.tcp）會拒絕啟動，同時出現在兩個 group 也是。
   allow_ssh_public: __SECURITY_ALLOW_SSH_PUBLIC__
 
 # ---------- filter rules ----------

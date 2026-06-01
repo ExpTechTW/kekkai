@@ -437,36 +437,43 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("filter.udp_ephemeral_min: invalid %d (want >= 1024)", c.Filter.UDPEphemeralMin)
 	}
 
-	// Port 22 landing in both filter.public.tcp and filter.private.tcp is
-	// already rejected by the generic same-port-twice check in
-	// registerProto above ("port 22 appears in both ..."), so no SSH-
-	// specific rule is needed here: security.allow_ssh_public alone decides
-	// which single group Normalize places 22 in.
+	// Port 22's manual placement must agree with security.allow_ssh_public.
+	// Leaving 22 unlisted is fine — Normalize places it per the flag — but
+	// listing it in the group that contradicts the flag is almost always an
+	// accident, so reject it loudly instead of silently picking a side.
+	// (22 in BOTH groups is already caught by the generic same-port-twice
+	// check in registerProto above.)
+	if c.Security.AllowSSHPublic && containsPort(c.Filter.Private.TCP, SSHPort) {
+		return errors.New(
+			"filter.private.tcp contains 22 but security.allow_ssh_public is true — " +
+				"remove 22 from private.tcp (it is auto-added to public.tcp), " +
+				"or set security.allow_ssh_public: false")
+	}
+	if !c.Security.AllowSSHPublic && containsPort(c.Filter.Public.TCP, SSHPort) {
+		return errors.New(
+			"filter.public.tcp contains 22 but security.allow_ssh_public is false — " +
+				"remove 22 from public.tcp (it is auto-added to private.tcp), " +
+				"or set security.allow_ssh_public: true")
+	}
 	return nil
 }
 
 // Normalize applies schema-level transformations the user shouldn't have
 // to write by hand — notably auto-placing port 22 according to
-// security.allow_ssh_public. If the user already listed 22 in either group
-// their choice is left untouched. Returns human-readable log lines
-// describing each change.
+// security.allow_ssh_public when it isn't listed anywhere. If 22 is already
+// listed it can only be in the group that agrees with the flag (Validate
+// rejects the contradicting placement first), so it is left untouched.
+// Returns human-readable log lines describing each change.
 func (c *Config) Normalize() []string {
-	var logs []string
-	inPublic := containsPort(c.Filter.Public.TCP, SSHPort)
-	inPrivate := containsPort(c.Filter.Private.TCP, SSHPort)
-	if inPublic || inPrivate {
-		return logs
+	if containsPort(c.Filter.Public.TCP, SSHPort) || containsPort(c.Filter.Private.TCP, SSHPort) {
+		return nil
 	}
 	if c.Security.AllowSSHPublic {
 		c.Filter.Public.TCP = append(c.Filter.Public.TCP, SSHPort)
-		logs = append(logs,
-			"auto-added port 22 to filter.public.tcp (security.allow_ssh_public=true)")
-	} else {
-		c.Filter.Private.TCP = append(c.Filter.Private.TCP, SSHPort)
-		logs = append(logs,
-			"auto-added port 22 to filter.private.tcp (security.allow_ssh_public=false)")
+		return []string{"auto-added port 22 to filter.public.tcp (security.allow_ssh_public=true)"}
 	}
-	return logs
+	c.Filter.Private.TCP = append(c.Filter.Private.TCP, SSHPort)
+	return []string{"auto-added port 22 to filter.private.tcp (security.allow_ssh_public=false)"}
 }
 
 // ResolveInterface fetches the *net.Interface for the configured name.

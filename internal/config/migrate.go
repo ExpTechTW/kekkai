@@ -1,10 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -20,7 +20,9 @@ import (
 // the lenient parse and dropped when Load() rewrites the canonical file.
 func migrateIfNeeded(data []byte, fromVersion int) (*Config, bool, error) {
 	if fromVersion == 0 || fromVersion == CurrentVersion {
-		cfg, err := parseCurrent(data)
+		// Current-version (or version-less) docs are parsed strictly so
+		// typos surface as a hard "unknown field" error.
+		cfg, err := parseConfig(data, true)
 		if err != nil {
 			return nil, false, err
 		}
@@ -34,7 +36,7 @@ func migrateIfNeeded(data []byte, fromVersion int) (*Config, bool, error) {
 		// strict decoder. Then bump the version marker so Load() backs up +
 		// rewrites canonical config in the current schema shape, dropping
 		// the dead keys from disk.
-		cfg, err := parseLenient(data)
+		cfg, err := parseConfig(data, false)
 		if err != nil {
 			return nil, false, err
 		}
@@ -47,25 +49,16 @@ func migrateIfNeeded(data []byte, fromVersion int) (*Config, bool, error) {
 		fromVersion, CurrentVersion)
 }
 
-// parseCurrent decodes a current-schema document using strict field
-// matching. Unknown keys are a hard error so typos surface immediately.
-func parseCurrent(data []byte) (*Config, error) {
+// parseConfig decodes a config document. When strict is true unknown keys
+// are a hard error (so typos surface immediately); when false they are
+// tolerated, which the migration path relies on to drop keys removed in
+// newer schema versions.
+func parseConfig(data []byte, strict bool) (*Config, error) {
 	var c Config
-	dec := yaml.NewDecoder(strings.NewReader(string(data)))
-	dec.KnownFields(true)
-	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("parse yaml: %w", err)
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	if strict {
+		dec.KnownFields(true)
 	}
-	return &c, nil
-}
-
-// parseLenient decodes an older-schema document without strict field
-// matching, so keys removed in newer schema versions are tolerated during
-// migration instead of failing the load. Only the migration path uses it;
-// current-version configs always go through parseCurrent.
-func parseLenient(data []byte) (*Config, error) {
-	var c Config
-	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parse yaml: %w", err)
 	}
