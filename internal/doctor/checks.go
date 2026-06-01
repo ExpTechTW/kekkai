@@ -155,44 +155,31 @@ func checkConfig(r *Runner) *config.Config {
 		Detail: "schema ok, ports unique, CIDRs parse",
 	})
 
-	// Security sanity checks.
-	hasSSHPrivate := false
-	for _, p := range cfg.Filter.Private.TCP {
-		if p == 22 {
-			hasSSHPrivate = true
-			break
-		}
-	}
-	hasSSHPublic := false
-	for _, p := range cfg.Filter.Public.TCP {
-		if p == 22 {
-			hasSSHPublic = true
-			break
-		}
-	}
-
+	// Security sanity checks. SSH (port 22) is applied to the running filter
+	// implicitly per security.allow_ssh_public — it is never listed in the
+	// config port groups — so the flag is the source of truth here.
 	switch {
-	case hasSSHPublic:
+	case cfg.SSHIsPublic():
 		sec.Add(Result{
 			Status: StatusWarn,
 			Title:  "SSH exposure",
-			Detail: "port 22 in filter.public.tcp — accessible from anywhere",
+			Detail: "SSH (port 22) reachable from any source (allow_ssh_public=true)",
 			Suggestions: []string{
-				"consider moving 22 to filter.private.tcp and setting an allowlist",
+				"set security.allow_ssh_public: false to gate SSH behind ingress_allowlist",
 			},
 		})
-	case hasSSHPrivate && len(cfg.Filter.IngressAllowlist) == 0:
+	case len(cfg.Filter.IngressAllowlist) == 0:
 		sec.Add(Result{
 			Status:      StatusError,
 			Title:       "SSH allowlist",
-			Detail:      "private.tcp contains 22 but ingress_allowlist is empty",
+			Detail:      "SSH gated to private (allow_ssh_public=false) but ingress_allowlist is empty — SSH is locked out",
 			Suggestions: []string{"add your management network to filter.ingress_allowlist"},
 		})
-	case hasSSHPrivate:
+	default:
 		sec.Add(Result{
 			Status: StatusOK,
 			Title:  "SSH allowlist",
-			Detail: fmt.Sprintf("%d allowlist entries gate port 22", len(cfg.Filter.IngressAllowlist)),
+			Detail: fmt.Sprintf("%d allowlist entries gate SSH (port 22)", len(cfg.Filter.IngressAllowlist)),
 		})
 	}
 

@@ -97,9 +97,6 @@ func runCheck(path string) int {
 		fmt.Printf("would migrate v%d → v%d on daemon start\n",
 			res.FromVersion, config.CurrentVersion)
 	}
-	for _, line := range res.NormalizeLog {
-		fmt.Printf("normalize: %s\n", line)
-	}
 	fmt.Println("config ok")
 	return 0
 }
@@ -247,9 +244,6 @@ func run(cfgPath, managedCfgPath string) error {
 			"from_version", res.FromVersion,
 			"to_version", config.CurrentVersion,
 			"backup", res.BackupPath)
-	}
-	for _, line := range res.NormalizeLog {
-		mainLog.Info("config normalize", "change", line)
 	}
 	warnIfSSHPublic(cfg, mainLog)
 
@@ -453,13 +447,18 @@ func (a *agent) applyFilter(cfg *config.Config) error {
 	if err := a.blocklist.Sync(blocklist); err != nil {
 		return err
 	}
-	if err := a.pubTCP.Sync(cfg.Filter.Public.TCP); err != nil {
+	// Effective*TCP fold in the implicit SSH port (22) per
+	// security.allow_ssh_public. The port is applied to the running filter
+	// only — it is never written back to the config file.
+	pubTCP := cfg.EffectivePublicTCP()
+	privTCP := cfg.EffectivePrivateTCP()
+	if err := a.pubTCP.Sync(pubTCP); err != nil {
 		return err
 	}
 	if err := a.pubUDP.Sync(cfg.Filter.Public.UDP); err != nil {
 		return err
 	}
-	if err := a.privTCP.Sync(cfg.Filter.Private.TCP); err != nil {
+	if err := a.privTCP.Sync(privTCP); err != nil {
 		return err
 	}
 	if err := a.privUDP.Sync(cfg.Filter.Private.UDP); err != nil {
@@ -480,9 +479,9 @@ func (a *agent) applyFilter(cfg *config.Config) error {
 		return err
 	}
 	a.log.Info("filter applied",
-		"public_tcp", fmt.Sprintf("%v", cfg.Filter.Public.TCP),
+		"public_tcp", fmt.Sprintf("%v", pubTCP),
 		"public_udp", fmt.Sprintf("%v", cfg.Filter.Public.UDP),
-		"private_tcp", fmt.Sprintf("%v", cfg.Filter.Private.TCP),
+		"private_tcp", fmt.Sprintf("%v", privTCP),
 		"private_udp", fmt.Sprintf("%v", cfg.Filter.Private.UDP),
 		"allowlist", len(cfg.Filter.IngressAllowlist),
 		"blocklist", len(cfg.Filter.StaticBlocklist))
@@ -541,9 +540,6 @@ func (a *agent) reload() error {
 		a.log.Info("auto-backup written", "path", backupPath)
 	}
 
-	for _, line := range res.NormalizeLog {
-		a.log.Info("config normalize", "change", line)
-	}
 	warnIfSSHPublic(newCfg, a.log)
 
 	if err := a.applyFilter(newCfg); err != nil {
@@ -627,19 +623,15 @@ func persistManagedConfig(path string, cfg *config.Config) error {
 	return os.Rename(tmp, path)
 }
 
-// warnIfSSHPublic shouts into the log whenever SSH is intentionally
-// exposed via security.allow_ssh_public. WARN level so it lands in the
-// MOTD-reachable slice of journal output.
+// warnIfSSHPublic shouts into the log whenever SSH is exposed to the public
+// internet. SSH-is-public is fully determined by security.allow_ssh_public
+// (Validate enforces that 22 can't sit in the contradicting group), so the
+// flag alone is the trigger. WARN level so it lands in the MOTD-reachable
+// slice of journal output.
 func warnIfSSHPublic(cfg *config.Config, l *logx.Logger) {
-	if !cfg.Security.AllowSSHPublic {
-		return
-	}
-	for _, p := range cfg.Filter.Public.TCP {
-		if p == config.SSHPort {
-			l.Warn("SECURITY: SSH (port 22) is in filter.public.tcp",
-				"security.allow_ssh_public", true)
-			return
-		}
+	if cfg.SSHIsPublic() {
+		l.Warn("SECURITY: SSH (port 22) is reachable from any source",
+			"security.allow_ssh_public", true)
 	}
 }
 

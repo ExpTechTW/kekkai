@@ -103,25 +103,23 @@ observability:
 
 # ---------- security ----------
 security:
-  # EN: Single switch for where SSH (port 22) is auto-placed when you
-  #     haven't listed 22 in filter.public.tcp or filter.private.tcp
-  #     yourself. Checked on every load/reload:
-  #       - true  -> auto-add 22 to filter.public.tcp (open to the internet);
-  #                  startup emits a loud WARNING log.
-  #       - false -> auto-add 22 to filter.private.tcp (ingress_allowlist only).
-  #     You may leave 22 unlisted and let this flag place it. If you DO list
-  #     22 manually it must match the flag — listing it in the contradicting
-  #     group (22 in public.tcp with false, or 22 in private.tcp with true)
-  #     is a fatal validation error, as is listing it in both groups.
-  # ZH: 決定 SSH (port 22) 自動歸到哪個 group 的單一開關。當你沒有自己把
-  #     22 寫進 filter.public.tcp 或 filter.private.tcp 時，每次載入/reload
-  #     會依此處理：
-  #       - true  -> 自動把 22 加進 filter.public.tcp (對全網開放)，
-  #                  啟動時會印一行 WARN log。
-  #       - false -> 自動把 22 加進 filter.private.tcp (只允許 allowlist)。
-  #     你可以不填 22，交給這個 flag 自動歸位；若你手動填，就必須和 flag 一致
-  #     ——填進矛盾的 group（false 卻把 22 放 public.tcp、或 true 卻放
-  #     private.tcp）會拒絕啟動，同時出現在兩個 group 也是。
+  # EN: Single switch for how SSH (port 22) is treated by the running
+  #     filter. Port 22 is applied to the eBPF maps IMPLICITLY — it is never
+  #     written into this file:
+  #       - true  -> SSH allowed on public (any source); startup WARNs.
+  #       - false -> SSH allowed on private (ingress_allowlist only).
+  #     You normally leave 22 unlisted and let this flag decide. You MAY
+  #     still list 22 explicitly, but only in the group that matches the
+  #     flag — listing it in the contradicting group (22 in public.tcp with
+  #     false, or 22 in private.tcp with true) is a fatal validation error,
+  #     as is listing it in both groups.
+  # ZH: 決定執行中的 filter 怎麼處理 SSH (port 22) 的單一開關。22 是「隱式」
+  #     套用到 eBPF map，永遠不會被寫進這個檔案：
+  #       - true  -> SSH 開在 public (任何來源)，啟動時印一行 WARN log。
+  #       - false -> SSH 開在 private (只允許 ingress_allowlist)。
+  #     正常情況不用填 22，交給這個 flag 決定；你也可以手動填，但只能填進和
+  #     flag 一致的 group——填進矛盾的 group（false 卻把 22 放 public.tcp、
+  #     或 true 卻放 private.tcp）會拒絕啟動，同時出現在兩個 group 也是。
   allow_ssh_public: __SECURITY_ALLOW_SSH_PUBLIC__
 
 # ---------- filter rules ----------
@@ -187,9 +185,11 @@ __FILTER_PUBLIC_UDP__
 
   private:
     # EN: Services only ingress_allowlist can reach. Everyone else dropped.
-    #     Port 22 is auto-added here when security.allow_ssh_public is false.
+    #     When security.allow_ssh_public is false, SSH (22) is allowed here
+    #     implicitly by the running filter — you don't (and shouldn't) list it.
     # ZH: 只允許 ingress_allowlist 連線的服務 port。其他全 DROP。
-    #     security.allow_ssh_public=false 時 22 會自動加進來。
+    #     security.allow_ssh_public=false 時，執行中的 filter 會隱式允許
+    #     SSH (22)，你不用（也不該）自己列進來。
     tcp:
 __FILTER_PRIVATE_TCP__
     udp:

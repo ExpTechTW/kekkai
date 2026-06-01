@@ -64,10 +64,9 @@ func backupFile(src string, kind BackupKind) (string, error) {
 	return dst, nil
 }
 
-// AutoBackupIfChanged compares the new config against the old one (after
-// Normalize) and writes an auto_backup if they differ. It is the caller's
-// responsibility to invoke this before overwriting `src`. No-op if the
-// structs match.
+// AutoBackupIfChanged compares the new config against the old one and
+// writes an auto_backup if they differ. It is the caller's responsibility
+// to invoke this before overwriting `src`. No-op if the structs match.
 //
 // Returns the backup path (empty if no backup was needed) and any error.
 func AutoBackupIfChanged(src string, oldCfg, newCfg *Config) (string, error) {

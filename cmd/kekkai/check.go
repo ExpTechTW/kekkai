@@ -67,9 +67,6 @@ func renderCheckSuccess(cfgPath string, cfg *config.Config, res *config.LoadResu
 		// Non-TTY output stays machine-parseable — mirrors what
 		// kekkai-agent -check used to print so any existing scripts
 		// that pipe `kekkai check` keep working.
-		for _, line := range res.NormalizeLog {
-			fmt.Printf("normalize: %s\n", line)
-		}
 		if res.Migrated {
 			fmt.Printf("would migrate v%d → v%d on daemon start\n",
 				res.FromVersion, config.CurrentVersion)
@@ -128,28 +125,20 @@ func renderCheckSuccess(cfgPath string, cfg *config.Config, res *config.LoadResu
 	fmt.Println(kv("allowlist", fmt.Sprintf("%d entries", len(cfg.Filter.IngressAllowlist))))
 	fmt.Println(kv("blocklist", fmt.Sprintf("%d entries", len(cfg.Filter.StaticBlocklist))))
 
-	// SSH exposure callout — coloured yellow if SSH is public (allowed
-	// by config but worth a second look) and green if allowlist-gated.
-	ssh := "not present"
-	sshStyle := dim
-	if hasPort(cfg.Filter.Public.TCP, config.SSHPort) {
-		ssh = "port 22 in public.tcp (WIDE OPEN)"
+	// SSH exposure callout — derived from security.allow_ssh_public, which
+	// is the source of truth (port 22 is applied to the running filter
+	// implicitly, never listed in config). Yellow when public, cyan when
+	// allowlist-gated.
+	var ssh string
+	var sshStyle lipgloss.Style
+	if cfg.SSHIsPublic() {
+		ssh = "public (WIDE OPEN) — allow_ssh_public=true"
 		sshStyle = warn
-	} else if hasPort(cfg.Filter.Private.TCP, config.SSHPort) {
-		ssh = "port 22 in private.tcp (allowlist-gated)"
+	} else {
+		ssh = "private (allowlist-gated) — allow_ssh_public=false"
 		sshStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#22d3ee"))
 	}
 	fmt.Println("  " + dim.Render(fmt.Sprintf("%-18s", "ssh exposure")) + sshStyle.Render(ssh))
-
-	// Normalize log — zero-to-many lines the loader reshaped during
-	// Normalize (e.g. "auto-added port 22 to filter.private.tcp").
-	if len(res.NormalizeLog) > 0 {
-		fmt.Println()
-		fmt.Println("  " + dim.Render("normalize:"))
-		for _, line := range res.NormalizeLog {
-			fmt.Println("    " + dim.Render("· "+line))
-		}
-	}
 
 	if res.Migrated {
 		fmt.Println()

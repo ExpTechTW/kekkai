@@ -79,41 +79,65 @@ func TestValidate_SSHPlacementMatchesAllowSSHPublic(t *testing.T) {
 	}
 }
 
-func TestNormalize_PlacesSSHPerAllowSSHPublic(t *testing.T) {
-	t.Run("public flag adds 22 to public.tcp", func(t *testing.T) {
+func TestEffectiveTCP_PlacesSSHImplicitlyWithoutMutatingConfig(t *testing.T) {
+	t.Run("public flag: 22 implicit in public, not in config", func(t *testing.T) {
 		c := baseValidConfig()
 		c.Security.AllowSSHPublic = true
-		c.Normalize()
-		if !containsPort(c.Filter.Public.TCP, SSHPort) {
-			t.Fatalf("Normalize did not add 22 to public.tcp: %v", c.Filter.Public.TCP)
+		c.Filter.Public.TCP = []uint16{80}
+
+		if !containsPort(c.EffectivePublicTCP(), SSHPort) {
+			t.Fatalf("EffectivePublicTCP missing 22: %v", c.EffectivePublicTCP())
 		}
-		if containsPort(c.Filter.Private.TCP, SSHPort) {
-			t.Fatalf("22 unexpectedly added to private.tcp: %v", c.Filter.Private.TCP)
+		if containsPort(c.EffectivePrivateTCP(), SSHPort) {
+			t.Fatalf("EffectivePrivateTCP unexpectedly has 22: %v", c.EffectivePrivateTCP())
+		}
+		// The config struct must stay untouched — 22 is never persisted.
+		if containsPort(c.Filter.Public.TCP, SSHPort) {
+			t.Fatalf("config Filter.Public.TCP was mutated: %v", c.Filter.Public.TCP)
 		}
 	})
 
-	t.Run("private flag adds 22 to private.tcp", func(t *testing.T) {
+	t.Run("private flag: 22 implicit in private, not in config", func(t *testing.T) {
 		c := baseValidConfig()
 		c.Security.AllowSSHPublic = false
-		c.Normalize()
-		if !containsPort(c.Filter.Private.TCP, SSHPort) {
-			t.Fatalf("Normalize did not add 22 to private.tcp: %v", c.Filter.Private.TCP)
+
+		if !containsPort(c.EffectivePrivateTCP(), SSHPort) {
+			t.Fatalf("EffectivePrivateTCP missing 22: %v", c.EffectivePrivateTCP())
 		}
-		if containsPort(c.Filter.Public.TCP, SSHPort) {
-			t.Fatalf("22 unexpectedly added to public.tcp: %v", c.Filter.Public.TCP)
+		if containsPort(c.EffectivePublicTCP(), SSHPort) {
+			t.Fatalf("EffectivePublicTCP unexpectedly has 22: %v", c.EffectivePublicTCP())
+		}
+		if containsPort(c.Filter.Private.TCP, SSHPort) {
+			t.Fatalf("config Filter.Private.TCP was mutated: %v", c.Filter.Private.TCP)
 		}
 	})
 
-	t.Run("already listed in agreeing group is untouched", func(t *testing.T) {
+	t.Run("no duplicate when user already listed 22 in agreeing group", func(t *testing.T) {
 		c := baseValidConfig()
 		c.Security.AllowSSHPublic = true
 		c.Filter.Public.TCP = []uint16{22, 443}
-		logs := c.Normalize()
-		if len(logs) != 0 {
-			t.Fatalf("Normalize logged changes for already-placed 22: %v", logs)
+
+		eff := c.EffectivePublicTCP()
+		n := 0
+		for _, p := range eff {
+			if p == SSHPort {
+				n++
+			}
 		}
-		if got := len(c.Filter.Public.TCP); got != 2 {
-			t.Fatalf("public.tcp len = %d, want 2 (no duplicate 22): %v", got, c.Filter.Public.TCP)
+		if n != 1 {
+			t.Fatalf("EffectivePublicTCP has %d copies of 22, want 1: %v", n, eff)
+		}
+	})
+
+	t.Run("SSHIsPublic tracks the flag", func(t *testing.T) {
+		c := baseValidConfig()
+		c.Security.AllowSSHPublic = true
+		if !c.SSHIsPublic() {
+			t.Fatal("SSHIsPublic()=false, want true")
+		}
+		c.Security.AllowSSHPublic = false
+		if c.SSHIsPublic() {
+			t.Fatal("SSHIsPublic()=true, want false")
 		}
 	})
 }
