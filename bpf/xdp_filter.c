@@ -7,13 +7,15 @@
 //      non-IPv4/ARP          → DROP
 //   2. IP frag 2+            → PASS (no L4 header to inspect)
 //   3. conntrack hit         → PASS (TCP/UDP stateful fast path)
-//   4. return traffic        → PASS (TCP established, DHCP client, ICMP-if-enabled)
-//                              NOTE: UDP ephemeral-port fallback was removed
-//                              in build.21 — attackers were trivially bypassing
-//                              it by targeting dport >= 32768. UDP return now
-//                              depends entirely on the egress seed (TC hook)
-//                              populating flowtrack_v4, which the stateful
-//                              fast path in step 3 consumes.
+//   4. ICMP / DHCP-client     → PASS (the only passes step 3 can't key on)
+//                              NOTE: ALL TCP/UDP return traffic goes through
+//                              the step-3 conntrack fast path, which the TC
+//                              egress seed populates. kekkai requires kernel
+//                              >= 6.6 (TCX), so that seed is always present —
+//                              there is no stateless return fallback. The old
+//                              "TCP has ACK/RST/FIN" rule was removed (a forged
+//                              ACK could mint a flow); the UDP ephemeral-port
+//                              rule was removed in build.21.
 //   5. static blocklist      → DROP
 //   6. dynamic blocklist     → DROP (if not expired)
 //   7. public port           → PASS (any source)
@@ -420,8 +422,8 @@ int kekkai_xdp(struct xdp_md *ctx) {
     __u32 saddr = ip->saddr;
     __u8 proto  = ip->protocol;
 
-    // One timestamp per packet, reused by perip_touch, the conntrack fast
-    // path, and flow_upsert (avoids re-calling bpf_ktime_get_ns()).
+    // One timestamp per packet, reused by perip_touch and the conntrack
+    // lookup (avoids re-calling bpf_ktime_get_ns()).
     __u64 now_ns = bpf_ktime_get_ns();
 
     // protocol counters (counted before filtering so drops still show)
@@ -436,13 +438,20 @@ int kekkai_xdp(struct xdp_md *ctx) {
         stat_add(STAT_PKTS_OTHER_L4, 1); stat_add(STAT_BYTES_OTHER_L4, pkt_len); break;
     }
 
-    // 2. IP fragment 2+ — no L4 header, let kernel defrag handle it
+    // 2. IP fragment 2+ (offset > 0) — DROP. Non-first fragments carry no L4
+    //    header, so passing them lets a packet skip every port/blocklist/
+    //    conntrack check (a bypass) and lets a fragment flood pile up in the
+    //    kernel's reassembly queue. The first fragment (offset 0) still has
+    //    the L4 header and is policed normally below. Trade-off: inbound
+    //    traffic that legitimately fragments can't be reassembled — fine for
+    //    an L4 edge firewall fronting TCP services (MSS/PMTU avoid frags).
     __u16 frag = bpf_ntohs(ip->frag_off) & IP_FRAG_OFFSET_MASK;
     if (frag != 0) {
-        stat_add(STAT_PASS_FRAGMENT, 1);
-        stat_add(STAT_PKTS_PASSED, 1);
-        perip_touch(saddr, pkt_len, proto, 0, now_ns);
-        return XDP_PASS;
+        stat_add(STAT_DROP_NO_POLICY, 1);
+        stat_add(STAT_PKTS_DROPPED, 1);
+        stat_add(STAT_BYTES_DROPPED, pkt_len);
+        perip_touch(saddr, pkt_len, proto, 1, now_ns);
+        return XDP_DROP;
     }
 
     // Compute L4 start from IP IHL. Header length is ihl * 4 bytes, min 20.
@@ -457,7 +466,6 @@ int kekkai_xdp(struct xdp_md *ctx) {
     void *l4 = (void *)ip + ihl * 4;
 
     __u16 sport_be = 0, dport_be = 0;
-    __u8 tcp_flags = 0;
 
     // Parse L4 header once (stateful + policy paths reuse these fields).
     if (proto == IPPROTO_TCP) {
@@ -471,7 +479,6 @@ int kekkai_xdp(struct xdp_md *ctx) {
         }
         sport_be = tcp->source;
         dport_be = tcp->dest;
-        tcp_flags = tcp->flags;
     } else if (proto == IPPROTO_UDP) {
         struct udphdr *udp = l4;
         if ((void *)(udp + 1) > data_end) {
@@ -509,58 +516,39 @@ int kekkai_xdp(struct xdp_md *ctx) {
         }
     }
 
-    // 4. return traffic fallback → PASS
-    //    - ICMP: always (ping replies, PMTU, etc)
-    //    - TCP: packets that are part of an established session. In
-    //      stateless terms this is the classic "tcp-established" match
-    //      used by AWS NACLs and Juniper filters: any segment where
-    //      ACK, RST or FIN is set. A brand-new connection is SYN-only,
-    //      which is the single case that falls through to port checks.
-    //      Matching RST/FIN is essential — otherwise the server-side
-    //      session dies the moment the peer sends a reset or starts a
-    //      graceful close, because those packets carry no payload ACK.
-    //    - UDP: only DHCP client replies (dst 68) are allowed here, so
-    //      lease renewal does not flap the interface IP. All other UDP
-    //      return traffic must come through the stateful fast path above,
-    //      which is fed by the TC egress seed. This is intentional: the
-    //      old "dport >= ephemeral" heuristic was a trivial UDP amplifier
-    //      bypass (attackers just aimed at dport 32768+).
-    if (proto == IPPROTO_ICMP && allow_icmp) {
-        stat_add(STAT_PASS_RETURN_ICMP, 1);
-        stat_add(STAT_PKTS_PASSED, 1);
-        perip_touch(saddr, pkt_len, proto, 0, now_ns);
-        return XDP_PASS;
-    }
-    if (proto == IPPROTO_TCP) {
-        if (tcp_flags & (TCP_FLAG_ACK | TCP_FLAG_RST | TCP_FLAG_FIN)) {
-            struct flow4_key fkey = {
-                .saddr = saddr, .daddr = ip->daddr,
-                .sport = sport_be, .dport = dport_be, .proto = proto,
-            };
-            flow_upsert(&fkey, now_ns);
-            stat_add(STAT_PASS_RETURN_TCP, 1);
+    // 4. Passes that the stateful fast path (step 3) structurally cannot key
+    //    on. kekkai requires kernel >= 6.6, so the TC egress seed always
+    //    populates flowtrack — ALL legitimate TCP/UDP return traffic is
+    //    matched in step 3. The old stateless "TCP has ACK/RST/FIN" return
+    //    rule was removed: it is now redundant, and it let a forged ACK
+    //    create a flow entry with no real egress (a bypass vector). TCP that
+    //    misses conntrack falls straight through to the port policy below —
+    //    a real new connection is a SYN to a public/private port; an orphan
+    //    ACK to a closed port hits default deny.
+    //
+    //    Only two protocol passes remain, neither expressible as a 4-tuple
+    //    flow:
+    //      - ICMP: ping replies / PMTU (toggle: allow_icmp)
+    //      - UDP dst 68: DHCP client lease renewal, so it doesn't flap the IP
+    if (proto == IPPROTO_ICMP) {
+        if (allow_icmp) {
+            stat_add(STAT_PASS_RETURN_ICMP, 1);
             stat_add(STAT_PKTS_PASSED, 1);
             perip_touch(saddr, pkt_len, proto, 0, now_ns);
             return XDP_PASS;
         }
+        // allow_icmp=false → fall through to default deny below.
     } else if (proto == IPPROTO_UDP) {
         if (dport_be == bpf_htons(LEGACY_DHCP_CLIENT_PORT)) {
-            struct flow4_key fkey = {
-                .saddr = saddr, .daddr = ip->daddr,
-                .sport = sport_be, .dport = dport_be, .proto = proto,
-            };
-            flow_upsert(&fkey, now_ns);
             stat_add(STAT_PASS_RETURN_UDP, 1);
             stat_add(STAT_PKTS_PASSED, 1);
             perip_touch(saddr, pkt_len, proto, 0, now_ns);
             return XDP_PASS;
         }
-        // No UDP ephemeral fallback — the stateful fast path already covers
-        // legitimate return traffic via the TC egress seed. Fall through to
-        // the port-policy checks below; anything not matching public/private
-        // rules will hit default deny.
-    } else {
-        // Unknown L4 proto and not a return classification — default deny.
+        // Other UDP: step 3 already covered return traffic; otherwise it
+        // falls through to the port policy / default deny below.
+    } else if (proto != IPPROTO_TCP) {
+        // Unknown L4 proto (not TCP/UDP/ICMP) — default deny.
         stat_add(STAT_DROP_NO_POLICY, 1);
         stat_add(STAT_PKTS_DROPPED, 1);
         stat_add(STAT_BYTES_DROPPED, pkt_len);
@@ -588,24 +576,21 @@ int kekkai_xdp(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    // 7. public ports (any source)
+    // 7. public ports (any source).
+    //    No flow_upsert here: inbound packets to a public/private service
+    //    port match the port rule on EVERY packet (dst port is constant), so
+    //    a conntrack entry adds nothing — and creating one per inbound SYN is
+    //    exactly how a spoofed-source SYN flood would evict legitimate flows
+    //    from flowtrack. flowtrack is therefore seeded ONLY by the TC egress
+    //    hook (agent-initiated outbound return traffic, whose replies land on
+    //    ephemeral ports that no port rule covers).
     if (proto == IPPROTO_TCP && port_in(&public_tcp_ports, dport_be)) {
-        struct flow4_key fkey = {
-            .saddr = saddr, .daddr = ip->daddr,
-            .sport = sport_be, .dport = dport_be, .proto = proto,
-        };
-        flow_upsert(&fkey, now_ns);
         stat_add(STAT_PASS_PUBLIC_TCP, 1);
         stat_add(STAT_PKTS_PASSED, 1);
         perip_touch(saddr, pkt_len, proto, 0, now_ns);
         return XDP_PASS;
     }
     if (proto == IPPROTO_UDP && port_in(&public_udp_ports, dport_be)) {
-        struct flow4_key fkey = {
-            .saddr = saddr, .daddr = ip->daddr,
-            .sport = sport_be, .dport = dport_be, .proto = proto,
-        };
-        flow_upsert(&fkey, now_ns);
         stat_add(STAT_PASS_PUBLIC_UDP, 1);
         stat_add(STAT_PKTS_PASSED, 1);
         perip_touch(saddr, pkt_len, proto, 0, now_ns);
@@ -622,11 +607,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
     if (is_private) {
         struct lpm_v4_key akey = { .prefixlen = 32, .addr = saddr };
         if (bpf_map_lookup_elem(&allowlist_v4, &akey)) {
-            struct flow4_key fkey = {
-                .saddr = saddr, .daddr = ip->daddr,
-                .sport = sport_be, .dport = dport_be, .proto = proto,
-            };
-            flow_upsert(&fkey, now_ns);
+            // No flow_upsert — see the note on the public-port path above.
             if (proto == IPPROTO_TCP)
                 stat_add(STAT_PASS_PRIVATE_TCP, 1);
             else

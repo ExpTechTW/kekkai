@@ -81,19 +81,20 @@ GitHub Releases 會提供各平台檔案（`kekkai-*` 與 `kekkai-agent-*`）：
 目前預設是 strict model，封包判斷順序：
 
 1. ARP（可配置）放行；其他非 IPv4 丟棄
-2. IPv4 後續分片放行（無 L4 header 可檢查）
-3. conntrack hit 直接放行（stateful fast path — TCP/UDP 都靠 egress seed 建立的 flow entry）
-4. 回程 fallback 放行：
-   - ICMP（可配置）
-   - TCP：ACK / RST / FIN（classic "tcp-established" 判斷，SYN-only 新連線會掉到 port 規則）
-   - UDP：只放行 dst port 68（DHCP client reply，避免 lease 續約 flap 介面 IP）
+2. IPv4 後續分片（offset>0）**丟棄**：無 L4 header 可檢查，放行會繞過所有 port/blocklist/conntrack policy,也避免分片洪水塞爆 kernel 重組佇列。第一個分片（offset 0）仍帶 L4 header,照常走下面的 policy。（代價:合法的入站分片無法重組——對前置 TCP 服務的 L4 防火牆而言通常無感。）
+3. conntrack hit 直接放行（stateful fast path）。**flowtrack 只由 TC egress hook 種子**:本機主動發出去的連線,其回包落在 ephemeral port、沒有 port rule 涵蓋,才需要 flow entry。入站打到 public/private 服務 port 的封包每一個都直接命中 port rule,**不**建立 flow entry——所以 SYN flood 無法撐爆 flowtrack。
+4. 只有兩種「無法用 flow 4-tuple 表示」的協定在此放行：
+   - ICMP（可配置 `filter.allow_icmp`；ping 回包 / PMTU）
+   - UDP dst port 68（DHCP client reply，避免 lease 續約 flap 介面 IP）
 5. static blocklist 命中丟棄
 6. dynamic blocklist 命中丟棄
 7. `filter.public.*` 放行
 8. `filter.private.*` 只有 `ingress_allowlist` 可放行
 9. 其餘 default deny
 
-> UDP 沒有 ephemeral port fallback — 本機主動發出去的 UDP session（DNS / NTP 等）回包完全依賴 egress seed 寫入 flowtrack，由 stateful fast path 接手。這個設計避免「dport >= 32768 就放行」的語義被 attacker 當成 UDP amplification 的入口。
+> **沒有無狀態回程 fallback。** 早期版本對「TCP 帶 ACK/RST/FIN」一律放行（classic tcp-established），但那讓偽造 ACK 能無中生有建立 flow entry，已移除。所有 TCP/UDP 回程都必須是真正的 conntrack 命中（步驟 3），由 TC egress seed 餵養。
+>
+> **kekkai 強制要求 kernel >= 6.6（TCX）。** egress seed 靠 TCX，是回程流量唯一的來源；< 6.6 會在**安裝時直接失敗**、agent 也會拒絕 attach。沒有它,DNS / NTP / 連線回包全部會被丟棄。
 
 ## 設定檔隔離（雙檔案）
 

@@ -154,10 +154,13 @@ func (l *linuxImpl) attachTCEgress() error {
 		Attach:    ebpf.AttachTCXEgress,
 	})
 	if err != nil {
-		// TCX depends on kernel support (6.6+). If unavailable, continue
-		// without egress seeding; ingress path still works via fallback rules.
+		// TCX (kernel >= 6.6) is REQUIRED, not optional: the egress seed is
+		// the only thing that lets TCP/UDP return traffic back through the
+		// filter (there is no stateless return fallback). If it can't attach,
+		// fail loudly rather than silently leaving the box unable to receive
+		// replies (DNS/NTP/connection responses would all break).
 		if errors.Is(err, link.ErrNotSupported) || isTCXModeError(err) {
-			return nil
+			return fmt.Errorf("attach tcx egress: kernel 6.6+ (TCX) required for egress seeding: %w", err)
 		}
 		return fmt.Errorf("attach tcx egress: %w", err)
 	}

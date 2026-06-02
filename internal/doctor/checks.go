@@ -399,9 +399,10 @@ func checkKernel(r *Runner) {
 	}
 
 	// Kernel version. TCX egress seeding needs >= 6.6, and that seed is the
-	// ONLY thing that lets outbound UDP return traffic (DNS, NTP, ...) back
-	// through the XDP filter — older kernels silently drop those replies.
-	// So treat < 6.6 as a hard error, not a cosmetic note.
+	// ONLY thing that lets TCP/UDP return traffic back through the filter
+	// (there is no stateless return fallback). kekkai requires >= 6.6 — the
+	// installer blocks older kernels and the agent refuses to attach — so
+	// seeing this here means the kernel was downgraded under an install.
 	if data, err := os.ReadFile("/proc/version"); err == nil {
 		line := strings.TrimSpace(string(data))
 		// Full line is verbose; keep first 70 chars.
@@ -412,7 +413,7 @@ func checkKernel(r *Runner) {
 			sec.Add(Result{
 				Status:      StatusError,
 				Title:       "kernel version",
-				Detail:      fmt.Sprintf("%d.%d too old — TCX egress unsupported (<6.6); outbound UDP return (DNS/NTP) is dropped", major, minor),
+				Detail:      fmt.Sprintf("%d.%d unsupported — kekkai requires >= 6.6 (TCX); all return traffic (DNS/NTP/replies) is dropped", major, minor),
 				Suggestions: kernelUpgradeSteps(),
 			})
 		} else {
@@ -707,13 +708,6 @@ func checkPermissions(r *Runner) {
 		Title:  "pinned stats map",
 		Detail: "openable",
 	})
-}
-
-func statusFor(ok bool) Status {
-	if ok {
-		return StatusOK
-	}
-	return StatusWarn
 }
 
 // ---------- auto-update --------------------------------------------------

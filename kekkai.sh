@@ -276,6 +276,23 @@ check_kernel() {
   log "kernel: $(uname -r)"
   [[ "$OS" == "linux" ]] || die "kekkai requires Linux"
   [[ "$ARCH" == "amd64" || "$ARCH" == "arm64" ]] || die "unsupported arch: $(uname -m)"
+
+  # kekkai REQUIRES kernel >= 6.6: TCX egress seeding is the only mechanism
+  # that lets TCP/UDP return traffic (DNS/NTP/connection replies) back through
+  # the filter — there is no stateless return fallback. Refuse to install on
+  # anything older rather than ship a box that can't receive replies.
+  local kver kmaj kmin
+  kver="$(uname -r)"
+  kmaj="${kver%%.*}"
+  kmin="${kver#*.}"; kmin="${kmin%%.*}"
+  if [[ "$kmaj" =~ ^[0-9]+$ && "$kmin" =~ ^[0-9]+$ ]]; then
+    if (( kmaj < 6 || (kmaj == 6 && kmin < 6) )); then
+      die "kekkai requires Linux kernel >= 6.6 (found $kver). TCX egress seeding is mandatory; upgrade the kernel and retry."
+    fi
+  else
+    die "could not parse kernel version '$kver'; kekkai requires >= 6.6"
+  fi
+
   if [[ ! -r /sys/kernel/btf/vmlinux ]]; then
     warn "/sys/kernel/btf/vmlinux not readable — OK, kekkai doesn't need BTF"
   fi

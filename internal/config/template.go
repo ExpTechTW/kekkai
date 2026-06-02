@@ -10,10 +10,6 @@ import (
 //go:embed default.yaml
 var defaultTemplate string
 
-// DefaultTemplate returns the raw, un-rendered template. Exposed mostly
-// for tests and for tooling that wants to inspect the canonical form.
-func DefaultTemplate() string { return defaultTemplate }
-
 // Values is the data used to render the default template. Every field is
 // optional — empty values fall back to conservative defaults so the
 // output is always valid YAML.

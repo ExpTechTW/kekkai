@@ -80,13 +80,6 @@ func New() *Logger {
 	return &Logger{slog: slog.New(h), closer: rf}
 }
 
-// NewWithWriter builds a Logger backed by an explicit writer. Used by
-// tests and by any future call site that wants to redirect logs (e.g.
-// into a buffer for assertion). No rotation, no stderr tee.
-func NewWithWriter(w io.Writer) *Logger {
-	return &Logger{slog: slog.New(newTextHandler(w, slog.LevelInfo))}
-}
-
 // With returns a child Logger carrying the given module tag. This is
 // the canonical way to route a subsystem's logs: agent main creates a
 // root logger, each subsystem calls root.With("update") once and

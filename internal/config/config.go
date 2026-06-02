@@ -196,25 +196,6 @@ func LoadWith(path string, opts LoadOptions) (*LoadResult, error) {
 	return res, nil
 }
 
-// Parse decodes a byte slice into a Config and runs the full migrate +
-// default + validate pipeline. Used by the -check and -show CLI flags and
-// by tests. It does NOT touch the filesystem.
-func Parse(data []byte) (*Config, error) {
-	fromVersion, err := peekVersion(data)
-	if err != nil {
-		return nil, err
-	}
-	cfg, _, err := migrateIfNeeded(data, fromVersion)
-	if err != nil {
-		return nil, err
-	}
-	cfg.applyDefaults()
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-	return cfg, nil
-}
-
 // Marshal serialises a Config back to YAML via the commented template.
 // This keeps the bilingual documentation attached to every field so users
 // who open the file after a reload see the same canonical shape they get

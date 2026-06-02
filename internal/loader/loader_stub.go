@@ -16,8 +16,7 @@ func newImpl() implementation { return &stubImpl{} }
 func (stubImpl) attach(ifaceIndex int, opts Options) error {
 	return fmt.Errorf("XDP is only supported on Linux; build for linux to attach")
 }
-func (stubImpl) detach() error { return nil }
-func (stubImpl) close() error  { return nil }
+func (stubImpl) close() error { return nil }
 
 const stubErr = "eBPF maps not available on non-linux builds"
 

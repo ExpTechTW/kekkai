@@ -28,29 +28,6 @@ func NewPrefixSet(m *ebpf.Map, name string) *PrefixSet {
 	return &PrefixSet{m: m, name: name}
 }
 
-func (s *PrefixSet) Add(p netip.Prefix) error {
-	key, err := keyFromPrefix(p)
-	if err != nil {
-		return err
-	}
-	val := uint8(1)
-	if err := s.m.Update(key, val, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("%s add %s: %w", s.name, p, err)
-	}
-	return nil
-}
-
-func (s *PrefixSet) Delete(p netip.Prefix) error {
-	key, err := keyFromPrefix(p)
-	if err != nil {
-		return err
-	}
-	if err := s.m.Delete(key); err != nil {
-		return fmt.Errorf("%s delete %s: %w", s.name, p, err)
-	}
-	return nil
-}
-
 // Sync reconciles the map contents with the desired set. Entries not in
 // `desired` are removed; missing entries are added. Used by config reload.
 func (s *PrefixSet) Sync(desired []netip.Prefix) error {

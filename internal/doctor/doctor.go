@@ -10,8 +10,6 @@ package doctor
 import (
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -193,17 +191,7 @@ func (p palette) dim(s string) string         { return p.wrap(p.dimCode, s) }
 func (p palette) section(s string) string     { return p.wrap(p.sectCode, s) }
 func (p palette) sectionName(s string) string { return p.wrap(p.sectCode, strings.ToUpper(s)) }
 
-// ---------- check utilities (used by platform-specific files) ------------
-
-// fileInfo returns a short "size, modified" description or an empty
-// string if the file doesn't exist.
-func fileInfo(path string) string {
-	st, err := os.Stat(path)
-	if err != nil {
-		return ""
-	}
-	return fmt.Sprintf("(%s, %s)", humanSize(st.Size()), filepath.Base(path))
-}
+// ---------- check utilities ----------------------------------------------
 
 func humanSize(n int64) string {
 	const (

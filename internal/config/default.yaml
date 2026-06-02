@@ -130,11 +130,14 @@ security:
 # EN: Inbound packet decision flow (strict model):
 #   1. ARP                         → PASS (toggle: filter.allow_arp)
 #      non-IPv4/ARP                → DROP
-#   2. IP fragment 2+              → PASS (no L4 header to inspect)
-#   3. return traffic              → PASS
-#        · TCP with ACK set
-#        · UDP with dst port ≥ filter.udp_ephemeral_min
+#   2. IP fragment 2+ (offset > 0) → DROP (no L4 header; would bypass policy)
+#   3. stateful return traffic     → PASS
+#        · TCP/UDP matched by the conntrack fast path (seeded by the TC
+#          egress hook — requires kernel >= 6.6 / TCX, which is mandatory)
 #        · ICMP (toggle: filter.allow_icmp)
+#        · UDP dst 68 (DHCP client lease renewal)
+#      NOTE: there is NO stateless TCP "ACK/RST/FIN" fallback — return
+#      traffic must be a real conntrack hit.
 #   4. src in static_blocklist     → DROP
 #   5. src in dynamic blocklist    → DROP (M6 / NATS push)
 #   6. dst port in filter.public.* → PASS (any source)
@@ -146,11 +149,14 @@ security:
 # ZH: 進站封包決策流程 (strict model)：
 #   1. ARP                         → PASS (可由 filter.allow_arp 控制)
 #      非 IPv4/ARP                 → DROP
-#   2. IP 分片後續片段              → PASS (沒有 L4 header 可檢查)
-#   3. 回程流量                     → PASS
-#        · TCP 帶 ACK flag
-#        · UDP dst port ≥ filter.udp_ephemeral_min
+#   2. IP 分片後續片段 (offset>0)   → DROP (無 L4 header，放行會繞過 policy)
+#   3. 有狀態回程流量               → PASS
+#        · TCP/UDP 由 conntrack fast path 命中 (靠 TC egress hook 種子，
+#          需 kernel >= 6.6 / TCX，為強制需求)
 #        · ICMP (由 filter.allow_icmp 控制)
+#        · UDP dst 68 (DHCP client 續租)
+#      注意：沒有無狀態的 TCP "ACK/RST/FIN" fallback —— 回程必須是真正的
+#      conntrack 命中。
 #   4. src 在 static_blocklist     → DROP
 #   5. src 在 dynamic blocklist    → DROP (M6 / NATS 推送)
 #   6. dst port 在 filter.public.* → PASS (任何來源)
@@ -160,9 +166,10 @@ security:
 #   8. 都沒命中                     → DROP (預設拒絕)
 #
 # EN: The agent's own outgoing traffic is never inspected (XDP is ingress
-#     only); rule #3 lets the responses come back without any extra config.
-# ZH: agent 自己主動出去的連線不會被檢查 (XDP 只 hook ingress)，回程封包
-#     靠規則 3 放行，不用特別設定。
+#     only); the TC egress hook seeds a flow so responses match the conntrack
+#     fast path (step 3) without any extra config.
+# ZH: agent 自己主動出去的連線不會被檢查 (XDP 只 hook ingress)；TC egress hook
+#     會種下 flow，回程封包靠 conntrack fast path (步驟 3) 放行，不用特別設定。
 filter:
   # EN: allow_icmp controls whether ICMP is treated as return traffic.
   # ZH: 控制 ICMP 是否視為回程流量直接放行。

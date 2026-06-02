@@ -89,23 +89,62 @@ func cmdVersion() {
 	}
 }
 
-// readAgentActiveSince tries to read systemd's active-enter timestamp for the
-// running agent unit. Returns zero time when systemctl is unavailable or when
-// the property can't be parsed.
+// readAgentActiveSince returns when the agent unit last became active, so the
+// TUI shows the AGENT's uptime (not the status session's). Returns zero time
+// when it can't be determined; the TUI then falls back to session time.
+//
+// systemd exposes ActiveEnterTimestamp (human string) and
+// ActiveEnterTimestampMonotonic (microseconds since boot) — there is NO
+// "...USec" realtime property (querying it returns empty, which is the bug
+// that made uptime silently fall back to session time). We use the monotonic
+// value plus /proc/uptime to compute how long the agent has been up, then
+// anchor to wall-clock now. Monotonic-based, so it's timezone-independent.
 func readAgentActiveSince() time.Time {
 	out, err := exec.Command(
 		"systemctl",
 		"show",
-		"--property=ActiveEnterTimestampUSec",
+		"--property=ActiveEnterTimestampMonotonic",
 		"--value",
-		agentUnit,
+		agentUnit+".service",
 	).Output()
 	if err != nil {
 		return time.Time{}
 	}
-	usec, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-	if err != nil || usec <= 0 {
+	startUsec, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil || startUsec <= 0 {
 		return time.Time{}
 	}
-	return time.Unix(0, usec*int64(time.Microsecond))
+	bootElapsed, err := readProcUptime()
+	if err != nil {
+		return time.Time{}
+	}
+	agentUp := bootElapsed - time.Duration(startUsec)*time.Microsecond
+	if agentUp < 0 {
+		agentUp = 0
+	}
+	return time.Now().Add(-agentUp)
+}
+
+// readProcUptime returns seconds-since-boot (the first field of /proc/uptime)
+// as a Duration.
+func readProcUptime() (time.Duration, error) {
+	b, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0, err
+	}
+	return parseProcUptime(string(b))
+}
+
+// parseProcUptime parses the first whitespace-delimited float of /proc/uptime
+// content into a Duration. Pure so it can be unit-tested.
+func parseProcUptime(content string) (time.Duration, error) {
+	fields := strings.Fields(content)
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("empty /proc/uptime")
+	}
+	secs, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(secs * float64(time.Second)), nil
 }
