@@ -1,7 +1,7 @@
 package main
 
 // Commands that touch /etc/kekkai/kekkai.yaml directly:
-// - cmdConfig opens the file in nano and auto-reloads on successful save.
+// - cmdConfig prints how to edit + reload safely (it does NOT launch an editor).
 // - cmdReload runs an offline -check pass and then signals the daemon.
 //
 // Plus tiny filesystem helpers kept local to these two commands.
@@ -12,24 +12,25 @@ import (
 	"os/exec"
 )
 
-// cmdConfig opens config in nano and reloads the agent after editor exit.
-// Root is already enforced by requireRoot() in main dispatch.
+// cmdConfig prints how to safely edit and reload the config. It deliberately
+// does NOT launch an editor.
+//
+// The old behaviour (`exec nano <path>` while running as root via sudo) was a
+// local privilege-escalation vector: most editors can spawn a shell (nano
+// ^R^X, vi :!sh, …), so anyone allowed to run `sudo kekkai config` could get
+// a root shell. Editing is delegated to `sudoedit`, which runs the editor as
+// the invoking *user* on a temp copy and writes back as root — an editor
+// shell-escape there only yields the user's own shell, not root.
 func cmdConfig(args []string) int {
 	cfgPath := firstArgOrDefault(args, defaultConfigPath)
-
-	nanoPath, err := exec.LookPath("nano")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, uiErr("nano not found; install nano first"))
-		return 1
-	}
-
-	editorCmd := exec.Command(nanoPath, cfgPath)
-	if code := runCommand(editorCmd, "edit config with nano"); code != 0 {
-		return code
-	}
-
-	// Reuse existing reload flow (includes config check).
-	return cmdReload([]string{cfgPath})
+	fmt.Println(uiInfo("config file: " + cfgPath))
+	fmt.Println(uiInfo("edit safely (the editor runs as you, not root):"))
+	fmt.Println("    sudoedit " + cfgPath)
+	fmt.Println(uiInfo("then apply:"))
+	fmt.Println("    sudo kekkai reload")
+	fmt.Println()
+	// Show the current on-disk config's validity so the operator sees its state.
+	return runWafEdge("-check", "-config", cfgPath)
 }
 
 // cmdReload validates the config first, then triggers a daemon SIGHUP via

@@ -738,7 +738,7 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 | 指令 | 實作 | 說明 |
 |---|---|---|
 | `kekkai status [path]`          | ✅ | 互動式 TUI |
-| `kekkai config [path]`          | ✅ | 用 nano 編輯 config，退出後自動 reload |
+| `kekkai config [path]`          | ✅ | 顯示 config 路徑與安全編輯方式（`sudoedit` + `kekkai reload`)；**不再**直接開編輯器（避免 root editor 提權） |
 | `kekkai doctor`                 | ✅ | 全系統健康檢查（read-only） |
 | `kekkai check [path]`           | ✅ | 驗證 config (read-only) |
 | `kekkai ports [path]`           | ✅ | 彩色列出 public/private port 與 SSH 暴露狀態 |

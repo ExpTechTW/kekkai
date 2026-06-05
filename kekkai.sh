@@ -606,10 +606,30 @@ setup_passwordless_sudo() {
   fi
 
   local sudoers_file="$SUDOERS_DIR/${SUDOERS_FILE_PREFIX}${target_user}"
-  local sudoers_line="$target_user ALL=(root) NOPASSWD: $CLI_BIN, $CLI_BIN *"
-  log "configuring passwordless sudo for $CLI_BIN (user=$target_user)"
+
+  # Passwordless sudo is restricted to SAFE subcommands. A blanket
+  # "kekkai *" was a privesc footgun: `kekkai config` launched a root editor
+  # (shell escape -> root), and `update`/`reset`/`backup` download+run a
+  # binary or write files. Those are excluded here and will prompt for a
+  # password. Config editing is delegated to sudoedit (runs the editor as the
+  # invoking user, not root). This block is rewritten on every install/update,
+  # so it also migrates any older broad drop-in.
+  local safe="status doctor ports version check show reload bypass config"
+  local cmds="" c
+  for c in $safe; do
+    cmds+="$CLI_BIN $c, $CLI_BIN $c *, "
+  done
+  cmds="${cmds%, }"
+
+  log "configuring passwordless sudo for $CLI_BIN (user=$target_user, safe subcommands only)"
   $SUDO install -d -m 0755 "$SUDOERS_DIR"
-  printf '%s\n' "$sudoers_line" | $SUDO tee "$sudoers_file" >/dev/null
+  {
+    printf '# kekkai CLI — passwordless sudo for SAFE subcommands only.\n'
+    printf '# Edit the config with: sudoedit %s   (editor runs as you, not root)\n' "$CONFIG_FILE"
+    printf '# update/reset/backup are intentionally excluded and prompt for a password.\n'
+    printf '%s ALL=(root) NOPASSWD: %s\n' "$target_user" "$cmds"
+    printf '%s ALL=(root) NOPASSWD: sudoedit %s\n' "$target_user" "$CONFIG_FILE"
+  } | $SUDO tee "$sudoers_file" >/dev/null
   $SUDO chmod 0440 "$sudoers_file"
   if ! $SUDO visudo -cf "$sudoers_file" >/dev/null; then
     $SUDO rm -f "$sudoers_file"
@@ -842,6 +862,41 @@ print(cli["browser_download_url"])
 ' "$channel" "$os" "$arch"
 }
 
+# verify_sha256 checks a downloaded asset against its sibling "<asset>.sha256"
+# in the same release. Returns:
+#   0 + log  on match
+#   0 + WARN on missing checksum (soft mode — does not block updates that
+#            predate checksum publishing; flip the `return 0` to `return 1`
+#            once every release is known to publish one)
+#   1        on mismatch (tampered / corrupted)
+# NOTE: a checksum hosted in the same release only stops transport corruption
+# and naive tampering — a full release-account compromise would replace both
+# the binary AND the checksum. Real supply-chain integrity needs a SIGNATURE
+# verified against a pinned public key (minisign/cosign); this is the floor.
+verify_sha256() {
+  local file="$1" asset_url="$2"
+  local sum_url="${asset_url%%\?*}.sha256"
+  local sum_tmp="$file.sha256"
+
+  if ! curl -fsSL --connect-timeout 10 "$sum_url" -o "$sum_tmp" 2>/dev/null \
+       || [[ ! -s "$sum_tmp" ]]; then
+    warn "no .sha256 published for $(basename "${asset_url%%\?*}") — integrity NOT verified"
+    warn "supply-chain risk: a poisoned release asset would be installed unchecked"
+    return 0
+  fi
+  local want got
+  want="$(awk '{print $1; exit}' "$sum_tmp")"
+  got="$(sha256sum "$file" | awk '{print $1}')"
+  if [[ -z "$want" || "$want" != "$got" ]]; then
+    err "sha256 MISMATCH for $(basename "$file") — refusing to install"
+    err "  expected: $want"
+    err "  got:      $got"
+    return 1
+  fi
+  log "sha256 verified: $(basename "$file")"
+  return 0
+}
+
 download_release_binary() {
   local url="$1"
   local want_name="$2"
@@ -851,6 +906,9 @@ download_release_binary() {
 
   curl -fL --retry 4 --retry-delay 1 --retry-all-errors --connect-timeout 10 \
     "$url" -o "$archive" || return 1
+
+  # Verify BEFORE extracting or executing anything from the artifact.
+  verify_sha256 "$archive" "$url" || return 1
 
   local out="$tmpdir/$want_name"
   case "$archive" in
@@ -1264,7 +1322,7 @@ validate_config_against_new_binary() {
     err "the old binary and service are still running untouched."
     echo
     info "to fix, one of:"
-    info "  1. edit the config:        sudo nano $CONFIG_FILE"
+    info "  1. edit the config:        sudoedit $CONFIG_FILE"
     info "  2. reset to a clean template (backs up the broken file first):"
     info "       sudo kekkai reset"
     info "     then edit to add filter.ingress_allowlist, and re-run:"
@@ -1436,7 +1494,7 @@ do_uninstall() {
 post_install_hints() {
   echo
   info "next steps (always run kekkai with sudo):"
-  printf '  %s1.%s edit config:      sudo nano %s\n' "$C_BOLD" "$C_RESET" "$CONFIG_FILE"
+  printf '  %s1.%s edit config:      sudoedit %s\n' "$C_BOLD" "$C_RESET" "$CONFIG_FILE"
   printf '  %s2.%s validate:         sudo kekkai check\n' "$C_BOLD" "$C_RESET"
   printf '  %s3.%s restart:          sudo systemctl restart kekkai-agent\n' "$C_BOLD" "$C_RESET"
   printf '  %s4.%s watch live:       sudo kekkai status\n' "$C_BOLD" "$C_RESET"

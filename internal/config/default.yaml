@@ -131,15 +131,17 @@ security:
 #   1. ARP                         → PASS (toggle: filter.allow_arp)
 #      non-IPv4/ARP                → DROP
 #   2. IP fragment 2+ (offset > 0) → DROP (no L4 header; would bypass policy)
-#   3. stateful return traffic     → PASS
+#   3. src in static_blocklist     → DROP   } checked FIRST (absolute deny) so a
+#      src in dynamic blocklist    → DROP   } blocklisted source can't slip
+#                                            through any PASS below; NATS push
+#                                            takes effect immediately.
+#   4. stateful return traffic     → PASS
 #        · TCP/UDP matched by the conntrack fast path (seeded by the TC
 #          egress hook — requires kernel >= 6.6 / TCX, which is mandatory)
-#        · ICMP (toggle: filter.allow_icmp)
-#        · UDP dst 68 (DHCP client lease renewal)
 #      NOTE: there is NO stateless TCP "ACK/RST/FIN" fallback — return
 #      traffic must be a real conntrack hit.
-#   4. src in static_blocklist     → DROP
-#   5. src in dynamic blocklist    → DROP (M6 / NATS push)
+#   5. ICMP (toggle: filter.allow_icmp)              → PASS
+#      DHCP reply: UDP src 67 → dst 68               → PASS
 #   6. dst port in filter.public.* → PASS (any source)
 #   7. dst port in filter.private.*:
 #        · src in ingress_allowlist → PASS
@@ -150,15 +152,16 @@ security:
 #   1. ARP                         → PASS (可由 filter.allow_arp 控制)
 #      非 IPv4/ARP                 → DROP
 #   2. IP 分片後續片段 (offset>0)   → DROP (無 L4 header，放行會繞過 policy)
-#   3. 有狀態回程流量               → PASS
+#   3. src 在 static_blocklist     → DROP   } 最先查 (絕對 deny)，被列黑的來源
+#      src 在 dynamic blocklist    → DROP   } 連 conntrack/ICMP/DHCP 也擋得住，
+#                                            NATS 推送即時生效。
+#   4. 有狀態回程流量               → PASS
 #        · TCP/UDP 由 conntrack fast path 命中 (靠 TC egress hook 種子，
 #          需 kernel >= 6.6 / TCX，為強制需求)
-#        · ICMP (由 filter.allow_icmp 控制)
-#        · UDP dst 68 (DHCP client 續租)
 #      注意：沒有無狀態的 TCP "ACK/RST/FIN" fallback —— 回程必須是真正的
 #      conntrack 命中。
-#   4. src 在 static_blocklist     → DROP
-#   5. src 在 dynamic blocklist    → DROP (M6 / NATS 推送)
+#   5. ICMP (由 filter.allow_icmp 控制)            → PASS
+#      DHCP 回包: UDP src 67 → dst 68              → PASS
 #   6. dst port 在 filter.public.* → PASS (任何來源)
 #   7. dst port 在 filter.private.*:
 #        · src 在 ingress_allowlist → PASS

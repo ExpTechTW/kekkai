@@ -5,23 +5,24 @@
 // Decision flow (see readme §filter for the spec):
 //   1. ARP                   → PASS (if enabled)
 //      non-IPv4/ARP          → DROP
-//   2. IP frag 2+            → PASS (no L4 header to inspect)
-//   3. conntrack hit         → PASS (TCP/UDP stateful fast path)
-//   4. ICMP / DHCP-client     → PASS (the only passes step 3 can't key on)
+//   2. IP frag 2+            → DROP (no L4 header; would bypass policy)
+//   3. static blocklist      → DROP   } checked FIRST so a blocklisted source
+//      dynamic blocklist     → DROP   } can't slip through any PASS below
+//   4. conntrack hit         → PASS (TCP/UDP stateful fast path)
+//   5. ICMP / DHCP server→client → PASS (the only passes step 4 can't key on)
 //                              NOTE: ALL TCP/UDP return traffic goes through
-//                              the step-3 conntrack fast path, which the TC
+//                              the step-4 conntrack fast path, which the TC
 //                              egress seed populates. kekkai requires kernel
 //                              >= 6.6 (TCX), so that seed is always present —
 //                              there is no stateless return fallback. The old
 //                              "TCP has ACK/RST/FIN" rule was removed (a forged
 //                              ACK could mint a flow); the UDP ephemeral-port
-//                              rule was removed in build.21.
-//   5. static blocklist      → DROP
-//   6. dynamic blocklist     → DROP (if not expired)
-//   7. public port           → PASS (any source)
-//   8. private port + allow  → PASS
-//   9. private port, no allow→ DROP
-//  10. no rule               → DROP (default deny)
+//                              rule was removed in build.21. DHCP requires
+//                              src 67 → dst 68.
+//   6. public port           → PASS (any source)
+//   7. private port + allow  → PASS
+//      private port, no allow→ DROP
+//   8. no rule               → DROP (default deny)
 //
 // All counters are per-CPU to avoid contention on the hot path. Userspace
 // sums across CPUs when rendering stats.
@@ -51,6 +52,7 @@ char __license[] SEC("license") = "GPL";
 // while cutting the per-packet shared write to ~0 on high-pps flows.
 #define FLOW_REFRESH_NS           (1ULL * 1000000000ULL)
 #define LEGACY_DHCP_CLIENT_PORT   68
+#define LEGACY_DHCP_SERVER_PORT   67
 
 // --- global stats slots -----------------------------------------------------
 // Keep these in sync with internal/stats/stats.go.
@@ -454,6 +456,29 @@ int kekkai_xdp(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
+    // 3. static + dynamic blocklist (source IP). Checked BEFORE the conntrack
+    //    fast path and the ICMP/DHCP/return passes — a blocklisted source is
+    //    an ABSOLUTE deny and must not slip through any of them (this also
+    //    makes a dynamic-blocklist push take effect immediately, even on an
+    //    already-established egress-seeded flow). Only needs saddr, so it runs
+    //    before the L4 parse.
+    struct lpm_v4_key bkey = { .prefixlen = 32, .addr = saddr };
+    if (bpf_map_lookup_elem(&blocklist_v4, &bkey)) {
+        stat_add(STAT_DROP_BLOCKLIST, 1);
+        stat_add(STAT_PKTS_DROPPED, 1);
+        stat_add(STAT_BYTES_DROPPED, pkt_len);
+        perip_touch(saddr, pkt_len, proto, 1, now_ns);
+        return XDP_DROP;
+    }
+    struct dyn_block_val *dyn = bpf_map_lookup_elem(&dyn_blocklist_v4, &saddr);
+    if (dyn && dyn->until_ns > now_ns) {
+        stat_add(STAT_DROP_DYN_BLOCK, 1);
+        stat_add(STAT_PKTS_DROPPED, 1);
+        stat_add(STAT_BYTES_DROPPED, pkt_len);
+        perip_touch(saddr, pkt_len, proto, 1, now_ns);
+        return XDP_DROP;
+    }
+
     // Compute L4 start from IP IHL. Header length is ihl * 4 bytes, min 20.
     __u32 ihl = iphdr_ihl(ip);
     if (ihl < 5) {
@@ -492,7 +517,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         dport_be = udp->dest;
     }
 
-    // 3. stateful conntrack fast path (TCP/UDP only).
+    // 4. stateful conntrack fast path (TCP/UDP only).
     //    Counters are split: stateful hits bump only the stateful counter,
     //    not `return`. Earlier builds double-counted here, which made the
     //    return-traffic numbers unreadable when the box is under load.
@@ -516,7 +541,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         }
     }
 
-    // 4. Passes that the stateful fast path (step 3) structurally cannot key
+    // 5. Passes that the stateful fast path (step 4) structurally cannot key
     //    on. kekkai requires kernel >= 6.6, so the TC egress seed always
     //    populates flowtrack — ALL legitimate TCP/UDP return traffic is
     //    matched in step 3. The old stateless "TCP has ACK/RST/FIN" return
@@ -529,7 +554,9 @@ int kekkai_xdp(struct xdp_md *ctx) {
     //    Only two protocol passes remain, neither expressible as a 4-tuple
     //    flow:
     //      - ICMP: ping replies / PMTU (toggle: allow_icmp)
-    //      - UDP dst 68: DHCP client lease renewal, so it doesn't flap the IP
+    //      - DHCP client lease renewal: UDP src 67 (server) -> dst 68 (client),
+    //        so it doesn't flap the IP. Requiring src 67 stops an untrusted
+    //        source from reaching the host's DHCP client on :68 from any port.
     if (proto == IPPROTO_ICMP) {
         if (allow_icmp) {
             stat_add(STAT_PASS_RETURN_ICMP, 1);
@@ -539,13 +566,14 @@ int kekkai_xdp(struct xdp_md *ctx) {
         }
         // allow_icmp=false → fall through to default deny below.
     } else if (proto == IPPROTO_UDP) {
-        if (dport_be == bpf_htons(LEGACY_DHCP_CLIENT_PORT)) {
+        if (dport_be == bpf_htons(LEGACY_DHCP_CLIENT_PORT) &&
+            sport_be == bpf_htons(LEGACY_DHCP_SERVER_PORT)) {
             stat_add(STAT_PASS_RETURN_UDP, 1);
             stat_add(STAT_PKTS_PASSED, 1);
             perip_touch(saddr, pkt_len, proto, 0, now_ns);
             return XDP_PASS;
         }
-        // Other UDP: step 3 already covered return traffic; otherwise it
+        // Other UDP: step 4 already covered return traffic; otherwise it
         // falls through to the port policy / default deny below.
     } else if (proto != IPPROTO_TCP) {
         // Unknown L4 proto (not TCP/UDP/ICMP) — default deny.
@@ -556,27 +584,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    // 5. static blocklist
-    struct lpm_v4_key bkey = { .prefixlen = 32, .addr = saddr };
-    if (bpf_map_lookup_elem(&blocklist_v4, &bkey)) {
-        stat_add(STAT_DROP_BLOCKLIST, 1);
-        stat_add(STAT_PKTS_DROPPED, 1);
-        stat_add(STAT_BYTES_DROPPED, pkt_len);
-        perip_touch(saddr, pkt_len, proto, 1, now_ns);
-        return XDP_DROP;
-    }
-
-    // 6. dynamic blocklist (TTL)
-    struct dyn_block_val *dyn = bpf_map_lookup_elem(&dyn_blocklist_v4, &saddr);
-    if (dyn && dyn->until_ns > now_ns) {
-        stat_add(STAT_DROP_DYN_BLOCK, 1);
-        stat_add(STAT_PKTS_DROPPED, 1);
-        stat_add(STAT_BYTES_DROPPED, pkt_len);
-        perip_touch(saddr, pkt_len, proto, 1, now_ns);
-        return XDP_DROP;
-    }
-
-    // 7. public ports (any source).
+    // 6. public ports (any source).
     //    No flow_upsert here: inbound packets to a public/private service
     //    port match the port rule on EVERY packet (dst port is constant), so
     //    a conntrack entry adds nothing — and creating one per inbound SYN is
@@ -597,7 +605,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    // 8. private ports (allowlist only)
+    // 7. private ports (allowlist only)
     __u8 is_private = 0;
     if (proto == IPPROTO_TCP && port_in(&private_tcp_ports, dport_be))
         is_private = 1;
@@ -623,7 +631,7 @@ int kekkai_xdp(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    // 8. default deny
+    // 8. default deny (no rule matched)
     stat_add(STAT_DROP_NO_POLICY, 1);
     stat_add(STAT_PKTS_DROPPED, 1);
     stat_add(STAT_BYTES_DROPPED, pkt_len);
