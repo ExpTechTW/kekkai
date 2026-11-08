@@ -27,6 +27,7 @@ func cmdBypass(args []string) int {
 		fmt.Fprintln(os.Stderr, uiErr(err.Error()))
 		return 2
 	}
+	p.cfgPath = mustConfigPath(p.cfgPath, false)
 	if p.save {
 		return cmdBypassSave(p.wantBypass, p.cfgPath)
 	}

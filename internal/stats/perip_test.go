@@ -1,25 +1,28 @@
 package stats
 
-import "testing"
+import (
+	"net/netip"
+	"testing"
 
-// TestAppendEntryPerCPU verifies the per-CPU fold used to read the per-CPU
-// perip_v4 map: counters sum across CPUs, Blocked OR-s, and Proto comes from
-// the CPU with the freshest last_seen.
-func TestAppendEntryPerCPU(t *testing.T) {
-	perCPU := []PerIPStat{
+	"github.com/ExpTechTW/kekkai/internal/maps"
+)
+
+// TestFoldPerIPPerCPU verifies the per-CPU fold used to read the perip map:
+// counters sum across CPUs, Blocked OR-s, and Proto comes from the CPU with
+// the freshest last_seen. The key is the 16-byte IPv4-mapped form.
+func TestFoldPerIPPerCPU(t *testing.T) {
+	perCPU := []maps.PerIPStat{
 		{Pkts: 10, Bytes: 100, PktsDropped: 1, BytesDropped: 10, LastSeenNS: 5, LastProto: 6, Blocked: 0}, // cpu0: TCP
 		{Pkts: 0, Bytes: 0}, // cpu1: idle
 		{Pkts: 3, Bytes: 30, PktsDropped: 3, BytesDropped: 30, LastSeenNS: 9, LastProto: 17, Blocked: 1}, // cpu2: UDP, newest, blocked
 	}
-	var buf []TopEntry
-	// 1.2.3.4 in network byte order little-endian key.
-	key := uint32(0x04030201)
-	appendEntry(&buf, key, perCPU)
+	// ::ffff:1.2.3.4
+	var key perIPKey
+	key[10], key[11] = 0xff, 0xff
+	key[12], key[13], key[14], key[15] = 1, 2, 3, 4
+	folded := FoldPerIP(perCPU)
+	e := entryFrom(key, &folded)
 
-	if len(buf) != 1 {
-		t.Fatalf("len(buf)=%d, want 1", len(buf))
-	}
-	e := buf[0]
 	if e.Pkts != 13 || e.Bytes != 130 {
 		t.Errorf("sum pkts/bytes = %d/%d, want 13/130", e.Pkts, e.Bytes)
 	}
@@ -32,17 +35,23 @@ func TestAppendEntryPerCPU(t *testing.T) {
 	if e.Proto != 17 {
 		t.Errorf("Proto = %d, want 17 (from freshest last_seen)", e.Proto)
 	}
-	if e.Addr != [4]byte{1, 2, 3, 4} {
-		t.Errorf("Addr = %v, want [1 2 3 4]", e.Addr)
+	want := netip.MustParseAddr("1.2.3.4")
+	if e.Addr != want || !e.Addr.Is4() {
+		t.Errorf("Addr = %v is4=%v, want %v", e.Addr, e.Addr.Is4(), want)
 	}
 }
 
-// TestAppendEntryAllIdle confirms an entry that exists but saw no traffic on
-// any CPU still folds cleanly to a zero row.
-func TestAppendEntryAllIdle(t *testing.T) {
-	var buf []TopEntry
-	appendEntry(&buf, 0, []PerIPStat{{}, {}})
-	if len(buf) != 1 || buf[0].Pkts != 0 || buf[0].Blocked {
-		t.Fatalf("idle fold = %+v, want zero row", buf)
+// TestFoldPerIPAllIdle confirms an entry that exists but saw no traffic on
+// any CPU still folds cleanly to a zero row. The key is v4-mapped 0.0.0.0.
+func TestFoldPerIPAllIdle(t *testing.T) {
+	var key perIPKey
+	key[10], key[11] = 0xff, 0xff
+	folded := FoldPerIP([]maps.PerIPStat{{}, {}})
+	e := entryFrom(key, &folded)
+	if e.Pkts != 0 || e.Blocked || e.Proto != 0 {
+		t.Fatalf("idle fold = %+v, want zero row", e)
+	}
+	if e.Addr != netip.MustParseAddr("0.0.0.0") {
+		t.Fatalf("Addr = %v, want 0.0.0.0", e.Addr)
 	}
 }

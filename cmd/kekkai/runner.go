@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/ExpTechTW/kekkai/internal/config"
 )
 
 // requireRoot prints a clear error and exits 1 if euid != 0. kekkai CLI is
@@ -84,10 +86,11 @@ func runWafEdge(args ...string) int {
 }
 
 func firstArgOrDefault(args []string, def string) string {
-	if len(args) == 0 {
-		return def
+	path := def
+	if len(args) > 0 {
+		path = args[0]
 	}
-	return args[0]
+	return mustConfigPath(path, false)
 }
 
 // resolveConfigArg returns the [-config, path] pair to hand to kekkai-agent.
@@ -115,6 +118,13 @@ func buildResetArgs(args []string) []string {
 		default:
 			// first non-flag arg is the config path
 			path = a
+		}
+	}
+	path = mustConfigPath(path, true)
+	if iface != "" {
+		if err := config.ValidateInterfaceName(iface); err != nil {
+			fmt.Fprintln(os.Stderr, uiErr(err.Error()))
+			os.Exit(1)
 		}
 	}
 	out := []string{"-reset", "-config", path}

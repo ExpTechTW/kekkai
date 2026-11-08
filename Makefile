@@ -8,7 +8,7 @@ GIT_SHA  := $(shell git rev-parse --short HEAD 2>/dev/null || echo nosha)
 VERSION ?= $(DATE_UTC)+$(GIT_SHA)
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 
-.PHONY: all bpf build build-agent build-cli build-linux vet test clean run status \
+.PHONY: all bpf build build-agent build-cli build-linux vet test test-bpf clean run status \
         install update repair doctor uninstall \
         config-check config-backup config-show
 
@@ -34,6 +34,13 @@ vet:
 
 test:
 	go test ./...
+
+# Compile the BPF_PROG_TEST_RUN suite and run it as root. The object embedded
+# at compile time is used unless KEKKAI_BPF_OBJ is set. `make bpf` first when
+# internal/loader/bpf/xdp_filter.o is still the 4-byte placeholder.
+test-bpf:
+	mkdir -p bin
+	go test -c -tags bpftest -o bin/loader.test ./internal/loader && sudo ./bin/loader.test -test.v
 
 run: build-agent
 	@mkdir -p /tmp/kekkai-run

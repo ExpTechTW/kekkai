@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -38,6 +39,9 @@ func cmdStatus(args []string) int {
 	}
 	defer src.Close()
 
+	// `ip link` is a process spawn. The banner still tracks attach state,
+	// but not on every 1s frame.
+	var poll bypassPoll
 	model := tui.NewModel(
 		src,
 		cfg.Node.ID,
@@ -46,7 +50,7 @@ func cmdStatus(args []string) int {
 		version,
 		cfg.Update.Channel,
 		readAgentActiveSince(),
-		func() bool { bypassed, _ := filterBypassed(cfg); return bypassed },
+		func() bool { return poll.bypassed(cfg) },
 	)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
@@ -71,34 +75,50 @@ func cmdVersion() {
 	} else {
 		fmt.Printf("kekkai %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
 	}
-	// Also print kekkai-agent's version if available.
-	if _, err := exec.LookPath(agentBinary); err == nil {
-		// kekkai-agent doesn't have a -version flag yet; just note its
-		// presence and file metadata. We ignore the -check invocation's
-		// output here — it's purely a liveness probe against /dev/null.
-		_, _ = exec.Command(agentBinary, "-check", "/dev/null").CombinedOutput()
-		if st, err := os.Stat(agentBinary); err == nil {
-			msg := fmt.Sprintf("present at %s (size %d bytes, modified %s)",
-				agentBinary, st.Size(), st.ModTime().Format("2006-01-02 15:04:05"))
-			if stdoutIsTerminal() {
-				fmt.Printf("%s %s\n", uiKeyStyle.Render("kekkai-agent"), uiInfoStyle.Render(msg))
-			} else {
-				fmt.Printf("kekkai-agent %s\n", msg)
-			}
+	if st, err := os.Stat(agentBinary); err == nil {
+		msg := fmt.Sprintf("present at %s (size %d bytes, modified %s)",
+			agentBinary, st.Size(), st.ModTime().Format("2006-01-02 15:04:05"))
+		if stdoutIsTerminal() {
+			fmt.Printf("%s %s\n", uiKeyStyle.Render("kekkai-agent"), uiInfoStyle.Render(msg))
+		} else {
+			fmt.Printf("kekkai-agent %s\n", msg)
 		}
 	}
 }
 
+// bypassPoll caches the `ip link` probe. Spawning it on every TUI frame
+// was a steady source of wakeups; the banner still updates within a few
+// seconds, and a persisted emergency_bypass flag is reported immediately.
+type bypassPoll struct {
+	mu      sync.Mutex
+	checked time.Time
+	on      bool
+}
+
+func (p *bypassPoll) bypassed(cfg *config.Config) bool {
+	if cfg.Runtime.EmergencyBypass {
+		return true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.checked.IsZero() && time.Since(p.checked) < 5*time.Second {
+		return p.on
+	}
+	p.checked = time.Now()
+	attached, ok := doctor.XDPAttached(cfg.Interface.Name)
+	p.on = ok && !attached
+	return p.on
+}
+
 // readAgentActiveSince returns when the agent unit last became active, so the
-// TUI shows the AGENT's uptime (not the status session's). Returns zero time
-// when it can't be determined; the TUI then falls back to session time.
+// TUI shows the agent's uptime rather than the status session's. Returns zero
+// time when it can't be determined; the TUI then falls back to session time.
 //
-// systemd exposes ActiveEnterTimestamp (human string) and
-// ActiveEnterTimestampMonotonic (microseconds since boot) — there is NO
-// "...USec" realtime property (querying it returns empty, which is the bug
-// that made uptime silently fall back to session time). We use the monotonic
-// value plus /proc/uptime to compute how long the agent has been up, then
-// anchor to wall-clock now. Monotonic-based, so it's timezone-independent.
+// systemd exposes ActiveEnterTimestamp (a human string) and
+// ActiveEnterTimestampMonotonic (microseconds since boot). There is no
+// realtime "...USec" property — querying it returns empty, and uptime then
+// silently falls back to session time. The monotonic value plus /proc/uptime
+// gives how long the agent has been up, anchored to wall-clock now.
 func readAgentActiveSince() time.Time {
 	out, err := exec.Command(
 		"systemctl",

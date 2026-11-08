@@ -7,31 +7,28 @@ import (
 )
 
 const (
-	// RuntimeFlagAllowICMP mirrors enum in bpf/xdp_filter.c.
-	RuntimeFlagAllowICMP = uint32(1 << 0)
-	// RuntimeFlagAllowARP mirrors enum in bpf/xdp_filter.c.
-	RuntimeFlagAllowARP = uint32(1 << 1)
+	// RuntimeFlagAllowICMP mirrors RT_ALLOW_ICMP (bit 0) in bpf/xdp_filter.c.
+	RuntimeFlagAllowICMP uint32 = 1
+	// RuntimeFlagAllowARP mirrors RT_ALLOW_ARP (bit 1) in bpf/xdp_filter.c.
+	RuntimeFlagAllowARP uint32 = 2
+	// RuntimeFlagEgressSeed mirrors RT_EGRESS_SEED (bit 2). Set only while
+	// the TC egress program is attached.
+	RuntimeFlagEgressSeed uint32 = 4
 )
 
+// RuntimeCfg wraps the runtime_cfg array. Index 0 holds the RT_* flags.
 type RuntimeCfg struct {
 	m *ebpf.Map
-}
-
-type RuntimeCfgValue struct {
-	Initialized     uint32
-	Flags           uint32
-	UDPEphemeralMin uint16
-	Pad             uint16
 }
 
 func NewRuntimeCfg(m *ebpf.Map) *RuntimeCfg {
 	return &RuntimeCfg{m: m}
 }
 
-func (r *RuntimeCfg) Sync(v RuntimeCfgValue) error {
-	key := uint32(0)
-	if err := r.m.Update(key, v, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("runtime_cfg_v4 update: %w", err)
+// Sync writes flags into slot 0.
+func (r *RuntimeCfg) Sync(flags uint32) error {
+	if err := r.m.Update(uint32(0), flags, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("runtime_cfg update: %w", err)
 	}
 	return nil
 }

@@ -2,9 +2,10 @@ package config
 
 import (
 	_ "embed"
-	"fmt"
 	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 //go:embed default.yaml
@@ -116,73 +117,112 @@ func Render(v Values) string {
 		replace(placeholder, value)
 	}
 
-	replace("__VERSION__", strconv.FormatInt(int64(v.Version), 10))
-	replace("__NODE_ID__", v.NodeID)
-	replace("__NODE_REGION__", v.NodeRegion)
-	replace("__INTERFACE_NAME__", v.InterfaceName)
-	replace("__INTERFACE_XDP_MODE__", v.InterfaceXDPMode)
-	replace("__UPDATE_CHANNEL__", v.UpdateChannel)
-	replace("__AUTO_UPDATE_DOWNLOAD__", boolYAML(v.AutoUpdateDownload))
-	replace("__AUTO_UPDATE_RELOAD__", boolYAML(v.AutoUpdateReload))
-	replace("__AUTO_UPDATE_INTERVAL__", strconv.FormatInt(int64(v.AutoUpdateInterval), 10))
-	replace("__RUNTIME_EMERGENCY_BYPASS__", boolYAML(v.EmergencyBypass))
+	replace("__VERSION__", strconv.Itoa(v.Version))
+	replace("__NODE_ID__", yamlScalar(v.NodeID))
+	replace("__NODE_REGION__", yamlScalar(v.NodeRegion))
+	replace("__INTERFACE_NAME__", yamlScalar(v.InterfaceName))
+	replace("__INTERFACE_XDP_MODE__", yamlScalar(v.InterfaceXDPMode))
+	replace("__UPDATE_CHANNEL__", yamlScalar(v.UpdateChannel))
+	replace("__AUTO_UPDATE_DOWNLOAD__", boolStr(v.AutoUpdateDownload))
+	replace("__AUTO_UPDATE_RELOAD__", boolStr(v.AutoUpdateReload))
+	replace("__AUTO_UPDATE_INTERVAL__", strconv.Itoa(v.AutoUpdateInterval))
+	replace("__RUNTIME_EMERGENCY_BYPASS__", boolStr(v.EmergencyBypass))
 	replace("__RUNTIME_PERIP_TABLE_SIZE__", strconv.FormatUint(uint64(v.PerIPTableSize), 10))
-	replace("__OBSERVABILITY_STATS_FILE__", v.StatsFile)
-	replace("__SECURITY_ALLOW_SSH_PUBLIC__", boolYAML(v.AllowSSHPublic))
-	replace("__FILTER_ALLOW_ICMP__", boolYAML(v.AllowICMP))
-	replace("__FILTER_ALLOW_ARP__", boolYAML(v.AllowARP))
+	replace("__OBSERVABILITY_STATS_FILE__", yamlScalar(v.StatsFile))
+	replace("__SECURITY_ALLOW_SSH_PUBLIC__", boolStr(v.AllowSSHPublic))
+	replace("__FILTER_ALLOW_ICMP__", boolStr(v.AllowICMP))
+	replace("__FILTER_ALLOW_ARP__", boolStr(v.AllowARP))
 	replace("__FILTER_UDP_EPHEMERAL_MIN__", strconv.FormatUint(uint64(v.UDPEphemeralMin), 10))
 
-	// List placeholders sit on their own line. Render each as a block
-	// sequence with 6 spaces of indent (4 for the key's indent + 2 for
-	// the "- " prefix) so the template's layout stays consistent.
-	// Empty lists collapse the whole line so the rendered YAML doesn't
-	// grow a stray blank line between the `tcp:` key and the next one.
-	replaceLine("__FILTER_PUBLIC_TCP__", uint16List(v.PublicTCP, "      "))
-	replaceLine("__FILTER_PUBLIC_UDP__", uint16List(v.PublicUDP, "      "))
-	replaceLine("__FILTER_PRIVATE_TCP__", uint16List(v.PrivateTCP, "      "))
-	replaceLine("__FILTER_PRIVATE_UDP__", uint16List(v.PrivateUDP, "      "))
-	replaceLine("__FILTER_INGRESS_ALLOWLIST__", stringList(v.IngressAllowlist, "    "))
-	replaceLine("__FILTER_STATIC_BLOCKLIST__", stringList(v.StaticBlocklist, "    "))
+	// List placeholders own their line. Indent is the template's nesting
+	// (6 under public/private, 4 under filter). An empty list drops the
+	// line so `tcp:` is not followed by a blank line.
+	replaceLine("__FILTER_PUBLIC_TCP__", blockList(v.PublicTCP, "      ", uintText))
+	replaceLine("__FILTER_PUBLIC_UDP__", blockList(v.PublicUDP, "      ", uintText))
+	replaceLine("__FILTER_PRIVATE_TCP__", blockList(v.PrivateTCP, "      ", uintText))
+	replaceLine("__FILTER_PRIVATE_UDP__", blockList(v.PrivateUDP, "      ", uintText))
+	replaceLine("__FILTER_INGRESS_ALLOWLIST__", blockList(v.IngressAllowlist, "    ", yamlScalar))
+	replaceLine("__FILTER_STATIC_BLOCKLIST__", blockList(v.StaticBlocklist, "    ", yamlScalar))
 
 	return out
 }
 
-// boolYAML formats a bool the way YAML expects (`true` / `false`).
-func boolYAML(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
+func uintText(n uint16) string {
+	return strconv.FormatUint(uint64(n), 10)
 }
 
-// uint16List renders a []uint16 as a block sequence. Empty slices render
-// to an empty string so the key becomes `tcp:` alone (nil in YAML).
-func uint16List(items []uint16, indent string) string {
+// blockList renders items as a YAML block sequence. Empty input is empty
+// so the caller can delete the placeholder line.
+func blockList[T any](items []T, indent string, scalar func(T) string) string {
 	if len(items) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	for i, v := range items {
-		fmt.Fprintf(&b, "%s- %d", indent, v)
-		if i < len(items)-1 {
+	for i, item := range items {
+		if i > 0 {
 			b.WriteByte('\n')
 		}
+		b.WriteString(indent)
+		b.WriteString("- ")
+		b.WriteString(scalar(item))
 	}
 	return b.String()
 }
 
-// stringList renders a []string as a block sequence, same conventions.
-func stringList(items []string, indent string) string {
-	if len(items) == 0 {
-		return ""
+// yamlScalar emits s as a YAML scalar that cannot break out of the value
+// position. When yaml.v3 would round-trip the plain form unchanged, s is
+// returned as-is so existing safe values stay byte-identical. Anything
+// else is double-quoted with escapes.
+func yamlScalar(s string) string {
+	if plainYAMLRoundTrip(s) {
+		return s
 	}
-	var b strings.Builder
-	for i, v := range items {
-		fmt.Fprintf(&b, "%s- %s", indent, v)
-		if i < len(items)-1 {
-			b.WriteByte('\n')
-		}
+	return yamlDoubleQuoted(s)
+}
+
+func plainYAMLRoundTrip(s string) bool {
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte("v: "+s+"\n"), &root); err != nil {
+		return false
 	}
-	return b.String()
+	if root.Kind != yaml.DocumentNode || len(root.Content) != 1 {
+		return false
+	}
+	mapping := root.Content[0]
+	if mapping.Kind != yaml.MappingNode || len(mapping.Content) != 2 {
+		return false
+	}
+	key, val := mapping.Content[0], mapping.Content[1]
+	if key.Kind != yaml.ScalarNode || key.Value != "v" {
+		return false
+	}
+	if val.Kind != yaml.ScalarNode || val.Tag != "!!str" || val.Style != 0 || val.Value != s {
+		return false
+	}
+	encoded, err := yaml.Marshal(&yaml.Node{
+		Kind:  yaml.ScalarNode,
+		Tag:   "!!str",
+		Value: s,
+	})
+	if err != nil {
+		return false
+	}
+	return strings.TrimSuffix(string(encoded), "\n") == s
+}
+
+func yamlDoubleQuoted(s string) string {
+	encoded, err := yaml.Marshal(&yaml.Node{
+		Kind:  yaml.ScalarNode,
+		Tag:   "!!str",
+		Value: s,
+		Style: yaml.DoubleQuotedStyle,
+	})
+	if err != nil {
+		return strconv.Quote(s)
+	}
+	out := strings.TrimSuffix(string(encoded), "\n")
+	if strings.Contains(out, "\n") || !strings.HasPrefix(out, `"`) {
+		return strconv.Quote(s)
+	}
+	return out
 }

@@ -1,6 +1,9 @@
 package version
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParse(t *testing.T) {
 	cases := []struct {
@@ -38,6 +41,27 @@ func TestParse(t *testing.T) {
 	}
 }
 
+func TestParseEdges(t *testing.T) {
+	v, ok := Parse("v2026.04.14+build.0")
+	if !ok || v.Build != 0 {
+		t.Fatalf("build 0: %+v ok=%v", v, ok)
+	}
+	v, ok = Parse("v2026.04.14+build.0007")
+	if !ok || v.Build != 7 {
+		t.Fatalf("leading zeros: %+v ok=%v", v, ok)
+	}
+	for _, in := range []string{
+		"v2026.04.14+build.-1",
+		"vv2026.04.14+build.1",
+		"v2026.04.14+Build.1",
+		"v2026.04.14+build." + strings.Repeat("9", 40),
+	} {
+		if _, ok := Parse(in); ok {
+			t.Fatalf("Parse(%q) accepted", in)
+		}
+	}
+}
+
 func TestCompare(t *testing.T) {
 	cases := []struct {
 		a, b string
@@ -46,10 +70,10 @@ func TestCompare(t *testing.T) {
 		{"v2026.04.14+build.24", "v2026.04.14+build.25", -1}, // the bug that motivated this package
 		{"v2026.04.14+build.25", "v2026.04.14+build.24", 1},
 		{"v2026.04.14+build.24", "v2026.04.14+build.24", 0},
-		{"v2026.04.14+build.9", "v2026.04.14+build.18", -1},  // numeric not lexicographic
-		{"v2026.04.14+build.99", "v2026.04.15+build.1", -1},  // day rolls
-		{"v2026.04.30+build.99", "v2026.05.01+build.1", -1},  // month rolls
-		{"v2026.12.31+build.99", "v2027.01.01+build.1", -1},  // year rolls
+		{"v2026.04.14+build.9", "v2026.04.14+build.18", -1}, // numeric not lexicographic
+		{"v2026.04.14+build.99", "v2026.04.15+build.1", -1}, // day rolls
+		{"v2026.04.30+build.99", "v2026.05.01+build.1", -1}, // month rolls
+		{"v2026.12.31+build.99", "v2027.01.01+build.1", -1}, // year rolls
 	}
 	for _, c := range cases {
 		a, okA := Parse(c.a)

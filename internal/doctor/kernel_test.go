@@ -31,12 +31,29 @@ func TestParseKernelMajorMinor(t *testing.T) {
 			if !ok {
 				return
 			}
-			// Mirror the <6.6 gate used by checkKernel.
-			tcxOK := !(major < 6 || (major == 6 && minor < 6))
-			if tcxOK != tt.tcxOK {
-				t.Fatalf("%q: tcxOK=%v, want %v", tt.rel, tcxOK, tt.tcxOK)
+			if got := !kernelTooOld(major, minor); got != tt.tcxOK {
+				t.Fatalf("%q: tcxOK=%v, want %v", tt.rel, got, tt.tcxOK)
 			}
 		})
+	}
+}
+
+func TestKernelVersionResult(t *testing.T) {
+	unread := kernelVersionResult(false, "", false, 0, 0)
+	if unread.Status != StatusWarn || !strings.Contains(unread.Detail, "/proc/version") {
+		t.Fatalf("unreadable version: %+v", unread)
+	}
+	unparsed := kernelVersionResult(true, "Linux version 6.8", false, 0, 0)
+	if unparsed.Status != StatusWarn || !strings.Contains(unparsed.Detail, "osrelease") {
+		t.Fatalf("unparseable osrelease: %+v", unparsed)
+	}
+	old := kernelVersionResult(true, "Linux version 5.15", true, 5, 15)
+	if old.Status != StatusError || !strings.Contains(old.Detail, "5.15 too old") {
+		t.Fatalf("old kernel: %+v", old)
+	}
+	ok := kernelVersionResult(true, "Linux version 6.8.0", true, 6, 8)
+	if ok.Status != StatusOK || ok.Detail != "Linux version 6.8.0" {
+		t.Fatalf("current kernel: %+v", ok)
 	}
 }
 

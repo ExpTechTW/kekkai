@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
-	"sort"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -22,28 +22,28 @@ import (
 
 const bpffsRoot = "/sys/fs/bpf/kekkai"
 
-// Source holds pinned map handles for the lifetime of the TUI. All
-// per-tick buffers are preallocated so steady-state refresh does no heap
-// work beyond what Bubble Tea itself needs.
+// Source holds pinned map handles for the lifetime of the TUI.
+// Scratch is reused. Top-N rows are double-buffered so a refresh never
+// writes the slice the view is still drawing.
 type Source struct {
 	statsMap *ebpf.Map
 	peripMap *ebpf.Map
 
-	iface       string
-	txBytes     *fastio.CounterReader
-	txPkts      *fastio.CounterReader
+	iface   string
+	txBytes *fastio.CounterReader
+	txPkts  *fastio.CounterReader
 
-	// scratch for PERCPU_ARRAY lookups
-	perCPU []uint64
+	scratch []stats.PerCPUCounters
+	scan    *stats.PerIPScan
+	bufs    [2][]stats.TopEntry
+	ix      int
 
-	// perip_v4 is a PER-CPU LRU hash: each lookup yields one perIPStat per
-	// possible CPU. peripCPU is the pre-sized (len == numCPU) sink the
-	// iterate fills in place; values are summed across CPUs per source IP.
-	numCPU   int
-	peripCPU []stats.PerIPStat
-
-	// preallocated top-N scratch; cap sized to perip MaxEntries
-	topBuf []stats.TopEntry
+	// Last successful per-IP walk. Reused when the global counters and the
+	// requested limit are unchanged, so an idle second does not walk the LRU.
+	topOK     bool
+	topLimit  int
+	topGlobal stats.Global
+	topRows   []stats.TopEntry
 }
 
 // Snapshot is what the Bubble Tea Model consumes each tick.
@@ -53,11 +53,11 @@ type Snapshot struct {
 	Top    []stats.TopEntry
 
 	// Deltas computed between consecutive snapshots.
-	PPS, DPS                 float64
-	BpsTotal, BpsDropped     float64
-	PpsTCP, PpsUDP, PpsICMP  float64
-	PpsStatefulTCP, PpsStatefulUDP float64
-	TxBps, TxPps             float64
+	PPS, DPS                float64
+	BpsTotal, BpsDropped    float64
+	PpsTCP, PpsUDP, PpsICMP float64
+	PpsUDPFlow              float64
+	TxBps, TxPps            float64
 
 	// Current tx counters (sysfs).
 	TxBytes, TxPkts uint64
@@ -70,37 +70,29 @@ func NewSource(iface string) (*Source, error) {
 	if err != nil {
 		return nil, wrapOpenErr("stats", err)
 	}
-	perip, err := ebpf.LoadPinnedMap(bpffsRoot+"/perip_v4", nil)
+	perip, err := ebpf.LoadPinnedMap(bpffsRoot+"/perip", nil)
 	if err != nil {
 		st.Close()
-		return nil, wrapOpenErr("perip_v4", err)
+		return nil, wrapOpenErr("perip", err)
 	}
-	// Fail loudly if the agent's pinned map doesn't match our decoder (e.g.
-	// CLI and agent built from different schemas) instead of mis-decoding.
+	// Fail before the first tick if the pinned map is not the per-CPU LRU
+	// this decoder sums. A shared hash, or a single-value iterate, dies with
+	// "per-cpu value requires a slice".
 	if err := stats.CheckPerIPMap(perip); err != nil {
 		st.Close()
 		perip.Close()
 		return nil, err
 	}
 
-	cap := int(perip.MaxEntries())
-	if cap == 0 {
-		cap = 65536
-	}
-
-	// perip_v4 is per-CPU; size the lookup sink to the possible-CPU count.
-	numCPU := stats.PossibleCPUOr1()
-
+	statsDir := filepath.Join("/sys/class/net", iface, "statistics")
 	return &Source{
-		statsMap:    st,
-		peripMap:    perip,
-		iface:       iface,
-		txBytes:     fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface)),
-		txPkts:      fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface)),
-		perCPU:      make([]uint64, 0, 128),
-		numCPU:      numCPU,
-		peripCPU:    make([]stats.PerIPStat, numCPU),
-		topBuf:      make([]stats.TopEntry, 0, cap),
+		statsMap: st,
+		peripMap: perip,
+		iface:    iface,
+		txBytes:  fastio.NewCounterReader(filepath.Join(statsDir, "tx_bytes")),
+		txPkts:   fastio.NewCounterReader(filepath.Join(statsDir, "tx_packets")),
+		scratch:  make([]stats.PerCPUCounters, 0, 8),
+		scan:     stats.NewPerIPScan(),
 	}, nil
 }
 
@@ -139,12 +131,15 @@ func (s *Source) Close() {
 	}
 }
 
-// Read produces a Snapshot. `prev` is optional — if non-nil, Read uses it
-// to compute per-second rates. The returned Snapshot is safe to pass as
-// next prev.
-func (s *Source) Read(prev *Snapshot) (Snapshot, error) {
+// Read produces a Snapshot. prev is optional and supplies the previous
+// counters for rates. limit selects the per-IP walk:
+//
+//	limit < 0  skip it (pages that do not draw the table)
+//	limit == 0 every row, sorted (the scrollable Top-N page)
+//	limit > 0  only the highest `limit` rows
+func (s *Source) Read(prev *Snapshot, limit int) (Snapshot, error) {
 	now := time.Now()
-	global, err := s.readGlobal()
+	global, err := stats.ReadGlobal(s.statsMap, &s.scratch)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -158,57 +153,49 @@ func (s *Source) Read(prev *Snapshot) (Snapshot, error) {
 	}
 
 	if prev != nil {
-		dt := now.Sub(prev.At).Seconds()
-		if dt > 0 {
-			snap.PPS = float64(global.PktsTotal-prev.Global.PktsTotal) / dt
-			snap.DPS = float64(global.PktsDropped-prev.Global.PktsDropped) / dt
-			snap.BpsTotal = float64(global.BytesTotal-prev.Global.BytesTotal) * 8 / dt
-			snap.BpsDropped = float64(global.BytesDropped-prev.Global.BytesDropped) * 8 / dt
-			snap.PpsTCP = float64(global.PktsTCP-prev.Global.PktsTCP) / dt
-			snap.PpsUDP = float64(global.PktsUDP-prev.Global.PktsUDP) / dt
-			snap.PpsICMP = float64(global.PktsICMP-prev.Global.PktsICMP) / dt
-			snap.PpsStatefulTCP = float64(global.PassStatefulTCP-prev.Global.PassStatefulTCP) / dt
-			snap.PpsStatefulUDP = float64(global.PassStatefulUDP-prev.Global.PassStatefulUDP) / dt
-			snap.TxBps = float64(txBytes-prev.TxBytes) * 8 / dt
-			snap.TxPps = float64(txPkts-prev.TxPkts) / dt
+		if dt := now.Sub(prev.At).Seconds(); dt > 0 {
+			inv := 1 / dt
+			snap.PPS = stats.PerSecond(global.PktsTotal-prev.Global.PktsTotal, inv)
+			snap.DPS = stats.PerSecond(global.PktsDropped-prev.Global.PktsDropped, inv)
+			snap.BpsTotal = stats.BitsPerSecond(global.BytesTotal-prev.Global.BytesTotal, inv)
+			snap.BpsDropped = stats.BitsPerSecond(global.BytesDropped-prev.Global.BytesDropped, inv)
+			snap.PpsTCP = stats.PerSecond(global.PktsTCP-prev.Global.PktsTCP, inv)
+			snap.PpsUDP = stats.PerSecond(global.PktsUDP-prev.Global.PktsUDP, inv)
+			snap.PpsICMP = stats.PerSecond(global.PktsICMP-prev.Global.PktsICMP, inv)
+			snap.PpsUDPFlow = stats.PerSecond(global.PassUDPFlow-prev.Global.PassUDPFlow, inv)
+			snap.TxBps = stats.BitsPerSecond(txBytes-prev.TxBytes, inv)
+			snap.TxPps = stats.PerSecond(txPkts-prev.TxPkts, inv)
 		}
 	}
 
-	// Top-N scan — reuse the preallocated buffer. Uses Iterate; the TUI
-	// tick cadence (1 s) is generous enough that BatchLookup's added
-	// complexity isn't worth it here.
-	s.topBuf = s.topBuf[:0]
-	var k uint32
-	iter := s.peripMap.Iterate()
-	// Per-CPU iterate: pass the pre-sized slice (len == numCPU) by value so
-	// the lookup fills it in place. A single perIPStat is rejected with
-	// "per-cpu value requires a slice".
-	for iter.Next(&k, s.peripCPU) {
-		s.topBuf = append(s.topBuf, stats.FoldPerIP(k, s.peripCPU))
+	if limit < 0 {
+		return snap, nil
 	}
-	if err := iter.Err(); err != nil {
-		return snap, fmt.Errorf("perip iterate: %w", err)
+	if reusePerIP(s.topOK, limit, s.topLimit, s.topGlobal, global) {
+		snap.Top = s.topRows
+		return snap, nil
 	}
 
-	sort.Slice(s.topBuf, func(i, j int) bool {
-		return s.topBuf[i].Pkts > s.topBuf[j].Pkts
-	})
-	snap.Top = s.topBuf
+	dst := s.bufs[s.ix][:0]
+	dst, _, err = s.scan.Top(s.peripMap, limit, dst)
+	if err != nil {
+		s.topOK = false
+		return snap, fmt.Errorf("perip scan: %w", err)
+	}
+	s.bufs[s.ix] = dst
+	s.ix ^= 1
+	s.topOK = true
+	s.topLimit = limit
+	s.topGlobal = global
+	s.topRows = dst
+	snap.Top = dst
 	return snap, nil
 }
 
-// readGlobal sums each PERCPU_ARRAY slot and maps it onto Global using the
-// shared stats helpers — no per-field wiring duplicated here.
-func (s *Source) readGlobal() (stats.Global, error) {
-	var g stats.Global
-	for slot := uint32(0); slot < stats.SlotCount; slot++ {
-		s.perCPU = s.perCPU[:0]
-		if err := s.statsMap.Lookup(&slot, &s.perCPU); err != nil {
-			return g, fmt.Errorf("lookup slot %d: %w", slot, err)
-		}
-		stats.AssignSlot(&g, slot, stats.SumPerCPU(s.perCPU))
-	}
-	return g, nil
+// reusePerIP reports whether the previous walk still answers this read.
+// A different limit (overview's 5 versus the full Top-N page) must rescan.
+func reusePerIP(ok bool, limit, prevLimit int, prev, cur stats.Global) bool {
+	return ok && limit == prevLimit && prev == cur
 }
 
 func (s *Source) readTx() (uint64, uint64) {
@@ -222,8 +209,10 @@ func (s *Source) readTx() (uint64, uint64) {
 	return b, p
 }
 
-// FormatAddr renders a [4]byte as dotted-quad. Lives here because both
-// source.go and view.go need it.
-func FormatAddr(a [4]byte) string {
-	return netip.AddrFrom4(a).String()
+// FormatAddr renders a source address. IPv4-mapped keys are shown as plain IPv4.
+func FormatAddr(a netip.Addr) string {
+	if !a.IsValid() {
+		return "-"
+	}
+	return a.Unmap().String()
 }

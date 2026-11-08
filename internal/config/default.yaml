@@ -84,17 +84,17 @@ runtime:
   #     透過 SIGHUP 切 true 快速恢復網路，不必 stop service。
   emergency_bypass: __RUNTIME_EMERGENCY_BYPASS__
 
-  # EN: Entry count of the per-source-IPv4 LRU hash used for statistics (not
-  #     filtering). It is a PER-CPU map, so kernel memory ≈ entries × nCPU ×
-  #     ~64 B. The MiB figures below assume a single CPU — multiply by core
-  #     count. Power of 2 recommended.
-  #       65 536  →  ~4 MiB/CPU   typical scan <5 ms   (default)
-  #       262 144 → ~16 MiB/CPU
-  #      1 048 576 → ~64 MiB/CPU  typical scan <50 ms on a Pi
+  # EN: Entry count of the per-source-IP LRU used for statistics (not
+  #     filtering). IPv4 and IPv6 share one map. It is PER-CPU, so kernel
+  #     memory ≈ entries × nCPU × ~64 B. The MiB figures below are per CPU —
+  #     multiply by core count. Power of 2 recommended.
+  #       65 536   →  ~4 MiB/CPU   typical scan <5 ms   (default)
+  #       262 144  → ~16 MiB/CPU
+  #     1 048 576  → ~64 MiB/CPU   typical scan <50 ms on a Pi
   #     Changing this value requires a full restart.
-  # ZH: per-source-IPv4 LRU hash 容量 (統計用，不是過濾用)。這是 PER-CPU map，
-  #     kernel 記憶體 ≈ 筆數 × CPU 數 × ~64 B；下面的 MiB 是單 CPU，要乘上
-  #     核心數。建議用 2 的次方。修改需重啟 agent。
+  # ZH: per-source-IP LRU 容量 (統計用，不是過濾用；v4/v6 同一張表)。這是
+  #     PER-CPU map，kernel 記憶體 ≈ 筆數 × CPU 數 × ~64 B；下面的 MiB 是
+  #     單 CPU，要乘上核心數。建議用 2 的次方。修改需重啟 agent。
   perip_table_size: __RUNTIME_PERIP_TABLE_SIZE__
 
 # ---------- observability ----------
@@ -127,55 +127,68 @@ security:
 
 # ---------- filter rules ----------
 #
-# EN: Inbound packet decision flow (strict model):
-#   1. ARP                         → PASS (toggle: filter.allow_arp)
-#      non-IPv4/ARP                → DROP
-#   2. IP fragment 2+ (offset > 0) → DROP (no L4 header; would bypass policy)
-#   3. src in static_blocklist     → DROP   } checked FIRST (absolute deny) so a
-#      src in dynamic blocklist    → DROP   } blocklisted source can't slip
-#                                            through any PASS below; NATS push
-#                                            takes effect immediately.
-#   4. stateful return traffic     → PASS
-#        · TCP/UDP matched by the conntrack fast path (seeded by the TC
-#          egress hook — requires kernel >= 6.6 / TCX, which is mandatory)
-#      NOTE: there is NO stateless TCP "ACK/RST/FIN" fallback — return
-#      traffic must be a real conntrack hit.
-#   5. ICMP (toggle: filter.allow_icmp)              → PASS
-#      DHCP reply: UDP src 67 → dst 68               → PASS
-#   6. dst port in filter.public.* → PASS (any source)
+# EN: Inbound decision flow, IPv4 and IPv6 alike (first match wins):
+#   1. ARP                          → PASS if filter.allow_arp
+#      anything not IPv4/IPv6/ARP   → DROP
+#   2. malformed L3 header          → DROP
+#   3. src in static_blocklist      → DROP (checked first: blocked sources
+#                                     get nothing, not even established TCP)
+#   4. IP fragment 2+               → PASS (no L4 header; the first fragment
+#                                     was checked, the kernel discards the rest)
+#   5. TCP: invalid flags (NULL/FIN/Xmas/SYN+FIN/SYN+RST) → DROP
+#           ACK or RST set          → PASS (established; creates no state).
+#             If only a listener would take it (SYN cookies), it is checked
+#             like a SYN on non-public ports.
+#      UDP: reply to a flow this host opened → PASS
+#           DHCP/DHCPv6 reply within 60 s of a local request → PASS
+#      ICMP/ICMPv6: echo            → PASS if filter.allow_icmp
+#           frag-needed / packet-too-big → PASS (PMTU discovery)
+#           other errors about a live local connection → PASS
+#           IPv6 NDP (hop limit 255) / MLD (hop limit 1) → PASS
+#           any other type (redirect, timestamp, ...) → DROP
+#      other L4 protocols           → DROP
+#   6. dst port in filter.public.*  → PASS (any source)
 #   7. dst port in filter.private.*:
 #        · src in ingress_allowlist → PASS
 #        · otherwise                → DROP
-#   8. no rule matched             → DROP (default deny)
+#   8. no rule matched              → DROP (default deny)
 #
-# ZH: 進站封包決策流程 (strict model)：
-#   1. ARP                         → PASS (可由 filter.allow_arp 控制)
-#      非 IPv4/ARP                 → DROP
-#   2. IP 分片後續片段 (offset>0)   → DROP (無 L4 header，放行會繞過 policy)
-#   3. src 在 static_blocklist     → DROP   } 最先查 (絕對 deny)，被列黑的來源
-#      src 在 dynamic blocklist    → DROP   } 連 conntrack/ICMP/DHCP 也擋得住，
-#                                            NATS 推送即時生效。
-#   4. 有狀態回程流量               → PASS
-#        · TCP/UDP 由 conntrack fast path 命中 (靠 TC egress hook 種子，
-#          需 kernel >= 6.6 / TCX，為強制需求)
-#      注意：沒有無狀態的 TCP "ACK/RST/FIN" fallback —— 回程必須是真正的
-#      conntrack 命中。
-#   5. ICMP (由 filter.allow_icmp 控制)            → PASS
-#      DHCP 回包: UDP src 67 → dst 68              → PASS
-#   6. dst port 在 filter.public.* → PASS (任何來源)
-#   7. dst port 在 filter.private.*:
+# ZH: 進站決策流程，IPv4 / IPv6 相同（先命中先決定）：
+#   1. ARP                          → filter.allow_arp 開啟時 PASS
+#      非 IPv4/IPv6/ARP             → DROP
+#   2. L3 header 格式錯誤            → DROP
+#   3. src 在 static_blocklist      → DROP（最先檢查：黑名單來源連既有 TCP
+#                                     連線都進不來）
+#   4. IP 分片第 2 片以後            → PASS（沒有 L4 header；第一片已檢查過，
+#                                     kernel 重組時會丟掉其餘片段）
+#   5. TCP：不合法 flag（NULL/FIN/Xmas/SYN+FIN/SYN+RST） → DROP
+#           帶 ACK 或 RST            → PASS（既有連線；不建立任何狀態）。
+#             只會落到 listener 的封包（SYN cookie）在非 public port 上比照
+#             SYN 檢查。
+#      UDP：本機先送出去的 flow 的回包 → PASS
+#           本機 60 秒內送過 DHCP/DHCPv6 請求後的回覆 → PASS
+#      ICMP/ICMPv6：echo            → filter.allow_icmp 開啟時 PASS
+#           frag-needed / packet-too-big → PASS（PMTU discovery）
+#           其他對應本機現存連線的錯誤訊息 → PASS
+#           IPv6 NDP（hop limit 255）/ MLD（hop limit 1） → PASS
+#           其他類型（redirect、timestamp…） → DROP
+#      其他 L4 協定                  → DROP
+#   6. dst port 在 filter.public.*  → PASS（任何來源）
+#   7. dst port 在 filter.private.*：
 #        · src 在 ingress_allowlist → PASS
 #        · 否則                      → DROP
-#   8. 都沒命中                     → DROP (預設拒絕)
+#   8. 都沒命中                      → DROP（預設拒絕）
 #
-# EN: The agent's own outgoing traffic is never inspected (XDP is ingress
-#     only); the TC egress hook seeds a flow so responses match the conntrack
-#     fast path (step 3) without any extra config.
-# ZH: agent 自己主動出去的連線不會被檢查 (XDP 只 hook ingress)；TC egress hook
-#     會種下 flow，回程封包靠 conntrack fast path (步驟 3) 放行，不用特別設定。
+# EN: The host's own outgoing traffic is not filtered (XDP is ingress only);
+#     replies come back through rule 5 without extra config. Source
+#     addresses are NOT authenticated: anti-spoofing must happen upstream.
+# ZH: 本機主動發出的流量不過濾（XDP 只 hook ingress），回包靠規則 5 放行，
+#     不用另外設定。來源位址無法驗證真偽，anti-spoofing 必須由上游網路負責。
 filter:
-  # EN: allow_icmp controls whether ICMP is treated as return traffic.
-  # ZH: 控制 ICMP 是否視為回程流量直接放行。
+  # EN: allow_icmp lets ICMP/ICMPv6 echo (ping) in. ICMP errors about live
+  #     local sockets and IPv6 NDP/MLD pass regardless; other types never do.
+  # ZH: 是否放行 ICMP/ICMPv6 echo（ping）。對應本機 socket 的 ICMP 錯誤訊息與
+  #     IPv6 NDP/MLD 不受此開關影響一律放行；其他類型一律丟棄。
   allow_icmp: __FILTER_ALLOW_ICMP__
 
   # EN: allow_arp controls L2 ARP pass-through. Turning this off can make the
@@ -183,13 +196,15 @@ filter:
   # ZH: 控制 L2 ARP 是否放行。關閉後 ARP cache 過期時可能出現主機離線。
   allow_arp: __FILTER_ALLOW_ARP__
 
-  # EN: Lower bound for UDP return-traffic classification.
-  # ZH: UDP 回程流量判定門檻下限。
+  # EN: Deprecated, no effect. UDP replies are matched against flows the
+  #     host opened. Kept so existing configs still validate.
+  # ZH: 已停用、沒有作用。UDP 回包改成比對本機送出的 flow。保留欄位只為了
+  #     讓舊設定檔仍可通過驗證。
   udp_ephemeral_min: __FILTER_UDP_EPHEMERAL_MIN__
 
   public:
     # EN: Services open to the public internet. Any source IP can connect
-    #     except those in static_blocklist or the dynamic blocklist.
+    #     except those in static_blocklist.
     # ZH: 對外開放的服務 port。任何來源都可連，但黑名單例外。
     tcp:
 __FILTER_PUBLIC_TCP__
@@ -208,20 +223,31 @@ __FILTER_PRIVATE_TCP__
     udp:
 __FILTER_PRIVATE_UDP__
 
-  # EN: Allowlist for private ports. CIDR and single IPs both work — a bare
-  #     address is treated as /32. Longest prefix match wins (LPM trie).
-  # ZH: private port 的來源白名單。CIDR 與單 IP 都可 (裸 IP 視為 /32)。
-  #     LPM trie 最長前綴匹配。
+  # EN: Allowlist for private ports. IPv4 and IPv6, CIDR or single address
+  #     (a bare address is /32 or /128). Longest prefix match (LPM trie).
+  #     WARNING: kekkai cannot detect spoofed sources. This list is only as
+  #     strong as the upstream network's anti-spoofing (BCP 38 / uRPF).
+  #     TCP needs a completed handshake, so blind spoofing fails, but a
+  #     private UDP service can be hit with a single forged packet. Hosts on
+  #     the same L2 segment can forge any address, so listing a whole LAN
+  #     trusts every machine on it.
+  # ZH: private port 的來源白名單。支援 IPv4 / IPv6、CIDR 或單一位址（裸位址
+  #     視為 /32 或 /128）。LPM trie 最長前綴匹配。
+  #     注意：kekkai 無法辨識偽造的來源位址，白名單的可信度取決於上游網路
+  #     是否做了 anti-spoofing（BCP 38 / uRPF）。TCP 需要完成三向交握，盲目
+  #     偽造無法連線；但 private UDP 服務只要一個偽造封包就能打到。同一個 L2
+  #     網段的主機可以偽造任何位址，放整段區網等於信任網段內每一台機器。
   ingress_allowlist:
 __FILTER_INGRESS_ALLOWLIST__
     # - 192.168.0.0/16
     # - 10.0.0.0/8
     # - 100.64.0.0/10      # Tailscale
 
-  # EN: Static blocklist. Matches any destination port. CIDRs or single IPs.
-  #     Evaluated before any allow rules (static beats allowlist).
-  # ZH: 靜態黑名單。不管 dst port，一律 DROP。支援 CIDR 與單 IP。
-  #     在 allowlist 之前生效 (黑名單優先)。
+  # EN: Static blocklist, IPv4 and IPv6, CIDR or single address. Checked
+  #     before every other rule: established TCP, fragments and ICMP from a
+  #     blocked source are dropped too.
+  # ZH: 靜態黑名單，支援 IPv4 / IPv6、CIDR 或單一位址。在所有規則之前檢查：
+  #     黑名單來源的既有 TCP 連線、分片、ICMP 也一律丟棄。
   static_blocklist:
 __FILTER_STATIC_BLOCKLIST__
     # - 203.0.113.4

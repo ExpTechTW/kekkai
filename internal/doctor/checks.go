@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cilium/ebpf"
 	"github.com/ExpTechTW/kekkai/internal/config"
+	"github.com/cilium/ebpf"
 )
 
 // Paths the agent uses. Kept in one place so any future rename is a
@@ -30,6 +30,20 @@ const (
 	bpffsPinRoot    = "/sys/fs/bpf/kekkai"
 	defaultStatsDir = "/var/run/kekkai"
 )
+
+// expectedPins are the maps the current data plane pins. Removed maps
+// (blocklist_v4, perip_v4, the split port maps, dyn_blocklist, events) are
+// not required.
+var expectedPins = []string{
+	"allowlist",
+	"blocklist",
+	"dhcp_tx",
+	"flowtrack",
+	"perip",
+	"ports",
+	"runtime_cfg",
+	"stats",
+}
 
 // Run executes the full check battery and returns the Runner for
 // rendering. Error checks never panic — each Check swallows its own
@@ -94,7 +108,14 @@ func sha256File(path string) (string, error) {
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:6]), nil
+}
+
+// bpffsMounted reports a bpf filesystem line in /proc/mounts.
+// " type bpf " is not checked separately: that phrase already contains " bpf ".
+func bpffsMounted(mounts string) bool {
+	return strings.Contains(mounts, " bpf ")
 }
 
 // ---------- config -------------------------------------------------------
@@ -307,6 +328,41 @@ func parseKernelMajorMinor(rel string) (major, minor int, ok bool) {
 	return maj, min, true
 }
 
+// kernelTooOld reports a kernel without TCX. Egress seeding needs >= 6.6;
+// without it, outbound UDP replies (DNS, NTP) never match a flow and are dropped.
+func kernelTooOld(major, minor int) bool {
+	return major < 6 || (major == 6 && minor < 6)
+}
+
+// kernelVersionResult is the kernel-version row. versionOK is false when
+// /proc/version could not be read. parsed is false when osrelease has no
+// major.minor. Both are warnings; only a parsed kernel below 6.6 is an error.
+func kernelVersionResult(versionOK bool, line string, parsed bool, major, minor int) Result {
+	switch {
+	case !versionOK:
+		return Result{
+			Status: StatusWarn,
+			Title:  "kernel version",
+			Detail: "could not read /proc/version",
+		}
+	case !parsed:
+		return Result{
+			Status: StatusWarn,
+			Title:  "kernel version",
+			Detail: "could not parse /proc/sys/kernel/osrelease",
+		}
+	case kernelTooOld(major, minor):
+		return Result{
+			Status:      StatusError,
+			Title:       "kernel version",
+			Detail:      fmt.Sprintf("%d.%d too old — kekkai_tc_egress needs TCX (>=6.6); outbound UDP return (DNS/NTP) is dropped", major, minor),
+			Suggestions: kernelUpgradeSteps(),
+		}
+	default:
+		return Result{Status: StatusOK, Title: "kernel version", Detail: line}
+	}
+}
+
 // kernelUpgradeSteps returns the ordered remediation a < 6.6 box needs.
 // Outbound UDP (DNS) is broken right now, so the package manager can't fetch
 // until the filter is bypassed — hence `kekkai bypass on` comes FIRST. That
@@ -398,28 +454,23 @@ func checkKernel(r *Runner) {
 		return
 	}
 
-	// Kernel version. TCX egress seeding needs >= 6.6, and that seed is the
-	// ONLY thing that lets TCP/UDP return traffic back through the filter
-	// (there is no stateless return fallback). kekkai requires >= 6.6 — the
-	// installer blocks older kernels and the agent refuses to attach — so
-	// seeing this here means the kernel was downgraded under an install.
-	if data, err := os.ReadFile("/proc/version"); err == nil {
-		line := strings.TrimSpace(string(data))
-		// Full line is verbose; keep first 70 chars.
+	// < 6.6 has no TCX egress hook, so outbound UDP replies are dropped.
+	// A missing or unreadable version file is a warning: skipping it, or
+	// reporting OK when osrelease does not parse, hides an old kernel.
+	data, readErr := os.ReadFile("/proc/version")
+	var line string
+	if readErr == nil {
+		line = strings.TrimSpace(string(data))
 		if len(line) > 70 {
 			line = line[:70] + "…"
 		}
-		if major, minor, ok := kernelMajorMinor(); ok && (major < 6 || (major == 6 && minor < 6)) {
-			sec.Add(Result{
-				Status:      StatusError,
-				Title:       "kernel version",
-				Detail:      fmt.Sprintf("%d.%d unsupported — kekkai requires >= 6.6 (TCX); all return traffic (DNS/NTP/replies) is dropped", major, minor),
-				Suggestions: kernelUpgradeSteps(),
-			})
-		} else {
-			sec.Add(Result{Status: StatusOK, Title: "kernel version", Detail: line})
-		}
 	}
+	var major, minor int
+	var parsed bool
+	if readErr == nil {
+		major, minor, parsed = kernelMajorMinor()
+	}
+	sec.Add(kernelVersionResult(readErr == nil, line, parsed, major, minor))
 
 	// BTF.
 	if _, err := os.Stat("/sys/kernel/btf/vmlinux"); err == nil {
@@ -434,7 +485,7 @@ func checkKernel(r *Runner) {
 
 	// bpffs mount.
 	if mounts, err := os.ReadFile("/proc/mounts"); err == nil {
-		if strings.Contains(string(mounts), " bpf ") || strings.Contains(string(mounts), " type bpf ") {
+		if bpffsMounted(string(mounts)) {
 			sec.Add(Result{Status: StatusOK, Title: "bpffs", Detail: "mounted at /sys/fs/bpf"})
 		} else {
 			sec.Add(Result{
@@ -446,13 +497,32 @@ func checkKernel(r *Runner) {
 		}
 	}
 
-	// Pinned maps.
+	// Pinned maps. Only the current names are required.
 	if entries, err := os.ReadDir(bpffsPinRoot); err == nil {
-		sec.Add(Result{
-			Status: StatusOK,
-			Title:  "pinned maps",
-			Detail: fmt.Sprintf("%d entries in %s", len(entries), bpffsPinRoot),
-		})
+		present := make(map[string]bool, len(entries))
+		for _, e := range entries {
+			present[e.Name()] = true
+		}
+		var missing []string
+		for _, name := range expectedPins {
+			if !present[name] {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			sec.Add(Result{
+				Status:      StatusError,
+				Title:       "pinned maps",
+				Detail:      "missing " + strings.Join(missing, ", "),
+				Suggestions: []string{"sudo systemctl restart kekkai-agent"},
+			})
+		} else {
+			sec.Add(Result{
+				Status: StatusOK,
+				Title:  "pinned maps",
+				Detail: fmt.Sprintf("%d entries in %s (%s)", len(entries), bpffsPinRoot, strings.Join(expectedPins, ", ")),
+			})
+		}
 	} else {
 		sec.Add(Result{
 			Status:      StatusWarn,
@@ -490,20 +560,14 @@ func checkNetwork(r *Runner, cfg *config.Config) {
 		}
 	}
 
-	// XDP attachment.
-	if xdpAttached(iface) {
-		sec.Add(Result{Status: StatusOK, Title: "XDP attachment", Detail: "program attached to " + iface})
-	} else {
-		sec.Add(Result{
-			Status: StatusWarn,
-			Title:  "XDP attachment",
-			Detail: "no XDP program detected on " + iface,
-			Suggestions: []string{
-				"if the daemon is running, this may just be generic mode and ip link doesn't expose it",
-				"check: journalctl -u kekkai-agent -n 30",
-			},
-		})
-	}
+	// XDP attachment. A running agent that is not in bypass must have the
+	// program attached; a failed `ip` probe is not evidence either way.
+	attached, probed := XDPAttached(iface)
+	sec.Add(xdpAttachmentResult(
+		iface, probed, attached,
+		systemctlIs("is-active", systemdUnit),
+		cfg.Runtime.EmergencyBypass,
+	))
 
 	// Multi-core scaling: XDP runs once per RX queue, each on its own CPU.
 	// A single RX queue pins all XDP work to one core regardless of how many
@@ -554,17 +618,19 @@ func ethtoolDriver(iface string) string {
 	return ""
 }
 
+// virtio_net is omitted: native XDP on it depends on the kernel and the device.
+var nativeXDPDrivers = map[string]struct{}{
+	"ixgbe":     {},
+	"i40e":      {},
+	"ice":       {},
+	"mlx5_core": {},
+	"ena":       {},
+	"bnxt_en":   {},
+}
+
 func nativeCapable(driver string) bool {
-	native := map[string]bool{
-		"ixgbe":     true,
-		"i40e":      true,
-		"ice":       true,
-		"mlx5_core": true,
-		"ena":       true,
-		"bnxt_en":   true,
-		"virtio_net": false, // technically has native, but varies
-	}
-	return native[driver]
+	_, ok := nativeXDPDrivers[driver]
+	return ok
 }
 
 // XDPAttached reports whether an XDP program is attached to iface (covers
@@ -576,17 +642,77 @@ func XDPAttached(iface string) (attached, ok bool) {
 	if err != nil {
 		return false, false
 	}
-	return strings.Contains(string(out), "xdp"), true
+	return xdpAttachedOutput(out), true
 }
 
-func xdpAttached(iface string) bool {
-	attached, ok := XDPAttached(iface)
-	return ok && attached
+// xdpAttachedOutput matches an attachment token from `ip link`, not a
+// substring. An interface named xdp0 must not count as attached.
+// Tokens are a field of their own (xdp, xdpgeneric, xdpdrv, xdpoffload)
+// or that name plus /id:<n>.
+func xdpAttachedOutput(out []byte) bool {
+	for _, field := range strings.Fields(string(out)) {
+		if xdpToken(field) {
+			return true
+		}
+	}
+	return false
+}
+
+func xdpToken(field string) bool {
+	switch field {
+	case "xdp", "xdpgeneric", "xdpdrv", "xdpoffload":
+		return true
+	}
+	return strings.HasPrefix(field, "xdpoffload/id:") ||
+		strings.HasPrefix(field, "xdpgeneric/id:") ||
+		strings.HasPrefix(field, "xdpdrv/id:") ||
+		strings.HasPrefix(field, "xdp/id:")
+}
+
+// xdpAttachmentResult is an error when the agent is up, bypass is off, and
+// `ip link` positively shows that no XDP program is attached. That makes
+// `kekkai doctor` exit non-zero. A probe failure stays a warning.
+func xdpAttachmentResult(iface string, probed, attached, agentRunning, bypass bool) Result {
+	switch {
+	case !probed:
+		return Result{
+			Status: StatusWarn,
+			Title:  "XDP attachment",
+			Detail: "could not determine whether an XDP program is attached to " + iface,
+			Suggestions: []string{
+				"ip -o link show dev " + iface,
+			},
+		}
+	case attached:
+		return Result{Status: StatusOK, Title: "XDP attachment", Detail: "program attached to " + iface}
+	case bypass:
+		return Result{Status: StatusOK, Title: "XDP attachment", Detail: "emergency bypass — XDP not attached to " + iface}
+	case agentRunning:
+		return Result{
+			Status: StatusError,
+			Title:  "XDP attachment",
+			Detail: "agent is active and not in bypass, but no XDP program is attached to " + iface,
+			Suggestions: []string{
+				"journalctl -u kekkai-agent -n 50 --no-pager",
+				"sudo systemctl restart kekkai-agent",
+			},
+		}
+	default:
+		return Result{
+			Status: StatusWarn,
+			Title:  "XDP attachment",
+			Detail: "no XDP program detected on " + iface,
+			Suggestions: []string{
+				"if the daemon is running, this may just be generic mode and ip link doesn't expose it",
+				"check: journalctl -u kekkai-agent -n 30",
+			},
+		}
+	}
 }
 
 // rxQueueCount returns the number of RX queues the kernel exposes for iface,
 // from /sys/class/net/<iface>/queues/ (the rx-N dirs). ok is false if the
-// directory can't be read.
+// directory can't be read or contains no rx queues.
 func rxQueueCount(iface string) (int, bool) {
 	entries, err := os.ReadDir(filepath.Join("/sys/class/net", iface, "queues"))
 	if err != nil {
@@ -764,9 +890,10 @@ func checkAutoUpdate(r *Runner, cfg *config.Config) {
 
 	// Last run state file (populated on every tick, success or failure).
 	if data, err := os.ReadFile(autoUpdateLastRunPath); err == nil {
-		state := grep1(string(data), "state")
-		detail := grep1(string(data), "detail")
-		ts := grep1(string(data), "timestamp")
+		lines := strings.Split(string(data), "\n")
+		state := grepLine(lines, "state")
+		detail := grepLine(lines, "detail")
+		ts := grepLine(lines, "timestamp")
 		st := StatusOK
 		if state == "failed" {
 			st = StatusError
@@ -788,12 +915,13 @@ func checkAutoUpdate(r *Runner, cfg *config.Config) {
 	// kind + target so the operator can decide whether to retry or
 	// investigate journalctl.
 	if data, err := os.ReadFile(autoUpdateErrorPath); err == nil {
+		lines := strings.Split(string(data), "\n")
 		sec.Add(Result{
 			Status: StatusError,
 			Title:  "last error",
 			Detail: fmt.Sprintf("kind=%s target=%s",
-				grep1(string(data), "kind"),
-				grep1(string(data), "target_version")),
+				grepLine(lines, "kind"),
+				grepLine(lines, "target_version")),
 			Suggestions: []string{
 				"sudo journalctl -u kekkai-agent --since=1h",
 				"sudo rm " + autoUpdateErrorPath + "  # clear the MOTD banner",
@@ -814,14 +942,13 @@ func checkAutoUpdate(r *Runner, cfg *config.Config) {
 	}
 }
 
-// grep1 returns the value of the first "key=value" line matching key, or
-// "?" if absent. Used to read the flat state files the agent writes
-// without pulling in a full YAML parser for a 3-line format.
-func grep1(body, key string) string {
+// grepLine returns the first "key=value" in lines, or "?" if key is absent.
+// The agent writes these flat files; a YAML parser would be wasted on them.
+func grepLine(lines []string, key string) string {
 	prefix := key + "="
-	for _, line := range strings.Split(body, "\n") {
+	for _, line := range lines {
 		if strings.HasPrefix(line, prefix) {
-			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+			return strings.TrimSpace(line[len(prefix):])
 		}
 	}
 	return "?"
@@ -898,7 +1025,3 @@ func extractStat(body, label string) string {
 	}
 	return ""
 }
-
-// Suppress unused-import warnings when building on non-linux (where
-// some helpers above are referenced but never executed).
-var _ = strconv.Itoa

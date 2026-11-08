@@ -1,57 +1,38 @@
 package logx
 
-// Daily log-file rotation and 7-day TTL GC for kekkai-agent's
-// persistent log at /var/log/kekkai/kekkai-agent.log.
+// Daily rotation for /var/log/kekkai/kekkai-agent.log.
 //
-// The file layout is:
+//	kekkai-agent.log           active file; the name stays put so tail -F works
+//	kekkai-agent-YYYYMMDD.log  previous days, removed once mtime is over 7 days
 //
-//	kekkai-agent.log              ← the active file (always this name)
-//	kekkai-agent-20260414.log     ← yesterday's, renamed at 00:00 UTC
-//	kekkai-agent-20260413.log     ← older still
-//	...                           ← deleted once mtime > 7 days
-//
-// Keeping the active file's name stable lets anyone do a trivial
-// `tail -F /var/log/kekkai/kekkai-agent.log` and never chase a suffix.
-// The rotator goroutine acquires the shared writer mutex during the
-// rename/open dance so no log line can leak across file boundaries.
+// Rename and reopen run under the writer mutex so a line cannot split across
+// two files. Retention is fixed: a week of context should be on disk without
+// a config knob.
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	// rotateRetention is how long old daily files are kept. Matches
-	// the spec: 7 days, hard-coded. Not a config knob on purpose — an
-	// operator noticing a problem should have at least a week of
-	// context without having to pre-plan.
-	rotateRetention = 7 * 24 * time.Hour
-
-	// Filename glob used for GC. We ONLY touch files matching this
-	// pattern so accidentally putting `/etc/passwd` in the log dir
-	// cannot cause harm.
+	rotateRetention    = 7 * 24 * time.Hour
 	rotateFilenameGlob = "kekkai-agent-*.log"
 )
 
-// rotatingFile is an io.Writer that transparently swaps its underlying
-// *os.File at 00:00 UTC each day. Multi-writer fan-out is done at a
-// layer above — this struct only cares about one file.
 type rotatingFile struct {
-	dir        string    // /var/log/kekkai
-	baseName   string    // kekkai-agent.log
+	dir        string
+	baseName   string
 	mu         sync.Mutex
 	f          *os.File
-	currentDay string    // "20260414", set on Open
+	currentDay string // YYYYMMDD of the open file; the archive suffix uses this, not "now"
 	stop       chan struct{}
 }
 
-// newRotatingFile opens (or creates) dir/base and starts the rotator
-// goroutine. Caller is responsible for Close()ing at shutdown so the
-// goroutine exits cleanly.
 func newRotatingFile(dir, base string) (*rotatingFile, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir log dir %s: %w", dir, err)
@@ -64,15 +45,11 @@ func newRotatingFile(dir, base string) (*rotatingFile, error) {
 	if err := rf.openCurrent(); err != nil {
 		return nil, err
 	}
-	// GC once at startup — if the box was off for a month this cleans
-	// out the dead history before we add today's first line to it.
 	rf.gc()
 	go rf.runRotator()
 	return rf, nil
 }
 
-// Write passes through to the active file under the mutex. This is
-// what slog.Handler ends up calling on every log line.
 func (rf *rotatingFile) Write(p []byte) (int, error) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -82,14 +59,11 @@ func (rf *rotatingFile) Write(p []byte) (int, error) {
 	return rf.f.Write(p)
 }
 
-// Close shuts the rotator goroutine and closes the active file.
-// Idempotent — multiple calls after the first are no-ops.
 func (rf *rotatingFile) Close() error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	select {
 	case <-rf.stop:
-		// already closed
 	default:
 		close(rf.stop)
 	}
@@ -101,11 +75,10 @@ func (rf *rotatingFile) Close() error {
 	return err
 }
 
-// openCurrent (re)opens dir/base for append. Holds rf.mu during the
-// swap so concurrent Write calls are safe.
+// openCurrent replaces rf.f. The caller must keep Write out until it returns.
 func (rf *rotatingFile) openCurrent() error {
 	path := filepath.Join(rf.dir, rf.baseName)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
 	if err != nil {
 		return fmt.Errorf("open log file %s: %w", path, err)
 	}
@@ -114,81 +87,64 @@ func (rf *rotatingFile) openCurrent() error {
 	return nil
 }
 
-// runRotator wakes at every midnight UTC. On wake it:
-//  1. renames the active file to kekkai-agent-<yesterday>.log
-//  2. opens a fresh kekkai-agent.log
-//  3. runs gc to delete anything older than rotateRetention
-//
-// Cancellation is handled by the stop channel; Close() triggers an
-// immediate exit without one last rotation.
 func (rf *rotatingFile) runRotator() {
+	timer := time.NewTimer(untilNextMidnightUTC(time.Now()))
+	defer timer.Stop()
 	for {
-		wait := untilNextMidnightUTC(time.Now())
 		select {
 		case <-rf.stop:
 			return
-		case <-time.After(wait):
+		case <-timer.C:
 			if err := rf.rotateOnce(); err != nil {
-				// Use stderr directly — we can't log through ourselves
-				// right now, the file is mid-swap. This is extremely
-				// rare; when it happens you want to see it loud.
 				fmt.Fprintf(os.Stderr, "logx: rotate failed: %v\n", err)
 			}
 			rf.gc()
+			timer.Reset(untilNextMidnightUTC(time.Now()))
 		}
 	}
 }
 
-// rotateOnce does the actual rename + reopen under the mutex.
 func (rf *rotatingFile) rotateOnce() error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// Close may have won the race after the timer fired and before this
+	// lock. Reopening here would leak a file the caller already released.
+	select {
+	case <-rf.stop:
+		return nil
+	default:
+	}
 
-	// Close the current handle before renaming on the off chance the
-	// filesystem serves open-file semantics we don't expect (ext4 is
-	// fine with it; NFS is not, and someone WILL put /var/log on NFS).
+	// Close first. NFS will not rename a file that still has an open fd.
 	if rf.f != nil {
 		_ = rf.f.Close()
 		rf.f = nil
 	}
 
 	active := filepath.Join(rf.dir, rf.baseName)
-	// Archive under the *previous* day's name — if the timer fires at
-	// 00:00:00.001 we still want yesterday as the suffix. Use the
-	// stored currentDay rather than computing from "now".
-	archive := filepath.Join(rf.dir,
-		fmt.Sprintf("kekkai-agent-%s.log", rf.currentDay))
-
+	archive := filepath.Join(rf.dir, "kekkai-agent-"+rf.currentDay+".log")
 	if _, err := os.Stat(active); err == nil {
-		// If the archive name is somehow already taken (e.g. someone
-		// restarted kekkai at exactly 00:00:00 twice), append a marker
-		// so we never lose the previous day's content.
 		if _, err := os.Stat(archive); err == nil {
-			archive = archive + "." + fmt.Sprintf("%d", time.Now().UnixNano())
+			archive += "." + strconv.FormatInt(time.Now().UnixNano(), 10)
 		}
 		if err := os.Rename(active, archive); err != nil {
 			return fmt.Errorf("rename %s → %s: %w", active, archive, err)
 		}
 	}
-
 	return rf.openCurrent()
 }
 
-// gc deletes rotated files older than rotateRetention. Errors are
-// logged to stderr and ignored — we'd rather keep rotating than die
-// because one stale file had weird perms.
+// gc removes rotated files older than rotateRetention. A failure is logged
+// and ignored so rotation itself keeps going.
 func (rf *rotatingFile) gc() {
-	pattern := filepath.Join(rf.dir, rotateFilenameGlob)
-	matches, err := filepath.Glob(pattern)
+	matches, err := filepath.Glob(filepath.Join(rf.dir, rotateFilenameGlob))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "logx: gc glob: %v\n", err)
 		return
 	}
 	cutoff := time.Now().Add(-rotateRetention)
 	for _, p := range matches {
-		// Extra safety: only touch files whose base name starts with
-		// the expected prefix. Glob is lax about * matching weird
-		// characters in some locales.
+		// Glob is not a substitute for a prefix check on every platform.
 		if !strings.HasPrefix(filepath.Base(p), "kekkai-agent-") {
 			continue
 		}
@@ -202,9 +158,8 @@ func (rf *rotatingFile) gc() {
 	}
 }
 
-// untilNextMidnightUTC returns the duration from now until the next
-// 00:00:00 UTC. Clamped at 1s if the calculation somehow returned
-// <= 0 (clock skew, leap second, etc).
+// untilNextMidnightUTC is at least one second. A zero or negative wait
+// (clock step, leap second) would spin the rotator.
 func untilNextMidnightUTC(now time.Time) time.Duration {
 	u := now.UTC()
 	next := time.Date(u.Year(), u.Month(), u.Day()+1, 0, 0, 0, 0, time.UTC)

@@ -4,7 +4,6 @@ package loader
 
 import (
 	"bytes"
-	_ "embed"
 	"errors"
 	"fmt"
 	"os"
@@ -15,33 +14,15 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-//go:embed bpf/xdp_filter.o
-var programBytes []byte
-
-const (
-	bpffsRoot = "/sys/fs/bpf/kekkai"
-
-	progNameXDP      = "kekkai_xdp"
-	progNameTCEgress = "kekkai_tcx_egress_seed"
-
-	mapBlocklistV4     = "blocklist_v4"
-	mapAllowlistV4     = "allowlist_v4"
-	mapPublicTCPPorts  = "public_tcp_ports"
-	mapPublicUDPPorts  = "public_udp_ports"
-	mapPrivateTCPPorts = "private_tcp_ports"
-	mapPrivateUDPPorts = "private_udp_ports"
-	mapRuntimeCfgV4    = "runtime_cfg_v4"
-	mapStats           = "stats"
-	mapPerIPv4         = "perip_v4"
-)
+const bpffsRoot = "/sys/fs/bpf/kekkai"
 
 type linuxImpl struct {
-	coll       *ebpf.Collection
-	lnk        link.Link
-	tcEgress   link.Link
-	lastIfidx  int
-	lastFlags  link.XDPAttachFlags
-	bypassed   bool // currently detached due to emergency bypass
+	coll      *ebpf.Collection
+	lnk       link.Link
+	tcEgress  link.Link
+	lastIfidx int
+	lastFlags link.XDPAttachFlags
+	bypassed  bool // currently detached due to emergency bypass
 }
 
 func newImpl() implementation { return &linuxImpl{} }
@@ -57,9 +38,11 @@ func (l *linuxImpl) attach(ifaceIndex int, opts Options) error {
 	}
 
 	if opts.PerIPMaxEntries > 0 {
-		if m := spec.Maps[mapPerIPv4]; m != nil {
-			m.MaxEntries = opts.PerIPMaxEntries
+		m := spec.Maps[mapPerIP]
+		if m == nil {
+			return fmt.Errorf("map %s not in spec", mapPerIP)
 		}
+		m.MaxEntries = opts.PerIPMaxEntries
 	}
 
 	if err := os.MkdirAll(bpffsRoot, 0o755); err != nil {
@@ -154,15 +137,12 @@ func (l *linuxImpl) attachTCEgress() error {
 		Attach:    ebpf.AttachTCXEgress,
 	})
 	if err != nil {
-		// TCX (kernel >= 6.6) is REQUIRED, not optional: the egress seed is
-		// the only thing that lets TCP/UDP return traffic back through the
-		// filter (there is no stateless return fallback). If it can't attach,
-		// fail loudly rather than silently leaving the box unable to receive
-		// replies (DNS/NTP/connection responses would all break).
+		// TCX depends on kernel support (6.6+). If unavailable, continue
+		// without egress seeding; ingress path still works via fallback rules.
 		if errors.Is(err, link.ErrNotSupported) || isTCXModeError(err) {
-			return fmt.Errorf("attach tcx egress: kernel 6.6+ (TCX) required for egress seeding: %w", err)
+			return nil
 		}
-		return fmt.Errorf("attach tcx egress: %w", err)
+		return fmt.Errorf("attach tc egress: %w", err)
 	}
 	l.tcEgress = lnk
 	return nil
@@ -226,9 +206,9 @@ func pinMaps(coll *ebpf.Collection, root string) error {
 		if err := m.Pin(path); err != nil {
 			return fmt.Errorf("pin %s → %s: %w", name, path, err)
 		}
-		// Make pinned map inode readable by non-root users so `kekkai status`
-		// can open maps without sudo on standard Linux setups.
-		_ = os.Chmod(path, 0o644)
+		// Root-only. cmd/ and contrib/ do not open these pins; status and
+		// doctor run under sudo.
+		_ = os.Chmod(path, 0o600)
 	}
 	return nil
 }
@@ -311,15 +291,16 @@ func (l *Loader) mapByName(name string) (*ebpf.Map, error) {
 	return m, nil
 }
 
-func (l *Loader) BlocklistMap() (*ebpf.Map, error)  { return l.mapByName(mapBlocklistV4) }
-func (l *Loader) AllowlistMap() (*ebpf.Map, error)  { return l.mapByName(mapAllowlistV4) }
-func (l *Loader) PublicTCPMap() (*ebpf.Map, error)  { return l.mapByName(mapPublicTCPPorts) }
-func (l *Loader) PublicUDPMap() (*ebpf.Map, error)  { return l.mapByName(mapPublicUDPPorts) }
-func (l *Loader) PrivateTCPMap() (*ebpf.Map, error) { return l.mapByName(mapPrivateTCPPorts) }
-func (l *Loader) PrivateUDPMap() (*ebpf.Map, error) { return l.mapByName(mapPrivateUDPPorts) }
-func (l *Loader) RuntimeCfgMap() (*ebpf.Map, error) { return l.mapByName(mapRuntimeCfgV4) }
-func (l *Loader) StatsMap() (*ebpf.Map, error)      { return l.mapByName(mapStats) }
-func (l *Loader) PerIPMap() (*ebpf.Map, error)      { return l.mapByName(mapPerIPv4) }
+func (l *linuxImpl) egressActive() bool { return l.tcEgress != nil }
+
+func (l *Loader) BlocklistMap() (*ebpf.Map, error) { return l.mapByName(mapBlocklist) }
+func (l *Loader) AllowlistMap() (*ebpf.Map, error) { return l.mapByName(mapAllowlist) }
+func (l *Loader) PortsMap() (*ebpf.Map, error)     { return l.mapByName(mapPorts) }
+func (l *Loader) RuntimeCfgMap() (*ebpf.Map, error) {
+	return l.mapByName(mapRuntimeCfg)
+}
+func (l *Loader) StatsMap() (*ebpf.Map, error) { return l.mapByName(mapStats) }
+func (l *Loader) PerIPMap() (*ebpf.Map, error) { return l.mapByName(mapPerIP) }
 
 // SetBypass transitions the running agent between attached and bypassed
 // states without tearing down the eBPF collection.

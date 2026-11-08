@@ -17,7 +17,7 @@ _kekkai() {
     local -a subcommands
     subcommands=(
         'status:launch the live TUI'
-        'config:edit config then auto-reload'
+        'config:print sudoedit steps and check the config'
         'check:validate a config file (read-only)'
         'ports:show public/private port summary'
         'show:print normalised config'

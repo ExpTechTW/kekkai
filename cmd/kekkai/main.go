@@ -117,7 +117,7 @@ func usage() {
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, uiKeyStyle.Render("Commands:"))
 		fmt.Fprintln(os.Stderr, "  status [config]            launch the live TUI")
-		fmt.Fprintln(os.Stderr, "  config [config]            open config in nano, then auto-reload")
+		fmt.Fprintln(os.Stderr, "  config [config]            print sudoedit steps, then check the config")
 		fmt.Fprintln(os.Stderr, "  check  [config]            validate a config file (read-only)")
 		fmt.Fprintln(os.Stderr, "  ports  [config]            show colorized public/private port summary")
 		fmt.Fprintln(os.Stderr, "  show   [config]            print the normalised config after migration")
@@ -145,7 +145,7 @@ so the CLI needs root to open pinned eBPF maps.
 
 Commands:
   status [config]            launch the live TUI
-  config [config]            open config in nano, then auto-reload
+  config [config]            print sudoedit steps, then check the config
   check  [config]            validate a config file (read-only)
   ports  [config]            show colorized public/private port summary
   show   [config]            print the normalised config after migration

@@ -2,7 +2,7 @@ package main
 
 // Commands that touch /etc/kekkai/kekkai.yaml directly:
 // - cmdConfig prints how to edit + reload safely (it does NOT launch an editor).
-// - cmdReload runs an offline -check pass and then signals the daemon.
+// - cmdReload runs an offline check and then signals the daemon.
 //
 // Plus tiny filesystem helpers kept local to these two commands.
 
@@ -15,12 +15,10 @@ import (
 // cmdConfig prints how to safely edit and reload the config. It deliberately
 // does NOT launch an editor.
 //
-// The old behaviour (`exec nano <path>` while running as root via sudo) was a
-// local privilege-escalation vector: most editors can spawn a shell (nano
-// ^R^X, vi :!sh, …), so anyone allowed to run `sudo kekkai config` could get
-// a root shell. Editing is delegated to `sudoedit`, which runs the editor as
-// the invoking *user* on a temp copy and writes back as root — an editor
-// shell-escape there only yields the user's own shell, not root.
+// Running an editor as root (`sudo kekkai config` → nano) was a local
+// privilege escalation: most editors can spawn a shell. Editing is delegated
+// to sudoedit, which runs the editor as the invoking user on a temp copy and
+// writes back as root. The path is still confined to /etc/kekkai.
 func cmdConfig(args []string) int {
 	cfgPath := firstArgOrDefault(args, defaultConfigPath)
 	fmt.Println(uiInfo("config file: " + cfgPath))
@@ -30,7 +28,7 @@ func cmdConfig(args []string) int {
 	fmt.Println("    sudo kekkai reload")
 	fmt.Println()
 	// Show the current on-disk config's validity so the operator sees its state.
-	return runWafEdge("-check", "-config", cfgPath)
+	return cmdCheck([]string{cfgPath})
 }
 
 // cmdReload validates the config first, then triggers a daemon SIGHUP via

@@ -1,24 +1,19 @@
 // Package stats reads the eBPF maps populated by the XDP program, aggregates
-// global/proto/drop-reason counters, walks the per-IP LRU map to compute a
+// global/proto/drop-reason counters, walks the per-CPU per-IP LRU to compute a
 // top-N table, reads tx counters from sysfs (XDP is ingress-only), and writes
 // a human-readable snapshot to disk so operators can `watch -n 1 cat` it.
 //
-// The fast tick (writer) and the slow tick (top-N scan) run on independent
-// goroutines and exchange results through an atomic pointer. All hot-path
-// buffers are preallocated once at construction time so steady-state
-// operation generates zero heap allocations per tick.
+// One goroutine owns the tick. The top-N ranking keeps a fixed window instead
+// of copying and sorting the whole LRU, and the file buffer is reused.
 package stats
 
 import (
-	"encoding/binary"
-	"errors"
+	"bytes"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
-	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -26,90 +21,85 @@ import (
 	"github.com/ExpTechTW/kekkai/internal/fastio"
 )
 
-// Global stats slot indices — keep in sync with bpf/xdp_filter.c.
+// Slot indices mirror the C enum in bpf/xdp_filter.c, in order. Verdicts
+// occupy 0..VerdictCount-1 and SlotPassARP is the first pass. The remaining
+// slots are traffic mix and byte totals. PktsTotal / PktsPassed / PktsDropped
+// are not slots — the reader derives them from the verdicts.
+//
+// STAT_VERDICTS and STAT_PKTS_TCP are the same index in C, so VerdictCount
+// is an alias of SlotPktsTCP rather than another iota step. Putting it in
+// this block would make SlotCount 28 and shift every later counter.
 const (
-	SlotPktsTotal    = 0
-	SlotPktsPassed   = 1
-	SlotPktsDropped  = 2
-	SlotBytesTotal   = 3
-	SlotBytesDropped = 4
-
-	SlotPktsTCP      = 5
-	SlotPktsUDP      = 6
-	SlotPktsICMP     = 7
-	SlotPktsOtherL4  = 8
-	SlotBytesTCP     = 9
-	SlotBytesUDP     = 10
-	SlotBytesICMP    = 11
-	SlotBytesOtherL4 = 12
-
-	SlotDropNonIPv4    = 13
-	SlotDropMalformed  = 14
-	SlotDropBlocklist  = 15
-	SlotDropDynBlock   = 16
-	SlotDropNotAllowed = 17
-	SlotDropNoPolicy   = 18
-
-	SlotPassFragment   = 19
-	SlotPassReturnTCP  = 20
-	SlotPassReturnUDP  = 21
-	SlotPassReturnICMP = 22
-	SlotPassPublicTCP  = 23
-	SlotPassPublicUDP  = 24
-	SlotPassPrivateTCP = 25
-	SlotPassPrivateUDP = 26
-	SlotPassStatefulTCP = 27
-	SlotPassStatefulUDP = 28
-
-	SlotCount = 48
+	SlotDropNonIP = iota
+	SlotDropMalformed
+	SlotDropBlocklist
+	SlotDropNotAllowed
+	SlotDropNoPolicy
+	SlotPassARP
+	SlotPassFragment
+	SlotPassTCPEst
+	SlotPassUDPFlow
+	SlotPassDHCP
+	SlotPassICMP
+	SlotPassPublicTCP
+	SlotPassPublicUDP
+	SlotPassPrivateTCP
+	SlotPassPrivateUDP
+	SlotPktsTCP
+	SlotPktsUDP
+	SlotPktsICMP
+	SlotPktsOther
+	SlotBytesTCP
+	SlotBytesUDP
+	SlotBytesICMP
+	SlotBytesOther
+	SlotPktsIPv6
+	SlotBytesIPv6
+	SlotBytesTotal
+	SlotBytesDropped
+	SlotCount
 )
 
-// Global mirrors the aggregated counters.
+const (
+	// VerdictCount is the number of verdict slots and the index of the first
+	// non-verdict counter.
+	VerdictCount = SlotPktsTCP
+	// FirstPassVerdict is the first slot that records a pass. Slots below it
+	// are drops.
+	FirstPassVerdict = SlotPassARP
+)
+
+// PerCPUCounters is one CPU's value in the stats map: u64 c[SlotCount].
+type PerCPUCounters [SlotCount]uint64
+
+// Global is the summed stats map plus the three derived packet totals.
 type Global struct {
-	PktsTotal, PktsPassed, PktsDropped          uint64
-	BytesTotal, BytesDropped                    uint64
-	PktsTCP, PktsUDP, PktsICMP, PktsOtherL4     uint64
-	BytesTCP, BytesUDP, BytesICMP, BytesOtherL4 uint64
+	PktsTotal, PktsPassed, PktsDropped uint64
 
-	DropNonIPv4, DropMalformed, DropBlocklist uint64
-	DropDynBlock, DropNotAllowed, DropNoPolicy uint64
+	DropNonIP, DropMalformed, DropBlocklist uint64
+	DropNotAllowed, DropNoPolicy            uint64
 
-	PassFragment, PassReturnTCP, PassReturnUDP, PassReturnICMP uint64
-	PassPublicTCP, PassPublicUDP, PassPrivateTCP, PassPrivateUDP uint64
-	PassStatefulTCP, PassStatefulUDP uint64
-}
+	PassARP, PassFragment                       uint64
+	PassTCPEst, PassUDPFlow, PassDHCP, PassICMP uint64
+	PassPublicTCP, PassPublicUDP                uint64
+	PassPrivateTCP, PassPrivateUDP              uint64
 
-// PerIPStat mirrors `struct perip_stat` in the eBPF program. Size: 48 bytes.
-type PerIPStat struct {
-	Pkts         uint64
-	Bytes        uint64
-	PktsDropped  uint64
-	BytesDropped uint64
-	LastSeenNS   uint64
-	LastProto    uint8
-	Blocked      uint8
-	_            [6]uint8
+	PktsTCP, PktsUDP, PktsICMP, PktsOther     uint64
+	BytesTCP, BytesUDP, BytesICMP, BytesOther uint64
+	PktsIPv6, BytesIPv6                       uint64
+	BytesTotal, BytesDropped                  uint64
 }
 
 // TopEntry is one row of the sorted top-N table.
+// Addr is a plain IPv4 or IPv6 address; IPv4-mapped keys are unmapped.
 type TopEntry struct {
-	Addr         [4]byte
+	Addr         netip.Addr
 	Pkts         uint64
 	Bytes        uint64
 	PktsDropped  uint64
 	BytesDropped uint64
 	Proto        uint8
 	Blocked      bool
-}
-
-// topSnapshot is what the slow goroutine hands to the fast goroutine via
-// atomic pointer swap. The Entries slice backs onto one of the two
-// preallocated buffers owned by the Reader — never allocated per tick.
-type topSnapshot struct {
-	Entries  []TopEntry
-	ScanAt   time.Time
-	ScanSize int
-	ScanMS   int64
 }
 
 type Reader struct {
@@ -121,38 +111,26 @@ type Reader struct {
 	outPath string
 
 	fastInterval time.Duration
-	slowInterval time.Duration
 	topN         int
 	peripCap     int
 
 	startedAt time.Time
 
-	// ----- fast path state (touched only by runFast goroutine) -----
-	prev         Global
-	prevAt       time.Time
-	hasPrev      bool
-	txBytes      *fastio.CounterReader
-	txPkts       *fastio.CounterReader
-	prevTxBytes  uint64
-	prevTxPkts   uint64
-	prevTxAt     time.Time
-	hasPrevTx    bool
-	globalPerCPU []uint64 // scratch for PERCPU_ARRAY lookups
-	fileBuf      strings.Builder
-
-	// ----- slow path state (touched only by runSlow goroutine) -----
-	bufA, bufB []TopEntry // double-buffered top-N storage
-	// perip_v4 is a PER-CPU LRU hash, so reads return one PerIPStat per
-	// possible CPU and must be summed. numCPU is that fan-out factor.
-	numCPU           int
-	scanKeys         []uint32    // BatchLookup key scratch (len batchSize)
-	scanVals         []PerIPStat // BatchLookup value scratch (len batchSize*numCPU, entry-major)
-	scanPerCPU       []PerIPStat // Iterate per-entry per-CPU scratch (len numCPU)
-	batchUnsupported bool        // fall back to Iterate if kernel rejects batch
-
-	// ----- cross-goroutine handoff -----
-	topPtr   atomic.Pointer[topSnapshot]
-	snapshot [2]topSnapshot // preallocated headers, one per buffer
+	prev        Global
+	prevAt      time.Time
+	hasPrev     bool
+	txBytes     *fastio.CounterReader
+	txPkts      *fastio.CounterReader
+	prevTxBytes uint64
+	prevTxPkts  uint64
+	scratch     []PerCPUCounters
+	scan        *PerIPScan
+	topEntries  []TopEntry
+	scanOK      bool
+	scanAt      time.Time
+	scanSize    int
+	scanMS      int64
+	fileBuf     bytes.Buffer
 }
 
 func NewReader(global, perip *ebpf.Map, nodeID, iface, outPath string) *Reader {
@@ -164,19 +142,6 @@ func NewReader(global, perip *ebpf.Map, nodeID, iface, outPath string) *Reader {
 		peripCap = 65536 // fall back for stub/non-linux
 	}
 
-	// BatchLookup pulls at most `batchSize` entries per syscall. Larger
-	// batches reduce syscall overhead but need bigger scratch buffers.
-	// 4096 keeps scratch at ~200 KiB and fits the 1-iteration-per-second
-	// cadence comfortably.
-	const batchSize = 4096
-
-	// perip_v4 is per-CPU: each lookup yields one value per possible CPU.
-	// Default to 1 when there's no map (stub / non-Linux tests).
-	numCPU := 1
-	if perip != nil {
-		numCPU = PossibleCPUOr1()
-	}
-
 	r := &Reader{
 		global:       global,
 		perip:        perip,
@@ -184,25 +149,21 @@ func NewReader(global, perip *ebpf.Map, nodeID, iface, outPath string) *Reader {
 		iface:        iface,
 		outPath:      outPath,
 		fastInterval: time.Second,
-		slowInterval: time.Second,
 		topN:         10,
 		peripCap:     peripCap,
 		startedAt:    time.Now(),
-		numCPU:       numCPU,
-		globalPerCPU: make([]uint64, 0, 128),
-		bufA:         make([]TopEntry, 0, peripCap),
-		bufB:         make([]TopEntry, 0, peripCap),
-		scanKeys:     make([]uint32, batchSize),
-		scanVals:     make([]PerIPStat, batchSize*numCPU),
-		scanPerCPU:   make([]PerIPStat, numCPU),
+		scratch:      make([]PerCPUCounters, 0, 8),
+		scan:         NewPerIPScan(),
+		topEntries:   make([]TopEntry, 0, 10),
 	}
-	r.txBytes = fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface))
-	r.txPkts = fastio.NewCounterReader(fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface))
+	statsDir := filepath.Join("/sys/class/net", iface, "statistics")
+	r.txBytes = fastio.NewCounterReader(filepath.Join(statsDir, "tx_bytes"))
+	r.txPkts = fastio.NewCounterReader(filepath.Join(statsDir, "tx_packets"))
 	r.fileBuf.Grow(4096)
 	return r
 }
 
-// Run launches fast and slow goroutines and blocks until `stop` closes.
+// Run blocks until stop closes, refreshing the stats file once a second.
 func (r *Reader) Run(stop <-chan struct{}) error {
 	if err := os.MkdirAll(filepath.Dir(r.outPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir stats dir: %w", err)
@@ -216,38 +177,21 @@ func (r *Reader) Run(stop <-chan struct{}) error {
 		}
 	}()
 
-	// Seed an empty snapshot so the writer has something to render.
-	r.snapshot[0] = topSnapshot{Entries: r.bufA[:0]}
-	r.topPtr.Store(&r.snapshot[0])
-
-	done := make(chan struct{}, 2)
-	go func() { r.runFast(stop); done <- struct{}{} }()
-	go func() { r.runSlow(stop); done <- struct{}{} }()
-
-	<-stop
-	<-done
-	<-done
-	return nil
-}
-
-// --- fast path --------------------------------------------------------------
-
-func (r *Reader) runFast(stop <-chan struct{}) {
 	t := time.NewTicker(r.fastInterval)
 	defer t.Stop()
-	r.fastTick()
+	r.tick()
 	for {
 		select {
 		case <-stop:
-			return
+			return nil
 		case <-t.C:
-			r.fastTick()
+			r.tick()
 		}
 	}
 }
 
-func (r *Reader) fastTick() {
-	g, err := r.readGlobal()
+func (r *Reader) tick() {
+	g, err := ReadGlobal(r.global, &r.scratch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "stats read global: %v\n", err)
 		return
@@ -256,33 +200,46 @@ func (r *Reader) fastTick() {
 
 	var pps, dps, bpsTotal, bpsDropped float64
 	var ppsTCP, ppsUDP, ppsICMP float64
+	txBytes, txPkts := r.readTx()
+	var txBps, txPps float64
+	// perip_touch only runs on the path that also increments these counters,
+	// so an unchanged global total means the LRU rows cannot have changed.
+	// A failed walk is never reused: the next tick tries again.
+	reuse := reusePerIPScan(r.scanOK, r.hasPrev, r.prev, g)
 	if r.hasPrev {
 		if dt := now.Sub(r.prevAt).Seconds(); dt > 0 {
-			pps = float64(g.PktsTotal-r.prev.PktsTotal) / dt
-			dps = float64(g.PktsDropped-r.prev.PktsDropped) / dt
-			bpsTotal = float64(g.BytesTotal-r.prev.BytesTotal) * 8 / dt
-			bpsDropped = float64(g.BytesDropped-r.prev.BytesDropped) * 8 / dt
-			ppsTCP = float64(g.PktsTCP-r.prev.PktsTCP) / dt
-			ppsUDP = float64(g.PktsUDP-r.prev.PktsUDP) / dt
-			ppsICMP = float64(g.PktsICMP-r.prev.PktsICMP) / dt
+			inv := 1 / dt
+			pps = PerSecond(g.PktsTotal-r.prev.PktsTotal, inv)
+			dps = PerSecond(g.PktsDropped-r.prev.PktsDropped, inv)
+			bpsTotal = BitsPerSecond(g.BytesTotal-r.prev.BytesTotal, inv)
+			bpsDropped = BitsPerSecond(g.BytesDropped-r.prev.BytesDropped, inv)
+			ppsTCP = PerSecond(g.PktsTCP-r.prev.PktsTCP, inv)
+			ppsUDP = PerSecond(g.PktsUDP-r.prev.PktsUDP, inv)
+			ppsICMP = PerSecond(g.PktsICMP-r.prev.PktsICMP, inv)
+			txBps = BitsPerSecond(txBytes-r.prevTxBytes, inv)
+			txPps = PerSecond(txPkts-r.prevTxPkts, inv)
 		}
 	}
 	r.prev = g
 	r.prevAt = now
 	r.hasPrev = true
-
-	txBytes, txPkts := r.readTx()
-	var txBps, txPps float64
-	if r.hasPrevTx {
-		if dt := now.Sub(r.prevTxAt).Seconds(); dt > 0 {
-			txBps = float64(txBytes-r.prevTxBytes) * 8 / dt
-			txPps = float64(txPkts-r.prevTxPkts) / dt
-		}
-	}
 	r.prevTxBytes = txBytes
 	r.prevTxPkts = txPkts
-	r.prevTxAt = now
-	r.hasPrevTx = true
+
+	if !reuse {
+		start := time.Now()
+		entries, n, err := r.scan.Top(r.perip, r.topN, r.topEntries)
+		if err != nil {
+			r.scanOK = false
+			fmt.Fprintf(os.Stderr, "stats perip scan: %v\n", err)
+		} else {
+			r.topEntries = entries
+			r.scanSize = n
+			r.scanAt = time.Now()
+			r.scanMS = time.Since(start).Milliseconds()
+			r.scanOK = true
+		}
+	}
 
 	r.writeFile(snapshotView{
 		Now:        now,
@@ -298,119 +255,7 @@ func (r *Reader) fastTick() {
 		TxPkts:     txPkts,
 		TxBps:      txBps,
 		TxPps:      txPps,
-		Top:        r.topPtr.Load(),
 	})
-}
-
-func (r *Reader) readGlobal() (Global, error) {
-	var g Global
-	for slot := uint32(0); slot < SlotCount; slot++ {
-		// Reuse the scratch slice; cilium/ebpf will resize it to nCPU on
-		// first call and then keep that length.
-		r.globalPerCPU = r.globalPerCPU[:0]
-		if err := r.global.Lookup(&slot, &r.globalPerCPU); err != nil {
-			return g, fmt.Errorf("lookup slot %d: %w", slot, err)
-		}
-		AssignSlot(&g, slot, SumPerCPU(r.globalPerCPU))
-	}
-	return g, nil
-}
-
-// SumPerCPU sums a PERCPU map value (one entry per possible CPU).
-func SumPerCPU(vals []uint64) uint64 {
-	var sum uint64
-	for _, v := range vals {
-		sum += v
-	}
-	return sum
-}
-
-// AssignSlot writes one summed global-stats slot into g. Shared by the agent
-// reader and the TUI so the slot→field wiring lives in exactly one place.
-func AssignSlot(g *Global, slot uint32, sum uint64) {
-	switch slot {
-	case SlotPktsTotal:
-		g.PktsTotal = sum
-	case SlotPktsPassed:
-		g.PktsPassed = sum
-	case SlotPktsDropped:
-		g.PktsDropped = sum
-	case SlotBytesTotal:
-		g.BytesTotal = sum
-	case SlotBytesDropped:
-		g.BytesDropped = sum
-	case SlotPktsTCP:
-		g.PktsTCP = sum
-	case SlotPktsUDP:
-		g.PktsUDP = sum
-	case SlotPktsICMP:
-		g.PktsICMP = sum
-	case SlotPktsOtherL4:
-		g.PktsOtherL4 = sum
-	case SlotBytesTCP:
-		g.BytesTCP = sum
-	case SlotBytesUDP:
-		g.BytesUDP = sum
-	case SlotBytesICMP:
-		g.BytesICMP = sum
-	case SlotBytesOtherL4:
-		g.BytesOtherL4 = sum
-	case SlotDropNonIPv4:
-		g.DropNonIPv4 = sum
-	case SlotDropMalformed:
-		g.DropMalformed = sum
-	case SlotDropBlocklist:
-		g.DropBlocklist = sum
-	case SlotDropDynBlock:
-		g.DropDynBlock = sum
-	case SlotDropNotAllowed:
-		g.DropNotAllowed = sum
-	case SlotDropNoPolicy:
-		g.DropNoPolicy = sum
-	case SlotPassFragment:
-		g.PassFragment = sum
-	case SlotPassReturnTCP:
-		g.PassReturnTCP = sum
-	case SlotPassReturnUDP:
-		g.PassReturnUDP = sum
-	case SlotPassReturnICMP:
-		g.PassReturnICMP = sum
-	case SlotPassPublicTCP:
-		g.PassPublicTCP = sum
-	case SlotPassPublicUDP:
-		g.PassPublicUDP = sum
-	case SlotPassPrivateTCP:
-		g.PassPrivateTCP = sum
-	case SlotPassPrivateUDP:
-		g.PassPrivateUDP = sum
-	case SlotPassStatefulTCP:
-		g.PassStatefulTCP = sum
-	case SlotPassStatefulUDP:
-		g.PassStatefulUDP = sum
-	}
-}
-
-// PossibleCPUOr1 returns the kernel's possible-CPU count for sizing per-CPU
-// map scratch, or 1 if it can't be determined.
-func PossibleCPUOr1() int {
-	if n, err := ebpf.PossibleCPU(); err == nil && n > 0 {
-		return n
-	}
-	return 1
-}
-
-// CheckPerIPMap verifies a pinned perip_v4 handle matches what the decoder
-// expects: a per-CPU LRU hash whose value is the size of PerIPStat. It turns
-// a kernel↔userspace (or agent↔CLI build) drift into a clear startup error
-// instead of a silent mis-decode or a per-tick "requires a slice" failure.
-func CheckPerIPMap(m *ebpf.Map) error {
-	if m.Type() != ebpf.LRUCPUHash {
-		return fmt.Errorf("perip_v4 map type is %s, expected per-CPU LRU hash (agent/CLI build mismatch?)", m.Type())
-	}
-	if want := uint32(binary.Size(PerIPStat{})); m.ValueSize() != want {
-		return fmt.Errorf("perip_v4 value size %d, decoder expects %d (struct layout drift)", m.ValueSize(), want)
-	}
-	return nil
 }
 
 func (r *Reader) readTx() (uint64, uint64) {
@@ -424,152 +269,6 @@ func (r *Reader) readTx() (uint64, uint64) {
 	return b, p
 }
 
-// --- slow path: perip scan --------------------------------------------------
-
-func (r *Reader) runSlow(stop <-chan struct{}) {
-	t := time.NewTicker(r.slowInterval)
-	defer t.Stop()
-	r.slowTick()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-t.C:
-			r.slowTick()
-		}
-	}
-}
-
-func (r *Reader) slowTick() {
-	start := time.Now()
-
-	// Pick the buffer that isn't currently published. The writer holds the
-	// other one read-only until we swap.
-	active := r.topPtr.Load()
-	var next *topSnapshot
-	var buf *[]TopEntry
-	if active == &r.snapshot[0] {
-		next = &r.snapshot[1]
-		buf = &r.bufB
-	} else {
-		next = &r.snapshot[0]
-		buf = &r.bufA
-	}
-	*buf = (*buf)[:0]
-
-	scanSize, err := r.scanPerIP(buf)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "stats perip scan: %v\n", err)
-		return
-	}
-
-	entries := *buf
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Pkts > entries[j].Pkts
-	})
-	if len(entries) > r.topN {
-		entries = entries[:r.topN]
-	}
-
-	next.Entries = entries
-	next.ScanAt = time.Now()
-	next.ScanSize = scanSize
-	next.ScanMS = time.Since(start).Milliseconds()
-	r.topPtr.Store(next)
-}
-
-// scanPerIP walks the LRU hash with BatchLookup when the kernel supports it
-// (Linux 5.6+) and falls back to Iterate otherwise. Both paths append into
-// the caller-provided buffer without allocating per-entry.
-func (r *Reader) scanPerIP(buf *[]TopEntry) (int, error) {
-	if r.perip == nil {
-		return 0, nil
-	}
-	if !r.batchUnsupported {
-		n, err := r.scanPerIPBatch(buf)
-		if err == nil {
-			return n, nil
-		}
-		if !errors.Is(err, ebpf.ErrNotSupported) {
-			return n, err
-		}
-		r.batchUnsupported = true
-		// fall through to Iterate
-	}
-	return r.scanPerIPIterate(buf)
-}
-
-func (r *Reader) scanPerIPBatch(buf *[]TopEntry) (int, error) {
-	total := 0
-	cursor := ebpf.MapBatchCursor{}
-	for {
-		// Per-CPU batch: valuesOut is a flat entry-major slice of length
-		// len(keys)*numCPU; entry i's per-CPU values are
-		// scanVals[i*numCPU : (i+1)*numCPU].
-		n, err := r.perip.BatchLookup(&cursor, r.scanKeys, r.scanVals, nil)
-		for i := 0; i < n; i++ {
-			appendEntry(buf, r.scanKeys[i], r.scanVals[i*r.numCPU:(i+1)*r.numCPU])
-		}
-		total += n
-		if errors.Is(err, ebpf.ErrKeyNotExist) {
-			return total, nil
-		}
-		if err != nil {
-			return total, err
-		}
-	}
-}
-
-func (r *Reader) scanPerIPIterate(buf *[]TopEntry) (int, error) {
-	var key uint32
-	iter := r.perip.Iterate()
-	n := 0
-	// Per-CPU iterate: pass the pre-sized slice (len == nCPU) by value so the
-	// lookup fills it IN PLACE. Passing &slice instead makes cilium allocate a
-	// fresh slice on every entry. A single PerIPStat (non-slice) is rejected
-	// outright with "per-cpu value requires a slice", which is the bug to
-	// avoid here.
-	for iter.Next(&key, r.scanPerCPU) {
-		appendEntry(buf, key, r.scanPerCPU)
-		n++
-	}
-	return n, iter.Err()
-}
-
-// FoldPerIP folds one source IP's per-CPU PerIPStat slice (as read from the
-// per-CPU perip_v4 map) into a single TopEntry: counters sum across CPUs,
-// Blocked is OR-ed, and Proto comes from the CPU with the freshest last_seen.
-// Shared by the agent's stats reader and the TUI so the decode lives in one
-// place — see CheckPerIPMap for the matching layout/type guard.
-func FoldPerIP(key uint32, perCPU []PerIPStat) TopEntry {
-	var e TopEntry
-	var newestSeen uint64
-	for i := range perCPU {
-		c := &perCPU[i]
-		e.Pkts += c.Pkts
-		e.Bytes += c.Bytes
-		e.PktsDropped += c.PktsDropped
-		e.BytesDropped += c.BytesDropped
-		if c.Blocked != 0 {
-			e.Blocked = true
-		}
-		if c.LastSeenNS > newestSeen {
-			newestSeen = c.LastSeenNS
-			e.Proto = c.LastProto
-		}
-	}
-	// key is __u32 in network byte order — bytes 0..3 already correct.
-	e.Addr[0] = byte(key)
-	e.Addr[1] = byte(key >> 8)
-	e.Addr[2] = byte(key >> 16)
-	e.Addr[3] = byte(key >> 24)
-	return e
-}
-
-func appendEntry(buf *[]TopEntry, key uint32, perCPU []PerIPStat) {
-	*buf = append(*buf, FoldPerIP(key, perCPU))
-}
-
 // --- file rendering ---------------------------------------------------------
 
 type snapshotView struct {
@@ -580,7 +279,6 @@ type snapshotView struct {
 	PpsTCP, PpsUDP, PpsICMP float64
 	TxBytes, TxPkts         uint64
 	TxBps, TxPps            float64
-	Top                     *topSnapshot
 }
 
 func (r *Reader) writeFile(v snapshotView) {
@@ -607,7 +305,8 @@ func (r *Reader) writeFile(v snapshotView) {
 	fmt.Fprintf(b, "  tcp             :  pkts=%-14s bytes=%s\n", fmtU(g.PktsTCP), humanBytes(g.BytesTCP))
 	fmt.Fprintf(b, "  udp             :  pkts=%-14s bytes=%s\n", fmtU(g.PktsUDP), humanBytes(g.BytesUDP))
 	fmt.Fprintf(b, "  icmp            :  pkts=%-14s bytes=%s\n", fmtU(g.PktsICMP), humanBytes(g.BytesICMP))
-	fmt.Fprintf(b, "  other l4        :  pkts=%-14s bytes=%s\n\n", fmtU(g.PktsOtherL4), humanBytes(g.BytesOtherL4))
+	fmt.Fprintf(b, "  other           :  pkts=%-14s bytes=%s\n", fmtU(g.PktsOther), humanBytes(g.BytesOther))
+	fmt.Fprintf(b, "  ipv6            :  pkts=%-14s bytes=%s\n\n", fmtU(g.PktsIPv6), humanBytes(g.BytesIPv6))
 
 	fmt.Fprintf(b, "protocols (rate, last %s)\n", r.fastInterval)
 	fmt.Fprintf(b, "  pps tcp         : %15s\n", fmtNum(v.PpsTCP))
@@ -622,56 +321,58 @@ func (r *Reader) writeFile(v snapshotView) {
 	fmt.Fprintf(b, "  bytes dropped   : %15s\n\n", humanBytes(g.BytesDropped))
 
 	fmt.Fprintf(b, "drops by reason (since start)\n")
-	fmt.Fprintf(b, "  non-ipv4        : %15s\n", fmtU(g.DropNonIPv4))
+	fmt.Fprintf(b, "  non-ip          : %15s\n", fmtU(g.DropNonIP))
 	fmt.Fprintf(b, "  malformed       : %15s\n", fmtU(g.DropMalformed))
 	fmt.Fprintf(b, "  blocklist       : %15s\n", fmtU(g.DropBlocklist))
-	fmt.Fprintf(b, "  dyn blocklist   : %15s\n", fmtU(g.DropDynBlock))
 	fmt.Fprintf(b, "  not allowed     : %15s\n", fmtU(g.DropNotAllowed))
 	fmt.Fprintf(b, "  no policy       : %15s\n\n", fmtU(g.DropNoPolicy))
 
 	fmt.Fprintf(b, "passes by reason (since start)\n")
-	fmt.Fprintf(b, "  stateful tcp hit: %15s\n", fmtU(g.PassStatefulTCP))
-	fmt.Fprintf(b, "  stateful udp hit: %15s\n", fmtU(g.PassStatefulUDP))
-	fmt.Fprintf(b, "  return tcp (ACK): %15s\n", fmtU(g.PassReturnTCP))
-	fmt.Fprintf(b, "  return udp (eph): %15s\n", fmtU(g.PassReturnUDP))
-	fmt.Fprintf(b, "  return icmp     : %15s\n", fmtU(g.PassReturnICMP))
+	fmt.Fprintf(b, "  arp             : %15s\n", fmtU(g.PassARP))
 	fmt.Fprintf(b, "  ip fragment     : %15s\n", fmtU(g.PassFragment))
+	fmt.Fprintf(b, "  tcp established : %15s\n", fmtU(g.PassTCPEst))
+	fmt.Fprintf(b, "  udp flow        : %15s\n", fmtU(g.PassUDPFlow))
+	fmt.Fprintf(b, "  dhcp            : %15s\n", fmtU(g.PassDHCP))
+	fmt.Fprintf(b, "  icmp            : %15s\n", fmtU(g.PassICMP))
 	fmt.Fprintf(b, "  public tcp      : %15s\n", fmtU(g.PassPublicTCP))
 	fmt.Fprintf(b, "  public udp      : %15s\n", fmtU(g.PassPublicUDP))
 	fmt.Fprintf(b, "  private tcp     : %15s\n", fmtU(g.PassPrivateTCP))
 	fmt.Fprintf(b, "  private udp     : %15s\n\n", fmtU(g.PassPrivateUDP))
 
-	top := v.Top
-	if top != nil {
-		fmt.Fprintf(b, "top %d source IPs (scan: %d entries / cap %d, %dms, at %s)\n",
-			r.topN, top.ScanSize, r.peripCap, top.ScanMS,
-			formatScanAge(v.Now, top.ScanAt))
-		fmt.Fprintf(b, "  %-4s %-16s %-12s %-12s %-10s %-6s %s\n",
-			"#", "SRC_IP", "PKTS", "BYTES", "DROPPED", "PROTO", "STATUS")
-		if len(top.Entries) == 0 {
-			fmt.Fprintf(b, "  (no traffic yet)\n")
+	fmt.Fprintf(b, "top %d source IPs (scan: %d entries / cap %d, %dms, at %s)\n",
+		r.topN, r.scanSize, r.peripCap, r.scanMS,
+		formatScanAge(v.Now, r.scanAt))
+	fmt.Fprintf(b, "  %-4s %-39s %-12s %-12s %-10s %-6s %s\n",
+		"#", "SRC_IP", "PKTS", "BYTES", "DROPPED", "PROTO", "STATUS")
+	if len(r.topEntries) == 0 {
+		fmt.Fprintf(b, "  (no traffic yet)\n")
+	}
+	for i, e := range r.topEntries {
+		status := "pass"
+		if e.Blocked {
+			status = "BLOCK"
 		}
-		for i, e := range top.Entries {
-			status := "pass"
-			if e.Blocked {
-				status = "BLOCK"
-			}
-			fmt.Fprintf(b, "  %-4d %-16s %-12s %-12s %-10s %-6s %s\n",
-				i+1,
-				fmt.Sprintf("%d.%d.%d.%d", e.Addr[0], e.Addr[1], e.Addr[2], e.Addr[3]),
-				fmtU(e.Pkts),
-				humanBytes(e.Bytes),
-				fmtU(e.PktsDropped),
-				protoName(e.Proto),
-				status,
-			)
-		}
+		fmt.Fprintf(b, "  %-4d %-39s %-12s %-12s %-10s %-6s %s\n",
+			i+1,
+			formatAddr(e.Addr),
+			fmtU(e.Pkts),
+			humanBytes(e.Bytes),
+			fmtU(e.PktsDropped),
+			protoName(e.Proto),
+			status,
+		)
 	}
 
 	// Atomic replace so `watch` never sees a half-written file.
+	// 0640: group-readable for operators, not world-readable.
 	tmp := r.outPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+	if err := os.WriteFile(tmp, b.Bytes(), 0o640); err != nil {
 		fmt.Fprintf(os.Stderr, "stats write: %v\n", err)
+		return
+	}
+	// WriteFile applies the process umask. Chmod pins 0640.
+	if err := os.Chmod(tmp, 0o640); err != nil {
+		fmt.Fprintf(os.Stderr, "stats chmod: %v\n", err)
 		return
 	}
 	if err := os.Rename(tmp, r.outPath); err != nil {
@@ -686,13 +387,20 @@ func formatScanAge(now, scanAt time.Time) string {
 	return fmt.Sprintf("%s ago", now.Sub(scanAt).Truncate(time.Millisecond))
 }
 
+func formatAddr(a netip.Addr) string {
+	if !a.IsValid() {
+		return "-"
+	}
+	return a.Unmap().String()
+}
+
 func protoName(p uint8) string {
 	switch p {
 	case 6:
 		return "tcp"
 	case 17:
 		return "udp"
-	case 1:
+	case 1, 58:
 		return "icmp"
 	case 0:
 		return "-"
@@ -701,39 +409,65 @@ func protoName(p uint8) string {
 	}
 }
 
+// reusePerIPScan skips the per-IP walk when the last walk succeeded and
+// every summed counter is unchanged.
+func reusePerIPScan(scanOK, hasPrev bool, prev, cur Global) bool {
+	return scanOK && hasPrev && prev == cur
+}
+
 func fmtU(v uint64) string {
-	return addCommas(strconv.FormatUint(v, 10))
+	var raw [20]byte
+	return groupDigits(strconv.AppendUint(raw[:0], v, 10))
 }
 
 func fmtNum(v float64) string {
-	return addCommas(strconv.FormatFloat(v, 'f', 2, 64))
+	var raw [64]byte
+	return groupDigits(strconv.AppendFloat(raw[:0], v, 'f', 2, 64))
 }
 
-func addCommas(s string) string {
-	intPart, decPart := s, ""
-	if i := strings.IndexByte(s, '.'); i >= 0 {
-		intPart, decPart = s[:i], s[i:]
+// groupDigits inserts thousands separators. The sign, if any, stays in the
+// integer part, matching the previous grouping of "-1234.50" as "-1,234.50".
+func groupDigits(s []byte) string {
+	intPart, dec := s, []byte(nil)
+	if i := bytes.IndexByte(s, '.'); i >= 0 {
+		intPart, dec = s[:i], s[i:]
 	}
 	n := len(intPart)
-	if n <= 3 {
-		return intPart + decPart
+	commas := 0
+	if n > 3 {
+		commas = (n - 1) / 3
 	}
-	var out strings.Builder
+	need := n + commas + len(dec)
+	var scratch [64]byte
+	out := scratch[:0]
+	if need <= len(scratch) {
+		out = scratch[:need]
+	} else {
+		out = make([]byte, need)
+	}
+	if commas == 0 {
+		copy(out, intPart)
+		copy(out[n:], dec)
+		return string(out)
+	}
 	pre := n % 3
+	pos := 0
 	if pre > 0 {
-		out.WriteString(intPart[:pre])
-		if n > pre {
-			out.WriteByte(',')
-		}
+		copy(out, intPart[:pre])
+		pos = pre
+		out[pos] = ','
+		pos++
 	}
 	for i := pre; i < n; i += 3 {
-		out.WriteString(intPart[i : i+3])
+		copy(out[pos:], intPart[i:i+3])
+		pos += 3
 		if i+3 < n {
-			out.WriteByte(',')
+			out[pos] = ','
+			pos++
 		}
 	}
-	out.WriteString(decPart)
-	return out.String()
+	copy(out[pos:], dec)
+	return string(out)
 }
 
 func humanBits(v float64) string {
@@ -742,15 +476,16 @@ func humanBits(v float64) string {
 		m = 1_000_000.0
 		g = 1_000_000_000.0
 	)
+	var buf [32]byte
 	switch {
 	case v >= g:
-		return fmt.Sprintf("%8.2f Gbps", v/g)
+		return string(appendPadFloat(buf[:0], v/g, " Gbps"))
 	case v >= m:
-		return fmt.Sprintf("%8.2f Mbps", v/m)
+		return string(appendPadFloat(buf[:0], v/m, " Mbps"))
 	case v >= k:
-		return fmt.Sprintf("%8.2f Kbps", v/k)
+		return string(appendPadFloat(buf[:0], v/k, " Kbps"))
 	default:
-		return fmt.Sprintf("%8.2f bps ", v)
+		return string(appendPadFloat(buf[:0], v, " bps "))
 	}
 }
 
@@ -762,18 +497,38 @@ func humanBytes(v uint64) string {
 		t = g * 1024
 	)
 	f := float64(v)
+	var buf [32]byte
 	switch {
 	case f >= t:
-		return fmt.Sprintf("%8.2f TiB", f/t)
+		return string(appendPadFloat(buf[:0], f/t, " TiB"))
 	case f >= g:
-		return fmt.Sprintf("%8.2f GiB", f/g)
+		return string(appendPadFloat(buf[:0], f/g, " GiB"))
 	case f >= m:
-		return fmt.Sprintf("%8.2f MiB", f/m)
+		return string(appendPadFloat(buf[:0], f/m, " MiB"))
 	case f >= k:
-		return fmt.Sprintf("%8.2f KiB", f/k)
+		return string(appendPadFloat(buf[:0], f/k, " KiB"))
 	default:
-		return fmt.Sprintf("%8d B  ", v)
+		return string(append(appendPadUint(buf[:0], v, 8), " B  "...))
 	}
+}
+
+func appendPadFloat(dst []byte, v float64, suffix string) []byte {
+	var tmp [32]byte
+	s := strconv.AppendFloat(tmp[:0], v, 'f', 2, 64)
+	for i := len(s); i < 8; i++ {
+		dst = append(dst, ' ')
+	}
+	dst = append(dst, s...)
+	return append(dst, suffix...)
+}
+
+func appendPadUint(dst []byte, v uint64, width int) []byte {
+	var tmp [20]byte
+	s := strconv.AppendUint(tmp[:0], v, 10)
+	for i := len(s); i < width; i++ {
+		dst = append(dst, ' ')
+	}
+	return append(dst, s...)
 }
 
 // Exported aliases for use by other packages (e.g. internal/tui).

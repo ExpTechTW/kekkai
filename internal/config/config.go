@@ -18,7 +18,9 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 
+	"github.com/ExpTechTW/kekkai/internal/maps"
 	"gopkg.in/yaml.v3"
 )
 
@@ -98,13 +100,17 @@ type SecurityConfig struct {
 }
 
 type FilterConfig struct {
-	Public           PortGroup `yaml:"public"`
-	Private          PortGroup `yaml:"private"`
-	AllowICMP        *bool     `yaml:"allow_icmp"`
-	AllowARP         *bool     `yaml:"allow_arp"`
-	UDPEphemeralMin  uint16    `yaml:"udp_ephemeral_min"`
-	IngressAllowlist []string  `yaml:"ingress_allowlist"`
-	StaticBlocklist  []string  `yaml:"static_blocklist"`
+	Public    PortGroup `yaml:"public"`
+	Private   PortGroup `yaml:"private"`
+	AllowICMP *bool     `yaml:"allow_icmp"`
+	AllowARP  *bool     `yaml:"allow_arp"`
+	// UDPEphemeralMin is accepted and validated (>= 1024) so existing
+	// configs keep loading. It has no effect: the data plane no longer
+	// falls back to an ephemeral UDP port range. UDP replies are allowed
+	// only when the TC egress program has seeded a flow.
+	UDPEphemeralMin  uint16   `yaml:"udp_ephemeral_min"`
+	IngressAllowlist []string `yaml:"ingress_allowlist"`
+	StaticBlocklist  []string `yaml:"static_blocklist"`
 }
 
 type PortGroup struct {
@@ -194,6 +200,25 @@ func LoadWith(path string, opts LoadOptions) (*LoadResult, error) {
 		return nil, err
 	}
 	return res, nil
+}
+
+// Parse decodes a byte slice into a Config and runs the full migrate +
+// default + validate pipeline. Used by the -check and -show CLI flags and
+// by tests. It does NOT touch the filesystem.
+func Parse(data []byte) (*Config, error) {
+	fromVersion, err := peekVersion(data)
+	if err != nil {
+		return nil, err
+	}
+	cfg, _, err := migrateIfNeeded(data, fromVersion)
+	if err != nil {
+		return nil, err
+	}
+	cfg.applyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 // Marshal serialises a Config back to YAML via the commented template.
@@ -338,6 +363,9 @@ func (c *Config) Validate() error {
 	if c.Interface.Name == "" {
 		return errors.New("interface.name is required")
 	}
+	if err := ValidateInterfaceName(c.Interface.Name); err != nil {
+		return fmt.Errorf("interface.name: %w", err)
+	}
 	switch c.Interface.XDPMode {
 	case "generic", "driver", "offload":
 	default:
@@ -414,6 +442,14 @@ func (c *Config) Validate() error {
 				"remove 22 from public.tcp (allow_ssh_public:false already allows SSH on private), " +
 				"or set security.allow_ssh_public: true")
 	}
+
+	// Effective* includes the implicit SSH port, which occupies a slot in
+	// the single ports map. Count that, not only the lists as written.
+	ports := len(c.EffectivePublicTCP()) + len(c.EffectivePrivateTCP()) +
+		len(c.Filter.Public.UDP) + len(c.Filter.Private.UDP)
+	if ports > maps.PortsMaxEntries {
+		return fmt.Errorf("filter ports: %d entries do not fit the ports map (max %d)", ports, maps.PortsMaxEntries)
+	}
 	return nil
 }
 
@@ -455,7 +491,7 @@ func (c *Config) ResolveInterface() (*net.Interface, error) {
 }
 
 // ParsePrefixes converts a list of strings (CIDR or bare IP) into
-// netip.Prefix values. Bare addresses are treated as /32 (IPv4).
+// normalised prefixes. See ParsePrefix.
 func ParsePrefixes(entries []string) ([]netip.Prefix, error) {
 	out := make([]netip.Prefix, 0, len(entries))
 	for _, s := range entries {
@@ -468,14 +504,33 @@ func ParsePrefixes(entries []string) ([]netip.Prefix, error) {
 	return out, nil
 }
 
-// ParsePrefix accepts either "1.2.3.4" (→ /32) or "1.2.3.0/24".
+// ParsePrefix accepts a CIDR or a bare address. A bare IPv4 address is /32
+// and a bare IPv6 address is /128. The result is the prefix stored in the
+// LPM maps (maps.NormalizePrefix): IPv4 and IPv4-mapped IPv6 are rewritten
+// to IPv4-mapped form with prefix length 96+n, other IPv6 prefixes are
+// masked as-is. Validation and the agent call this same function, so
+// `kekkai check` cannot accept a prefix the agent later rejects.
 func ParsePrefix(s string) (netip.Prefix, error) {
-	if p, err := netip.ParsePrefix(s); err == nil {
-		return p, nil
+	raw, err := parseRawPrefix(s)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	return maps.NormalizePrefix(raw)
+}
+
+func parseRawPrefix(s string) (netip.Prefix, error) {
+	// A slash means the caller wrote a CIDR. Don't fall through to
+	// ParseAddr: a zone would swallow the length ("fe80::1%eth0/64").
+	if strings.Contains(s, "/") {
+		return netip.ParsePrefix(s)
 	}
 	addr, err := netip.ParseAddr(s)
 	if err != nil {
 		return netip.Prefix{}, err
+	}
+	// Zones are host-local and are not part of the address on the wire.
+	if addr.Zone() != "" {
+		return netip.Prefix{}, fmt.Errorf("zone %q is not allowed", addr.Zone())
 	}
 	return netip.PrefixFrom(addr, addr.BitLen()), nil
 }
