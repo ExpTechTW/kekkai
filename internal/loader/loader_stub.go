@@ -16,16 +16,15 @@ func newImpl() implementation { return &stubImpl{} }
 func (stubImpl) attach(ifaceIndex int, opts Options) error {
 	return fmt.Errorf("XDP is only supported on Linux; build for linux to attach")
 }
-func (stubImpl) close() error { return nil }
+func (stubImpl) detach() error      { return nil }
+func (stubImpl) close() error       { return nil }
+func (stubImpl) egressActive() bool { return false }
 
 const stubErr = "eBPF maps not available on non-linux builds"
 
 func (l *Loader) BlocklistMap() (*ebpf.Map, error)  { return nil, fmt.Errorf(stubErr) }
 func (l *Loader) AllowlistMap() (*ebpf.Map, error)  { return nil, fmt.Errorf(stubErr) }
-func (l *Loader) PublicTCPMap() (*ebpf.Map, error)  { return nil, fmt.Errorf(stubErr) }
-func (l *Loader) PublicUDPMap() (*ebpf.Map, error)  { return nil, fmt.Errorf(stubErr) }
-func (l *Loader) PrivateTCPMap() (*ebpf.Map, error) { return nil, fmt.Errorf(stubErr) }
-func (l *Loader) PrivateUDPMap() (*ebpf.Map, error) { return nil, fmt.Errorf(stubErr) }
+func (l *Loader) PortsMap() (*ebpf.Map, error)      { return nil, fmt.Errorf(stubErr) }
 func (l *Loader) RuntimeCfgMap() (*ebpf.Map, error) { return nil, fmt.Errorf(stubErr) }
 func (l *Loader) StatsMap() (*ebpf.Map, error)      { return nil, fmt.Errorf(stubErr) }
 func (l *Loader) PerIPMap() (*ebpf.Map, error)      { return nil, fmt.Errorf(stubErr) }

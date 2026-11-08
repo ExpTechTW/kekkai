@@ -31,7 +31,9 @@ import (
 )
 
 // version is injected at build time via -ldflags:
-//   -X main.version=YYYY.MM.DD+build.N
+//
+//	-X main.version=YYYY.MM.DD+build.N
+//
 // Keep default empty so linker override works reliably.
 var version string
 
@@ -146,6 +148,10 @@ func runReset(path, iface string) int {
 		fmt.Fprintln(os.Stderr, "reset: could not auto-detect interface; pass -iface <name>")
 		return 1
 	}
+	if err := config.ValidateInterfaceName(iface); err != nil {
+		fmt.Fprintf(os.Stderr, "reset: %v\n", err)
+		return 1
+	}
 
 	// Backup existing file (if any) before overwriting.
 	if _, err := os.Stat(path); err == nil {
@@ -204,20 +210,18 @@ func detectDefaultIface() string {
 // make their own children via log.With("update"). Sharing the root
 // logger across goroutines is safe — logx serialises writes internally.
 type agent struct {
-	cfg       *config.Config
-	cfgPath   string
-	mcfgPath  string
-	loader    *loader.Loader
-	log       *logx.Logger
-	root      *logx.Logger // kept separately so Close() at shutdown stops rotation
-	mu        sync.Mutex
-	blocklist *kmaps.PrefixSet
-	allowlist *kmaps.PrefixSet
-	pubTCP    *kmaps.PortSet
-	pubUDP    *kmaps.PortSet
-	privTCP   *kmaps.PortSet
-	privUDP   *kmaps.PortSet
-	runtime   *kmaps.RuntimeCfg
+	cfg          *config.Config
+	cfgPath      string
+	mcfgPath     string
+	loader       *loader.Loader
+	log          *logx.Logger
+	root         *logx.Logger // kept separately so Close() at shutdown stops rotation
+	mu           sync.Mutex
+	blocklist    *kmaps.PrefixSet
+	allowlist    *kmaps.PrefixSet
+	ports        *kmaps.PortTable
+	runtime      *kmaps.RuntimeCfg
+	egressWarned bool
 }
 
 func run(cfgPath, managedCfgPath string) error {
@@ -263,25 +267,18 @@ func run(cfgPath, managedCfgPath string) error {
 
 	loaderLog := root.With("loader")
 	ld := loader.New(cfg.Interface.Name)
+	// Load maps with nothing attached, fill them, then attach. That closes
+	// the window where XDP would run against empty maps.
 	if err := ld.Attach(iface.Index, loader.Options{
 		PerIPMaxEntries: cfg.Runtime.PerIPTableSize,
 		XDPMode:         cfg.Interface.XDPMode,
-		EmergencyBypass: cfg.Runtime.EmergencyBypass,
+		EmergencyBypass: true,
 	}); err != nil {
 		loaderLog.Error("xdp attach failed", "iface", cfg.Interface.Name, "err", err.Error())
 		_ = root.Close()
 		return fmt.Errorf("attach xdp: %w", err)
 	}
 	defer ld.Close()
-	if cfg.Runtime.EmergencyBypass {
-		loaderLog.Warn("emergency bypass enabled — eBPF loaded but not attached",
-			"iface", cfg.Interface.Name)
-	} else {
-		loaderLog.Info("xdp attached",
-			"iface", cfg.Interface.Name,
-			"ifindex", iface.Index,
-			"mode", cfg.Interface.XDPMode)
-	}
 
 	a := &agent{
 		cfg:      cfg,
@@ -303,6 +300,26 @@ func run(cfgPath, managedCfgPath string) error {
 	if err := a.applyFilter(cfg); err != nil {
 		mapsLog.Error("apply filter failed", "err", err.Error())
 		return fmt.Errorf("apply filter: %w", err)
+	}
+	if cfg.Runtime.EmergencyBypass {
+		loaderLog.Warn("emergency bypass enabled — eBPF loaded but not attached",
+			"iface", cfg.Interface.Name)
+	} else {
+		if err := ld.SetBypass(false); err != nil {
+			loaderLog.Error("xdp attach failed", "iface", cfg.Interface.Name, "err", err.Error())
+			return fmt.Errorf("attach xdp: %w", err)
+		}
+		// applyFilter ran while the TC link was down, so EGRESS_SEED was clear.
+		if err := a.syncRuntimeFlags(cfg); err != nil {
+			loaderLog.Error("runtime flags after attach failed", "err", err.Error())
+			return fmt.Errorf("runtime flags: %w", err)
+		}
+		a.warnEgressDegraded()
+		loaderLog.Info("xdp attached",
+			"iface", cfg.Interface.Name,
+			"ifindex", iface.Index,
+			"mode", cfg.Interface.XDPMode,
+			"egress", ld.EgressActive())
 	}
 	mapsLog.Info("initial filter applied",
 		"public_tcp", len(cfg.Filter.Public.TCP),
@@ -400,21 +417,9 @@ func (a *agent) openMaps() error {
 	if err != nil {
 		return fmt.Errorf("allowlist map: %w", err)
 	}
-	ptcp, err := a.loader.PublicTCPMap()
+	ports, err := a.loader.PortsMap()
 	if err != nil {
-		return fmt.Errorf("public tcp map: %w", err)
-	}
-	pudp, err := a.loader.PublicUDPMap()
-	if err != nil {
-		return fmt.Errorf("public udp map: %w", err)
-	}
-	prtcp, err := a.loader.PrivateTCPMap()
-	if err != nil {
-		return fmt.Errorf("private tcp map: %w", err)
-	}
-	prudp, err := a.loader.PrivateUDPMap()
-	if err != nil {
-		return fmt.Errorf("private udp map: %w", err)
+		return fmt.Errorf("ports map: %w", err)
 	}
 	rcfg, err := a.loader.RuntimeCfgMap()
 	if err != nil {
@@ -423,15 +428,14 @@ func (a *agent) openMaps() error {
 
 	a.blocklist = kmaps.NewPrefixSet(blMap, "blocklist")
 	a.allowlist = kmaps.NewPrefixSet(alMap, "allowlist")
-	a.pubTCP = kmaps.NewPortSet(ptcp, "public_tcp")
-	a.pubUDP = kmaps.NewPortSet(pudp, "public_udp")
-	a.privTCP = kmaps.NewPortSet(prtcp, "private_tcp")
-	a.privUDP = kmaps.NewPortSet(prudp, "private_udp")
+	a.ports = kmaps.NewPortTable(ports, "ports")
 	a.runtime = kmaps.NewRuntimeCfg(rcfg)
 	return nil
 }
 
-// applyFilter syncs all six filter maps from the given config in one shot.
+// applyFilter syncs allowlist, blocklist, ports, and runtime flags.
+// Prefixes are parsed and normalised before any map is touched, so a bad
+// string leaves the running filter as it was.
 func (a *agent) applyFilter(cfg *config.Config) error {
 	allowlist, err := config.ParsePrefixes(cfg.Filter.IngressAllowlist)
 	if err != nil {
@@ -441,55 +445,91 @@ func (a *agent) applyFilter(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
+	// Effective*TCP fold in the implicit SSH port (22) per
+	// security.allow_ssh_public. The port is applied to the running filter
+	// only — it is never written back to the config file.
+	pubTCP := cfg.EffectivePublicTCP()
+	privTCP := cfg.EffectivePrivateTCP()
+	pubUDP := cfg.Filter.Public.UDP
+	privUDP := cfg.Filter.Private.UDP
+	flags := runtimeFlags(cfg, a.loader.EgressActive())
+
 	if err := a.allowlist.Sync(allowlist); err != nil {
 		return err
 	}
 	if err := a.blocklist.Sync(blocklist); err != nil {
 		return err
 	}
-	// Effective*TCP fold in the implicit SSH port (22) per
-	// security.allow_ssh_public. The port is applied to the running filter
-	// only — it is never written back to the config file.
-	pubTCP := cfg.EffectivePublicTCP()
-	privTCP := cfg.EffectivePrivateTCP()
-	if err := a.pubTCP.Sync(pubTCP); err != nil {
+	if err := a.ports.Sync(pubTCP, pubUDP, privTCP, privUDP); err != nil {
 		return err
 	}
-	if err := a.pubUDP.Sync(cfg.Filter.Public.UDP); err != nil {
+	if err := a.runtime.Sync(flags); err != nil {
 		return err
 	}
-	if err := a.privTCP.Sync(privTCP); err != nil {
-		return err
-	}
-	if err := a.privUDP.Sync(cfg.Filter.Private.UDP); err != nil {
-		return err
-	}
-	flags := uint32(0)
+	a.log.Info("filter applied",
+		"public_tcp", fmt.Sprintf("%v", pubTCP),
+		"public_udp", fmt.Sprintf("%v", pubUDP),
+		"private_tcp", fmt.Sprintf("%v", privTCP),
+		"private_udp", fmt.Sprintf("%v", privUDP),
+		"allowlist", len(cfg.Filter.IngressAllowlist),
+		"blocklist", len(cfg.Filter.StaticBlocklist))
+	a.logRuntimeFlags(flags)
+	return nil
+}
+
+// runtimeFlags is the runtime_cfg word: ICMP and ARP come from cfg, and
+// EGRESS_SEED is set only while the TC egress program is attached.
+func runtimeFlags(cfg *config.Config, egressActive bool) uint32 {
+	var flags uint32
 	if cfg.Filter.AllowICMP != nil && *cfg.Filter.AllowICMP {
 		flags |= kmaps.RuntimeFlagAllowICMP
 	}
 	if cfg.Filter.AllowARP != nil && *cfg.Filter.AllowARP {
 		flags |= kmaps.RuntimeFlagAllowARP
 	}
-	if err := a.runtime.Sync(kmaps.RuntimeCfgValue{
-		Initialized:     1,
-		Flags:           flags,
-		UDPEphemeralMin: cfg.Filter.UDPEphemeralMin,
-	}); err != nil {
+	if egressActive {
+		flags |= kmaps.RuntimeFlagEgressSeed
+	}
+	return flags
+}
+
+func (a *agent) syncRuntimeFlags(cfg *config.Config) error {
+	flags := runtimeFlags(cfg, a.loader.EgressActive())
+	if err := a.runtime.Sync(flags); err != nil {
 		return err
 	}
-	a.log.Info("filter applied",
-		"public_tcp", fmt.Sprintf("%v", pubTCP),
-		"public_udp", fmt.Sprintf("%v", cfg.Filter.Public.UDP),
-		"private_tcp", fmt.Sprintf("%v", privTCP),
-		"private_udp", fmt.Sprintf("%v", cfg.Filter.Private.UDP),
-		"allowlist", len(cfg.Filter.IngressAllowlist),
-		"blocklist", len(cfg.Filter.StaticBlocklist))
-	a.log.Info("runtime policy applied",
-		"allow_icmp", cfg.Filter.AllowICMP != nil && *cfg.Filter.AllowICMP,
-		"allow_arp", cfg.Filter.AllowARP != nil && *cfg.Filter.AllowARP,
-		"udp_ephemeral_min", cfg.Filter.UDPEphemeralMin)
+	a.logRuntimeFlags(flags)
 	return nil
+}
+
+func (a *agent) logRuntimeFlags(flags uint32) {
+	a.log.Info("runtime policy applied",
+		"allow_icmp", flags&kmaps.RuntimeFlagAllowICMP != 0,
+		"allow_arp", flags&kmaps.RuntimeFlagAllowARP != 0,
+		"egress_seed", flags&kmaps.RuntimeFlagEgressSeed != 0)
+}
+
+// warnEgressDegraded logs once per process when XDP is attached and the TC
+// egress program is not. DHCP replies stay open and UDP return traffic is
+// not seeded until egress is available.
+func (a *agent) warnEgressDegraded() {
+	if a.egressWarned || a.cfg.Runtime.EmergencyBypass || a.loader.EgressActive() {
+		return
+	}
+	a.egressWarned = true
+	a.root.With("loader").Warn("XDP is attached but TC egress is not; DHCP and UDP return traffic are degraded")
+}
+
+// rollbackFilter re-applies the previous config after a partial update.
+// Both the original error and a failed rollback are logged.
+func (a *agent) rollbackFilter(cause error) {
+	if rerr := a.applyFilter(a.cfg); rerr != nil {
+		a.log.Error("apply failed and previous config could not be restored",
+			"err", cause.Error(),
+			"rollback_err", rerr.Error())
+		return
+	}
+	a.log.Error("apply failed; previous config restored", "err", cause.Error())
 }
 
 // reload re-reads the config file, validates it, auto-backs up the
@@ -543,21 +583,35 @@ func (a *agent) reload() error {
 	warnIfSSHPublic(newCfg, a.log)
 
 	if err := a.applyFilter(newCfg); err != nil {
+		a.rollbackFilter(err)
 		return err
 	}
 
 	if newCfg.Runtime.EmergencyBypass != a.cfg.Runtime.EmergencyBypass {
 		if err := a.loader.SetBypass(newCfg.Runtime.EmergencyBypass); err != nil {
+			a.rollbackFilter(err)
 			return fmt.Errorf("bypass toggle: %w", err)
+		}
+		// The link state changed after applyFilter computed EGRESS_SEED.
+		if err := a.syncRuntimeFlags(newCfg); err != nil {
+			if berr := a.loader.SetBypass(a.cfg.Runtime.EmergencyBypass); berr != nil {
+				a.log.Error("runtime flag sync failed and bypass rollback failed",
+					"err", err.Error(),
+					"rollback_err", berr.Error())
+			}
+			a.rollbackFilter(err)
+			return fmt.Errorf("runtime flags: %w", err)
 		}
 		if newCfg.Runtime.EmergencyBypass {
 			a.log.Warn("emergency bypass enabled via reload", "xdp", "detached")
 		} else {
-			a.log.Info("emergency bypass disabled via reload", "xdp", "reattached")
+			a.log.Info("emergency bypass disabled via reload", "xdp", "reattached",
+				"egress", a.loader.EgressActive())
 		}
 	}
 
 	a.cfg = newCfg
+	a.warnEgressDegraded()
 	if err := persistManagedConfig(a.mcfgPath, newCfg); err != nil {
 		a.log.Warn("managed config persist failed", "path", a.mcfgPath, "err", err.Error())
 	} else {
@@ -579,11 +633,27 @@ func (a *agent) setBypassRuntime(bypass bool, reason string) error {
 	if err := a.loader.SetBypass(bypass); err != nil {
 		return fmt.Errorf("bypass toggle: %w", err)
 	}
+	prev := a.cfg.Runtime.EmergencyBypass
 	a.cfg.Runtime.EmergencyBypass = bypass
+	if err := a.syncRuntimeFlags(a.cfg); err != nil {
+		a.cfg.Runtime.EmergencyBypass = prev
+		if berr := a.loader.SetBypass(prev); berr != nil {
+			a.log.Error("runtime flag sync failed and bypass rollback failed",
+				"err", err.Error(),
+				"rollback_err", berr.Error())
+		} else if ferr := a.syncRuntimeFlags(a.cfg); ferr != nil {
+			a.log.Error("runtime flag sync failed and flag rollback failed",
+				"err", err.Error(),
+				"rollback_err", ferr.Error())
+		}
+		return fmt.Errorf("runtime flags: %w", err)
+	}
+	a.warnEgressDegraded()
 	if bypass {
 		a.log.Warn("temporary bypass enabled", "reason", reason, "persisted", false)
 	} else {
-		a.log.Info("temporary bypass disabled", "reason", reason, "persisted", false)
+		a.log.Info("temporary bypass disabled", "reason", reason, "persisted", false,
+			"egress", a.loader.EgressActive())
 	}
 	return nil
 }

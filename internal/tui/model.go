@@ -24,16 +24,14 @@ const (
 	pageCount
 )
 
-// Model is the Bubble Tea state machine. It polls the Source on a fixed
-// cadence, holds the latest two snapshots for rate calculation, and tracks
-// which page is active plus any per-page cursor state.
+// Model is the Bubble Tea state machine. It polls the Source once a second,
+// keeps the latest snapshot for the next rate sample, and tracks which page
+// is active plus any per-page cursor state.
 type Model struct {
 	src  *Source
 	page Page
 
-	// last two snapshots for delta computation
-	prev *Snapshot
-	cur  *Snapshot
+	cur *Snapshot
 
 	// UI state
 	width, height int
@@ -44,21 +42,23 @@ type Model struct {
 	tcpHist       []float64
 	udpHist       []float64
 	icmpHist      []float64
-	statefulTCPHist []float64
-	statefulUDPHist []float64
+	udpFlowHist   []float64
 
 	// startup metadata
 	agentStartedAt   time.Time
 	sessionStartedAt time.Time
-	nodeID    string
-	iface     string
-	xdpMode   string
-	version   string
-	updateChannel string
-	updateState   string // checking | up-to-date | update-available | n/a | error
-	updateLatest  string
-	updateHint    string
-	errMsg    string // non-fatal error from the last tick
+	nodeID           string
+	iface            string
+	xdpMode          string
+	version          string
+	updateChannel    string
+	updateState      string // checking | up-to-date | update-available | n/a | error
+	updateLatest     string
+	updateHint       string
+	errMsg           string // non-fatal error from the last tick
+	reading          bool   // a source read is already in flight
+	beat             bool   // banner glyph, flipped once per tick
+	viewCache        string // last frame; dropped on every Update so a tick still redraws
 
 	// bypassCheck reports whether the XDP filter is currently NOT attached
 	// (emergency bypass on, or agent detached). Re-run every tick so the
@@ -76,24 +76,23 @@ func NewModel(
 	bypassCheck func() bool,
 ) *Model {
 	return &Model{
-		src:       src,
-		page:      PageOverview,
+		src:              src,
+		page:             PageOverview,
 		agentStartedAt:   agentStartedAt,
 		sessionStartedAt: time.Now(),
-		nodeID:    nodeID,
-		iface:     iface,
-		xdpMode:   xdpMode,
-		version:   version,
-		updateChannel: updateChannel,
-		bypassCheck:   bypassCheck,
-		updateState:   "checking",
-		ppsHist:   make([]float64, 0, 120),
-		dpsHist:   make([]float64, 0, 120),
-		tcpHist:   make([]float64, 0, 120),
-		udpHist:   make([]float64, 0, 120),
-		icmpHist:  make([]float64, 0, 120),
-		statefulTCPHist: make([]float64, 0, 120),
-		statefulUDPHist: make([]float64, 0, 120),
+		nodeID:           nodeID,
+		iface:            iface,
+		xdpMode:          xdpMode,
+		version:          version,
+		updateChannel:    updateChannel,
+		bypassCheck:      bypassCheck,
+		updateState:      "checking",
+		ppsHist:          make([]float64, 0, 120),
+		dpsHist:          make([]float64, 0, 120),
+		tcpHist:          make([]float64, 0, 120),
+		udpHist:          make([]float64, 0, 120),
+		icmpHist:         make([]float64, 0, 120),
+		udpFlowHist:      make([]float64, 0, 120),
 	}
 }
 
@@ -106,13 +105,6 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-// readMsg carries the latest Snapshot from the background read goroutine.
-// (Currently Read is fast enough to do on the main tick.)
-type readMsg struct {
-	snap Snapshot
-	err  error
-}
-
 type updateCheckMsg struct {
 	state  string
 	latest string
@@ -120,6 +112,7 @@ type updateCheckMsg struct {
 }
 
 func (m *Model) Init() tea.Cmd {
+	m.reading = true
 	return tea.Batch(
 		tickCmd(),
 		m.doRead(),
@@ -140,11 +133,50 @@ func (m *Model) doBypassCheck() tea.Cmd {
 	}
 }
 
-func (m *Model) doRead() tea.Cmd {
-	return func() tea.Msg {
-		snap, err := m.src.Read(m.prev)
-		return readMsg{snap: snap, err: err}
+// readMsg carries the latest Snapshot from the background read goroutine.
+type readMsg struct {
+	snap  Snapshot
+	err   error
+	limit int // per-IP limit this read used; < 0 means the walk was skipped
+}
+
+// perIPLimit is how many per-IP rows the current page needs.
+// Negative skips the map walk. Zero keeps every row for scrolling.
+func (m *Model) perIPLimit() int {
+	switch m.page {
+	case PageOverview:
+		return 5
+	case PageTopN:
+		return 0
+	default:
+		return -1
 	}
+}
+
+func (m *Model) doRead() tea.Cmd {
+	limit := m.perIPLimit()
+	var base Snapshot
+	hasBase := m.cur != nil
+	if hasBase {
+		base = *m.cur
+		base.Top = nil
+	}
+	return func() tea.Msg {
+		var p *Snapshot
+		if hasBase {
+			p = &base
+		}
+		snap, err := m.src.Read(p, limit)
+		return readMsg{snap: snap, err: err, limit: limit}
+	}
+}
+
+func (m *Model) kickRead() tea.Cmd {
+	if m.paused || m.reading {
+		return nil
+	}
+	m.reading = true
+	return m.doRead()
 }
 
 func (m *Model) doUpdateCheck() tea.Cmd {
@@ -155,6 +187,7 @@ func (m *Model) doUpdateCheck() tea.Cmd {
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	m.viewCache = ""
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -168,35 +201,39 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.paused {
 			return m, tickCmd()
 		}
-		return m, tea.Batch(tickCmd(), m.doRead(), m.doBypassCheck())
+		m.beat = !m.beat
+		if m.reading {
+			return m, tea.Batch(tickCmd(), m.doBypassCheck())
+		}
+		m.reading = true
+		return m, tea.Batch(tickCmd(), m.doBypassCheck(), m.doRead())
 
 	case bypassMsg:
 		m.bypassed = bool(msg)
 		return m, nil
 
 	case readMsg:
+		m.reading = false
 		if msg.err != nil {
 			m.errMsg = msg.err.Error()
-			return m, nil
+			return m, m.followRead(msg.limit)
 		}
 		m.errMsg = ""
-		// Promote current to prev, keep a copy of the new snapshot so
-		// rate math is correct on the next tick.
-		if m.cur != nil {
-			p := *m.cur
-			m.prev = &p
-		}
 		s := msg.snap
+		// A page that does not list sources keeps the rows already on screen
+		// so switching back does not flash empty for a frame.
+		if msg.limit < 0 && m.cur != nil {
+			s.Top = m.cur.Top
+		}
 		m.cur = &s
 		m.pushHistory(s)
-		// Clamp top cursor after data changes.
-		if m.cur != nil && m.topCursor >= len(m.cur.Top) {
+		if m.topCursor >= len(m.cur.Top) {
 			m.topCursor = len(m.cur.Top) - 1
 			if m.topCursor < 0 {
 				m.topCursor = 0
 			}
 		}
-		return m, nil
+		return m, m.followRead(msg.limit)
 
 	case updateCheckMsg:
 		m.updateState = msg.state
@@ -207,23 +244,41 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// followRead starts another read when the one that just finished was for
+// a different page than the one now on screen.
+func (m *Model) followRead(limit int) tea.Cmd {
+	if m.paused || limit == m.perIPLimit() {
+		return nil
+	}
+	m.reading = true
+	return m.doRead()
+}
+
+func (m *Model) switchPage(p Page) (tea.Model, tea.Cmd) {
+	if m.page == p {
+		return m, nil
+	}
+	m.page = p
+	return m, m.kickRead()
+}
+
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 
 	case "1":
-		m.page = PageOverview
+		return m.switchPage(PageOverview)
 	case "2":
-		m.page = PageDetail
+		return m.switchPage(PageDetail)
 	case "3":
-		m.page = PageTopN
+		return m.switchPage(PageTopN)
 	case "4":
-		m.page = PageCharts
+		return m.switchPage(PageCharts)
 	case "tab":
-		m.page = (m.page + 1) % pageCount
+		return m.switchPage((m.page + 1) % pageCount)
 	case "shift+tab":
-		m.page = (m.page + pageCount - 1) % pageCount
+		return m.switchPage((m.page + pageCount - 1) % pageCount)
 
 	case "p":
 		m.paused = !m.paused
@@ -257,8 +312,7 @@ func (m *Model) pushHistory(s Snapshot) {
 	m.tcpHist = pushSeries(m.tcpHist, s.PpsTCP, 120)
 	m.udpHist = pushSeries(m.udpHist, s.PpsUDP, 120)
 	m.icmpHist = pushSeries(m.icmpHist, s.PpsICMP, 120)
-	m.statefulTCPHist = pushSeries(m.statefulTCPHist, s.PpsStatefulTCP, 120)
-	m.statefulUDPHist = pushSeries(m.statefulUDPHist, s.PpsStatefulUDP, 120)
+	m.udpFlowHist = pushSeries(m.udpFlowHist, s.PpsUDPFlow, 120)
 }
 
 func pushSeries(series []float64, v float64, max int) []float64 {
@@ -273,9 +327,10 @@ func pushSeries(series []float64, v float64, max int) []float64 {
 	return series
 }
 
-// uptime prefers agent runtime (from systemd ActiveEnterTimestampUSec as
-// provided by cmd/kekkai status). If unavailable, fall back to TUI session
-// time so non-systemd/manual runs still show a useful counter.
+// uptime prefers agent runtime. cmd/kekkai status derives it from systemd's
+// ActiveEnterTimestampMonotonic plus /proc/uptime (there is no realtime
+// USec property). If unavailable, fall back to TUI session time so
+// non-systemd/manual runs still show a useful counter.
 func (m *Model) uptime() string {
 	startAt := m.agentStartedAt
 	if startAt.IsZero() {
@@ -285,7 +340,7 @@ func (m *Model) uptime() string {
 	if d < 0 {
 		d = 0
 	}
-	return fmt.Sprintf("%s", d)
+	return d.String()
 }
 
 func checkUpdateStatus(channel, current string) (state, latest, hint string) {
@@ -370,4 +425,3 @@ func fetchLatestReleaseTag(channel string) (string, error) {
 	}
 	return "", fmt.Errorf("no pre-release found")
 }
-

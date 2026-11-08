@@ -137,6 +137,15 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      # Adversarial data-plane suite: loads the real object (verifier) and
+      # drives crafted packets through BPF_PROG_TEST_RUN. Needs root, so it
+      # runs once, on the runner's native arch.
+      - name: Run eBPF data-plane tests (root)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          go test -c -tags bpftest -o "$RUNNER_TEMP/loader.test" ./internal/loader
+          sudo KEKKAI_BPF_REQUIRE=1 "$RUNNER_TEMP/loader.test" -test.v -test.count=1
+
       - name: Build binaries
         env:
           GOOS: ${{ matrix.goos }}
@@ -284,6 +293,42 @@ jobs:
           with open("release-notes.md", "w", encoding="utf-8") as f:
               f.write("\n".join(lines))
           PY
+
+      - name: Add release assets and SHA256SUMS
+        run: |
+          cp kekkai.sh dist/kekkai.sh
+          cp contrib/motd/98-kekkai dist/kekkai-motd
+          cp contrib/completions/_kekkai dist/_kekkai
+          cp contrib/completions/kekkai.bash dist/kekkai.bash
+          cp deploy/systemd/kekkai-agent.service dist/kekkai-agent.service
+          cd dist
+          shopt -s nullglob
+          # kekkai-* also matches kekkai-motd and kekkai-agent.service.
+          bins=()
+          for f in kekkai-*; do
+            case "$f" in
+              kekkai-motd|kekkai-agent.service) continue ;;
+              *) bins+=("$f") ;;
+            esac
+          done
+          if [[ ${#bins[@]} -eq 0 ]]; then
+            echo "no release binaries in dist/" >&2
+            exit 1
+          fi
+          extras=(kekkai.sh kekkai-motd _kekkai kekkai.bash kekkai-agent.service)
+          for f in "${extras[@]}"; do
+            if [[ ! -f "$f" ]]; then
+              echo "missing dist/${f}" >&2
+              exit 1
+            fi
+          done
+          # sha256sum format, file names only (no dist/ prefix).
+          # SHA256SUMS itself is not included.
+          sha256sum "${extras[@]}" "${bins[@]}" > SHA256SUMS
+          if grep -q '/' SHA256SUMS; then
+            echo "SHA256SUMS contains a directory prefix" >&2
+            exit 1
+          fi
 
       # `commit: github.sha` pins the release + tag to the exact commit
       # that triggered this workflow. Without it, ncipollo/release-action

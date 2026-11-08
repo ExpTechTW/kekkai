@@ -13,6 +13,9 @@
 #   --no-install  skip apt dependency install
 #   --iface NAME  force a specific interface in the default config
 #   --run         launch the agent in foreground at the end (debugging)
+#   --force       update: pick the newest tag across release and pre-release
+#   --local       dev only: motd, completions, and the systemd unit come from
+#                 this checkout instead of the verified release assets
 #
 # Update model: kekkai is distributed as prebuilt GitHub release binaries.
 # `update.channel` may be `release` (default) or `pre-release`. There is no
@@ -23,8 +26,10 @@
 # because on Debian/Ubuntu/Pi OS the kernel sysctl
 # `kernel.unprivileged_bpf_disabled` blocks non-root bpf() regardless of caps.
 # The installer writes a sudoers drop-in (/etc/sudoers.d/kekkai-cli-<user>)
-# so `sudo kekkai ...` won't prompt for a password. No shell alias is added —
-# users should type literal `sudo kekkai` to build portable muscle memory.
+# granting NOPASSWD only for the safe subcommands (status, doctor, ports,
+# version, check, show, reload, bypass, config) and for
+# `sudoedit /etc/kekkai/kekkai.yaml`. update, reset, and backup still prompt.
+# No shell alias is added — users should type literal `sudo kekkai`.
 #
 # Auto-detect logic (no subcommand):
 #   - no binaries yet            → install
@@ -34,10 +39,30 @@
 #
 set -euo pipefail
 
+# Temp files created while root must not use a predictable /tmp name.
+# track_tmp remembers them and cleanup_tracked_tmp removes them on exit,
+# including when die() aborts the script.
+_KEKKAI_TMP=()
+track_tmp() {
+  _KEKKAI_TMP+=("$1")
+}
+cleanup_tracked_tmp() {
+  local p
+  [[ ${#_KEKKAI_TMP[@]} -eq 0 ]] && return 0
+  for p in "${_KEKKAI_TMP[@]}"; do
+    [[ -n "$p" && "$p" != "/" ]] || continue
+    rm -rf -- "$p" || true
+  done
+}
+trap cleanup_tracked_tmp EXIT
+
 # ROOT resolution:
 # - normal: directory containing kekkai.sh on disk (/usr/local/bin or dev dir)
 # - raw mode (`bash <(curl ...)`): fallback to ~/kekkai (or $KEKKAI_REPO)
 #   because $0 becomes /dev/fd/* and is not a writable project directory.
+# resolve_root prints a directory, or "-" when the caller (the main shell,
+# not this command substitution) must create a private temp dir. track_tmp
+# inside this function would be lost: ROOT="$(resolve_root)" is a subshell.
 resolve_root() {
   if [[ -n "${KEKKAI_REPO:-}" ]]; then
     mkdir -p "$KEKKAI_REPO"
@@ -49,34 +74,38 @@ resolve_root() {
   script_dir="$(cd "$(dirname "$0")" && pwd)"
 
   if [[ "$script_dir" == /dev/fd* ]] || [[ "$script_dir" == /proc/*/fd* ]]; then
-    local fallback="${HOME:-/tmp}/kekkai"
-    mkdir -p "$fallback"
-    (cd "$fallback" && pwd)
+    if [[ -n "${HOME:-}" ]]; then
+      mkdir -p "${HOME}/kekkai"
+      (cd "${HOME}/kekkai" && pwd)
+      return
+    fi
+    # No home directory. "-" is not a path `pwd` can print.
+    printf '%s\n' "-"
     return
   fi
 
-  echo "$script_dir"
+  printf '%s\n' "$script_dir"
 }
 
-ROOT="$(resolve_root)"
-cd "$ROOT"
-
-# Ensure a reusable local script copy exists for `kekkai update`.
-# This is critical when running via process substitution:
-#   bash <(curl -fsSL .../kekkai.sh)
-# where $0 is /dev/fd/* and no on-disk kekkai.sh exists by default.
-persist_self_script() {
-  local target="$ROOT/kekkai.sh"
-  if [[ -f "$target" ]] && [[ -s "$target" ]]; then
-    return 0
+# establish_root runs in the main shell so the no-home temp dir is tracked.
+establish_root() {
+  local resolved
+  resolved="$(resolve_root)"
+  if [[ "$resolved" == "-" ]]; then
+    resolved="$(mktemp -d)"
+    track_tmp "$resolved"
   fi
-  if [[ -r "$0" ]]; then
-    cat "$0" > "$target" 2>/dev/null || true
-    chmod +x "$target" 2>/dev/null || true
+  if [[ -z "$resolved" ]]; then
+    printf '%s\n' "could not resolve a working directory" >&2
+    exit 1
   fi
+  # curl | bash leaves ROOT as the caller's cwd, which may be "/" (cloud-init).
+  # That directory is not an install source; verified files stay in mktemp.
+  ROOT="$resolved"
+  cd "$ROOT"
 }
 
-persist_self_script
+establish_root
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -96,40 +125,19 @@ CONFIG_FILE="$CONFIG_DIR/kekkai.yaml"
 STATS_DIR=/var/run/kekkai
 BPFFS_DIR=/sys/fs/bpf/kekkai
 UNIT_NAME=kekkai-agent.service
-UNIT_SRC="$ROOT/deploy/systemd/kekkai-agent.service"
 UNIT_DST="/etc/systemd/system/$UNIT_NAME"
 SUDOERS_DIR=/etc/sudoers.d
 SUDOERS_FILE_PREFIX=kekkai-cli-
-LOCAL_AGENT_BIN="$ROOT/bin/kekkai-agent"
-LOCAL_CLI_BIN="$ROOT/bin/kekkai"
-BRANCH=main
 REPO_OWNER=ExpTechTW
 REPO_NAME=kekkai
 RELEASES_API_BASE="https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases"
-RAW_BASE="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME"
-
-# ---------------------------------------------------------------------------
-# CLI parsing
-# ---------------------------------------------------------------------------
-CMD=""
-DO_INSTALL_DEPS=1
-IFACE_OVERRIDE=""
-DO_RUN=0
-FORCE_UPDATE=0
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    install|update|repair|doctor|uninstall)
-      CMD="$1"; shift ;;
-    --no-install)  DO_INSTALL_DEPS=0; shift ;;
-    --iface)       IFACE_OVERRIDE="$2"; shift 2 ;;
-    --run)         DO_RUN=1; shift ;;
-    --force)       FORCE_UPDATE=1; shift ;;
-    -h|--help)
-      sed -n '2,23p' "$0"; exit 0 ;;
-    *) die "unknown argument: $1" ;;
-  esac
-done || true
+# Flat names published next to the binaries and listed in SHA256SUMS.
+ASSET_SUMS=SHA256SUMS
+ASSET_SCRIPT=kekkai.sh
+ASSET_MOTD=kekkai-motd
+ASSET_BASH_COMP=kekkai.bash
+ASSET_ZSH_COMP=_kekkai
+ASSET_UNIT=kekkai-agent.service
 
 # ---------------------------------------------------------------------------
 # Pretty output (sandstone colours; works in 16-colour terminals)
@@ -180,6 +188,85 @@ warn() { printf '%s[!]%s %s\n' "$C_WARN" "$C_RESET" "$*"; _kslog_append WARN "$*
 err()  { printf '%s[x]%s %s\n' "$C_ERR"  "$C_RESET" "$*" >&2; _kslog_append ERROR "$*"; }
 info() { printf '%s[·]%s %s\n' "$C_INFO" "$C_RESET" "$*"; _kslog_append INFO "$*"; }
 die()  { err "$*"; exit 1; }
+
+# safe_rm_rf refuses an empty path, which would otherwise become `rm -rf /`.
+safe_rm_rf() {
+  local p
+  for p in "$@"; do
+    if [[ -z "$p" || "$p" == "/" ]]; then
+      die "refusing to remove empty path or /"
+    fi
+    rm -rf -- "$p"
+  done
+}
+
+# Linux IFNAMSIZ is 16 including NUL. "." and ".." match the character
+# class but are path components, not interface names.
+validate_iface_name() {
+  local n="$1"
+  [[ "$n" == "." || "$n" == ".." ]] && return 1
+  [[ "$n" =~ ^[A-Za-z0-9._@:-]{1,15}$ ]] || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# CLI parsing
+# ---------------------------------------------------------------------------
+CMD=""
+DO_INSTALL_DEPS=1
+IFACE_OVERRIDE=""
+DO_RUN=0
+FORCE_UPDATE=0
+# --local is the only path that reads motd, completions, or the unit from
+# the working tree. The default is the checksum-verified release asset.
+USE_LOCAL=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    install|update|repair|doctor|uninstall)
+      CMD="$1"; shift ;;
+    --no-install)  DO_INSTALL_DEPS=0; shift ;;
+    --iface)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        die "--iface requires a name"
+      fi
+      IFACE_OVERRIDE="$2"; shift 2 ;;
+    --run)         DO_RUN=1; shift ;;
+    --force)       FORCE_UPDATE=1; shift ;;
+    --local)       USE_LOCAL=1; shift ;;
+    -h|--help)
+      cat <<'EOF'
+kekkai — one-script installer / updater / repair tool.
+
+Usage:
+  bash kekkai.sh               # auto-detect state and do the right thing
+  bash kekkai.sh install       # force first-time install
+  bash kekkai.sh update        # force update (pulls prebuilt release assets)
+  bash kekkai.sh repair        # force re-install of binaries + systemd unit
+  bash kekkai.sh doctor        # read-only health check (delegates to `kekkai doctor`)
+  bash kekkai.sh uninstall     # remove everything except config
+
+Flags (apply to any subcommand):
+  --no-install  skip apt dependency install
+  --iface NAME  force a specific interface in the default config
+  --run         launch the agent in foreground at the end (debugging)
+  --force       update: pick the newest tag across release and pre-release
+  --local       use the motd script, shell completions, and systemd unit from
+                this checkout instead of the verified release assets (dev only)
+  -h, --help    show this help
+
+Release assets are verified against SHA256SUMS before they are installed.
+A missing checksum file aborts the install.
+EOF
+      exit 0
+      ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+if [[ -n "$IFACE_OVERRIDE" ]] && ! validate_iface_name "$IFACE_OVERRIDE"; then
+  die "invalid interface name: $IFACE_OVERRIDE"
+fi
 
 banner() {
   printf '%s\n' "$C_TITLE"
@@ -260,10 +347,10 @@ detect_state() {
 # Dependency install
 # ---------------------------------------------------------------------------
 install_deps() {
-  [[ $DO_INSTALL_DEPS -eq 0 ]] && { info "skipping apt (--no-install)"; return; }
+  [[ $DO_INSTALL_DEPS -eq 0 ]] && { info "skipping apt (--no-install)"; return 0; }
   if ! command -v apt-get >/dev/null 2>&1; then
     warn "no apt-get; install clang/libbpf-dev/linux-headers manually"
-    return
+    return 0
   fi
   log "installing apt dependencies"
   $SUDO apt-get update -y
@@ -276,23 +363,6 @@ check_kernel() {
   log "kernel: $(uname -r)"
   [[ "$OS" == "linux" ]] || die "kekkai requires Linux"
   [[ "$ARCH" == "amd64" || "$ARCH" == "arm64" ]] || die "unsupported arch: $(uname -m)"
-
-  # kekkai REQUIRES kernel >= 6.6: TCX egress seeding is the only mechanism
-  # that lets TCP/UDP return traffic (DNS/NTP/connection replies) back through
-  # the filter — there is no stateless return fallback. Refuse to install on
-  # anything older rather than ship a box that can't receive replies.
-  local kver kmaj kmin
-  kver="$(uname -r)"
-  kmaj="${kver%%.*}"
-  kmin="${kver#*.}"; kmin="${kmin%%.*}"
-  if [[ "$kmaj" =~ ^[0-9]+$ && "$kmin" =~ ^[0-9]+$ ]]; then
-    if (( kmaj < 6 || (kmaj == 6 && kmin < 6) )); then
-      die "kekkai requires Linux kernel >= 6.6 (found $kver). TCX egress seeding is mandatory; upgrade the kernel and retry."
-    fi
-  else
-    die "could not parse kernel version '$kver'; kekkai requires >= 6.6"
-  fi
-
   if [[ ! -r /sys/kernel/btf/vmlinux ]]; then
     warn "/sys/kernel/btf/vmlinux not readable — OK, kekkai doesn't need BTF"
   fi
@@ -301,6 +371,7 @@ check_kernel() {
     $SUDO mount -t bpf bpf /sys/fs/bpf || warn "bpffs mount failed"
   fi
   $SUDO mkdir -p "$BPFFS_DIR"
+  return 0
 }
 
 detect_iface() {
@@ -369,14 +440,16 @@ resolve_update_channel() {
 prepare_binaries() {
   local channel
   channel="$(resolve_update_channel)"
-  fetch_release_binaries_to_root_bin "$channel"
+  REL_DOWNLOAD_DIR="$(mktemp -d)"
+  track_tmp "$REL_DOWNLOAD_DIR"
+  fetch_release_artifacts "$channel" "$REL_DOWNLOAD_DIR"
 }
 
 install_binaries_from() {
   local src_agent="$1"
   local src_cli="$2"
-  [[ -x "$src_agent" ]] || die "missing agent binary: $src_agent"
-  [[ -x "$src_cli" ]] || die "missing cli binary: $src_cli"
+  [[ -n "$src_agent" && -x "$src_agent" ]] || die "missing agent binary: $src_agent"
+  [[ -n "$src_cli" && -x "$src_cli" ]] || die "missing cli binary: $src_cli"
 
   # Rollback snapshot of the current daemon (update only — install has
   # nothing to roll back to).
@@ -392,77 +465,39 @@ install_binaries_from() {
 
   install_completions
   install_motd
+  return 0
 }
 
-# persist_script_for_updates puts a copy of kekkai.sh at /usr/local/bin/kekkai.sh
-# so future `sudo kekkai update` calls can find it via resolveUpdateScript().
-#
-# Three sources, in priority order:
-#   1. $ROOT/kekkai.sh (repo clone or persist_self_script() already worked)
-#   2. $0 itself, if it's a readable regular file (not /dev/fd/*)
-#   3. curl from the main branch on GitHub (last resort for one-shot
-#      `curl | bash` installs where $0 is /dev/fd/* and $ROOT is empty)
+# persist_script_for_updates installs the checksum-verified kekkai.sh from
+# the release currently being installed. It does not copy a local checkout
+# or curl the main branch — those are writable or unpinned. The bootstrap
+# `curl …/main/kekkai.sh | bash` still works: that process downloads the
+# release asset and installs that verified copy.
 persist_script_for_updates() {
   [[ "$OS" == "linux" ]] || return 0
-
-  local src=""
-  if [[ -f "$ROOT/kekkai.sh" ]] && [[ -s "$ROOT/kekkai.sh" ]]; then
-    src="$ROOT/kekkai.sh"
-  elif [[ -r "$0" ]] && [[ -f "$0" ]]; then
-    src="$0"
-  fi
-
-  # Skip self-copy: if $0 is already the installed script (common during
-  # `sudo kekkai update`, where kekkai delegates to /usr/local/bin/kekkai.sh),
-  # `install` would error with "same file". Treat that case as already persisted.
-  if [[ -n "$src" ]]; then
-    local src_real dst_real
-    src_real="$(readlink -f "$src" 2>/dev/null || echo "$src")"
-    dst_real="$(readlink -f "$SCRIPT_INSTALL_PATH" 2>/dev/null || echo "$SCRIPT_INSTALL_PATH")"
-    if [[ "$src_real" == "$dst_real" ]]; then
-      return 0
-    fi
-    $SUDO install -D -m 0755 "$src" "$SCRIPT_INSTALL_PATH"
-    log "installed: $SCRIPT_INSTALL_PATH (for future 'sudo kekkai update')"
-    return 0
-  fi
-
-  # Fallback: fetch from GitHub. Acceptable here because we're already
-  # mid-install from curl|bash — the user has implicitly trusted main.
-  if command -v curl >/dev/null 2>&1; then
-    local tmp
-    tmp="$(mktemp)"
-    if curl -fsSL "$RAW_BASE/$BRANCH/kekkai.sh" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
-      $SUDO install -D -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"
-      rm -f "$tmp"
-      log "installed: $SCRIPT_INSTALL_PATH (fetched from $BRANCH — for future 'sudo kekkai update')"
-      return 0
-    fi
-    rm -f "$tmp"
-  fi
-
-  warn "could not persist kekkai.sh to $SCRIPT_INSTALL_PATH — 'sudo kekkai update' will need KEKKAI_SCRIPT set"
+  [[ -n "${REL_NEW_SCRIPT:-}" && -s "$REL_NEW_SCRIPT" ]] \
+    || die "refusing to install kekkai.sh: no checksum-verified release asset"
+  $SUDO install -D -m 0755 "$REL_NEW_SCRIPT" "$SCRIPT_INSTALL_PATH"
+  log "installed: $SCRIPT_INSTALL_PATH (verified release asset)"
+  return 0
 }
 
-# fetch_or_copy_asset: stage a repo-tracked file at $1 (relative to $ROOT)
-# into a temp path. Prefers the on-disk copy; falls back to curl from
-# $RAW_BASE/$BRANCH/$1. Echoes the staged path on success, empty on failure.
-fetch_or_copy_asset() {
-  local rel="$1"
-  local local_src="$ROOT/$rel"
-  if [[ -f "$local_src" ]] && [[ -s "$local_src" ]]; then
-    echo "$local_src"
+# aux_source picks the checkout file only when --local was passed.
+# Otherwise it returns the checksum-verified release path (may be empty
+# when an older release did not publish that asset).
+aux_source() {
+  local local_path="$1"
+  local verified="${2:-}"
+  if (( USE_LOCAL )); then
+    if [[ -f "$local_path" ]]; then
+      printf '%s\n' "$local_path"
+    fi
     return 0
   fi
-  command -v curl >/dev/null 2>&1 || return 1
-  local tmp
-  tmp="$(mktemp)"
-  if curl -fsSL "$RAW_BASE/$BRANCH/$rel" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
-    echo "$tmp"
-    return 0
+  if [[ -n "$verified" && -f "$verified" ]]; then
+    printf '%s\n' "$verified"
   fi
-  rm -f "$tmp"
-  return 1
+  return 0
 }
 
 # install_completions drops the bash + zsh completion scripts into the
@@ -472,25 +507,22 @@ install_completions() {
   [[ "$OS" == "linux" ]] || return 0
 
   local bash_src zsh_src
-  bash_src="$(fetch_or_copy_asset contrib/completions/kekkai.bash)" || bash_src=""
-  zsh_src="$(fetch_or_copy_asset contrib/completions/_kekkai)"      || zsh_src=""
+  bash_src="$(aux_source "$ROOT/contrib/completions/kekkai.bash" "${REL_NEW_BASH_COMP:-}")"
+  zsh_src="$(aux_source "$ROOT/contrib/completions/_kekkai" "${REL_NEW_ZSH_COMP:-}")"
 
-  if [[ -n "$bash_src" ]] && [[ -d "$(dirname "$BASH_COMPLETION_DST")" ]]; then
+  if [[ -n "$bash_src" && -f "$bash_src" && -d "$(dirname "$BASH_COMPLETION_DST")" ]]; then
     $SUDO install -D -m 0644 "$bash_src" "$BASH_COMPLETION_DST"
     log "installed: $BASH_COMPLETION_DST"
   fi
-  if [[ -n "$zsh_src" ]] && [[ -d "$(dirname "$ZSH_COMPLETION_DST")" ]]; then
+  if [[ -n "$zsh_src" && -f "$zsh_src" && -d "$(dirname "$ZSH_COMPLETION_DST")" ]]; then
     $SUDO install -D -m 0644 "$zsh_src" "$ZSH_COMPLETION_DST"
     log "installed: $ZSH_COMPLETION_DST"
   fi
 
-  # Clean up any temp files fetch_or_copy_asset may have created.
-  [[ -n "$bash_src" && "$bash_src" != "$ROOT"* ]] && rm -f "$bash_src"
-  [[ -n "$zsh_src"  && "$zsh_src"  != "$ROOT"* ]] && rm -f "$zsh_src"
-
-  if [[ -z "$bash_src" ]] && [[ -z "$zsh_src" ]]; then
-    warn "shell completions not installed (no local or remote source)"
+  if [[ -z "$bash_src" && -z "$zsh_src" ]]; then
+    warn "shell completions not installed (no verified release asset)"
   fi
+  return 0
 }
 
 # install_motd drops the auto-update failure notice into
@@ -512,18 +544,33 @@ install_motd() {
   fi
 
   local motd_src
-  motd_src="$(fetch_or_copy_asset contrib/motd/98-kekkai)" || motd_src=""
-  if [[ -z "$motd_src" ]]; then
-    warn "motd script not installed (no local or remote source)"
+  motd_src="$(aux_source "$ROOT/contrib/motd/98-kekkai" "${REL_NEW_MOTD:-}")"
+  if [[ -z "$motd_src" || ! -f "$motd_src" ]]; then
+    warn "motd script not installed (no verified release asset)"
     return 0
   fi
   $SUDO install -D -m 0755 "$motd_src" "$MOTD_DST"
   log "installed: $MOTD_DST"
-  [[ "$motd_src" != "$ROOT"* ]] && rm -f "$motd_src"
+  return 0
 }
 
 install_binaries() {
-  install_binaries_from "$LOCAL_AGENT_BIN" "$LOCAL_CLI_BIN"
+  [[ -n "${REL_NEW_AGENT:-}" && -n "${REL_NEW_CLI:-}" ]] \
+    || die "no verified binaries to install"
+  install_binaries_from "$REL_NEW_AGENT" "$REL_NEW_CLI"
+  return 0
+}
+
+# cleanup_download_dir removes the private mktemp dir that held verified
+# artifacts. Best-effort: the EXIT trap retries if this is skipped.
+cleanup_download_dir() {
+  local d="${REL_DOWNLOAD_DIR:-}"
+  REL_DOWNLOAD_DIR=""
+  if [[ -z "$d" || "$d" == "/" || ! -d "$d" ]]; then
+    return 0
+  fi
+  rm -rf -- "$d" || true
+  return 0
 }
 
 read_cli_version() {
@@ -592,10 +639,8 @@ print_update_result() {
 }
 
 setup_passwordless_sudo() {
-  # Install a sudoers drop-in so `sudo kekkai ...` never prompts for a
-  # password. Intentionally NO shell alias — we want the literal `sudo`
-  # keystrokes so users build the right muscle memory across hosts where
-  # the alias may not exist.
+  # NOPASSWD covers safe subcommands only. No shell alias — users type
+  # literal `sudo kekkai` so the habit survives hosts without this drop-in.
   [[ "$OS" == "linux" ]] || return 0
 
   local target_user
@@ -637,7 +682,7 @@ setup_passwordless_sudo() {
     warn "you will be prompted for a password each time you run: sudo kekkai"
     return 0
   fi
-  info "sudo kekkai will no longer prompt for a password"
+  info "passwordless sudo enabled for safe subcommands; update/reset/backup still prompt"
 }
 
 install_config() {
@@ -677,14 +722,21 @@ install_config() {
 }
 
 install_systemd_unit() {
-  command -v systemctl >/dev/null 2>&1 || { warn "systemctl not found — skipping unit install"; return; }
+  command -v systemctl >/dev/null 2>&1 || { warn "systemctl not found — skipping unit install"; return 0; }
   log "installing systemd unit to $UNIT_DST"
-  if [[ -f "$UNIT_SRC" ]]; then
-    $SUDO install -D -m 0644 "$UNIT_SRC" "$UNIT_DST"
+  local unit_src
+  unit_src="$(aux_source "$ROOT/deploy/systemd/kekkai-agent.service" "${REL_NEW_UNIT:-}")"
+  if [[ -n "$unit_src" && -f "$unit_src" ]]; then
+    $SUDO install -D -m 0644 "$unit_src" "$UNIT_DST"
   else
-    warn "systemd unit template not found in $ROOT; using built-in fallback unit"
+    if (( USE_LOCAL )); then
+      warn "systemd unit not found in this checkout; using built-in fallback unit"
+    else
+      warn "release has no ${ASSET_UNIT} asset; using built-in fallback unit"
+    fi
     local tmp_unit
     tmp_unit="$(mktemp)"
+    track_tmp "$tmp_unit"
     cat > "$tmp_unit" <<'EOF'
 [Unit]
 Description=kekkai edge XDP firewall agent
@@ -723,10 +775,11 @@ EOF
     rm -f "$tmp_unit"
   fi
   $SUDO systemctl daemon-reload
+  return 0
 }
 
 enable_and_start() {
-  command -v systemctl >/dev/null 2>&1 || return
+  command -v systemctl >/dev/null 2>&1 || return 0
   if $SUDO systemctl is-enabled --quiet "$UNIT_NAME" 2>/dev/null; then
     log "unit already enabled"
   else
@@ -851,84 +904,106 @@ def best_asset(kind):
             best = a
     return best if best_s >= 8 else None
 
+def find_exact(name):
+    for a in assets:
+        if a.get("name") == name and a.get("browser_download_url"):
+            return a
+    return None
+
 agent = best_asset("kekkai-agent")
 cli = best_asset("kekkai")
+sums = find_exact("SHA256SUMS")
+script = find_exact("kekkai.sh")
 if agent is None or cli is None:
     raise SystemExit("release assets for kekkai-agent/kekkai not found for target os/arch")
+if sums is None or script is None:
+    raise SystemExit("release is missing SHA256SUMS or kekkai.sh; refusing to install unverified files")
 
+def url_of(name):
+    asset = find_exact(name)
+    if asset is None:
+        return ""
+    return asset["browser_download_url"]
+
+# One field per line. Lines 6-9 are blank when that release has no asset.
 print(release.get("tag_name", "unknown"))
 print(agent["browser_download_url"])
 print(cli["browser_download_url"])
+print(sums["browser_download_url"])
+print(script["browser_download_url"])
+print(url_of("kekkai-motd"))
+print(url_of("kekkai.bash"))
+print(url_of("_kekkai"))
+print(url_of("kekkai-agent.service"))
 ' "$channel" "$os" "$arch"
 }
 
-# verify_sha256 checks a downloaded asset against its sibling "<asset>.sha256"
-# in the same release. Returns:
-#   0 + log  on match
-#   0 + WARN on missing checksum (soft mode — does not block updates that
-#            predate checksum publishing; flip the `return 0` to `return 1`
-#            once every release is known to publish one)
-#   1        on mismatch (tampered / corrupted)
-# NOTE: a checksum hosted in the same release only stops transport corruption
-# and naive tampering — a full release-account compromise would replace both
-# the binary AND the checksum. Real supply-chain integrity needs a SIGNATURE
-# verified against a pinned public key (minisign/cosign); this is the floor.
-verify_sha256() {
-  local file="$1" asset_url="$2"
-  local sum_url="${asset_url%%\?*}.sha256"
-  local sum_tmp="$file.sha256"
-
-  if ! curl -fsSL --connect-timeout 10 "$sum_url" -o "$sum_tmp" 2>/dev/null \
-       || [[ ! -s "$sum_tmp" ]]; then
-    warn "no .sha256 published for $(basename "${asset_url%%\?*}") — integrity NOT verified"
-    warn "supply-chain risk: a poisoned release asset would be installed unchecked"
-    return 0
-  fi
-  local want got
-  want="$(awk '{print $1; exit}' "$sum_tmp")"
-  got="$(sha256sum "$file" | awk '{print $1}')"
-  if [[ -z "$want" || "$want" != "$got" ]]; then
-    err "sha256 MISMATCH for $(basename "$file") — refusing to install"
-    err "  expected: $want"
-    err "  got:      $got"
-    return 1
-  fi
-  log "sha256 verified: $(basename "$file")"
-  return 0
+# parsed_field reads line N (1-based) from select_release_assets output.
+parsed_field() {
+  local n="$1"
+  local text="$2"
+  printf '%s\n' "$text" | sed -n "${n}p"
 }
 
-download_release_binary() {
+# --retry-all-errors arrived in curl 7.71. Ubuntu 20.04 ships 7.68, and
+# passing the flag there makes every download fail.
+curl_has_retry_all_errors() {
+  if [[ -z "${CURL_RETRY_ALL_CHECKED:-}" ]]; then
+    CURL_RETRY_ALL_CHECKED=1
+    CURL_RETRY_ALL_ERRORS=0
+    if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+      CURL_RETRY_ALL_ERRORS=1
+    fi
+  fi
+  [[ "${CURL_RETRY_ALL_ERRORS}" == 1 ]]
+}
+
+# curl_fetch_to downloads url to dest. Non-zero on failure; it does not exit.
+curl_fetch_to() {
   local url="$1"
+  local dest="$2"
+  [[ -n "$url" ]] || return 1
+  local -a args=(-fL --retry 4 --retry-delay 1 --connect-timeout 10)
+  if curl_has_retry_all_errors; then
+    args+=(--retry-all-errors)
+  fi
+  curl "${args[@]}" "$url" -o "$dest"
+}
+
+download_asset_file() {
+  local url="$1"
+  local dest="$2"
+  [[ -n "$url" ]] || die "empty download url"
+  curl_fetch_to "$url" "$dest" || die "failed to download $(basename "$dest")"
+  [[ -s "$dest" ]] || die "download of $(basename "$dest") is empty; refusing to continue"
+}
+
+# stage_verified_binary unpacks an already-verified asset. Checksums are
+# checked by the caller before this runs, so the -h probe never executes
+# an unverified binary. Prints the staged path on stdout.
+stage_verified_binary() {
+  local archive="$1"
   local want_name="$2"
   local tmpdir="$3"
-  local archive="$tmpdir/$(basename "${url%%\?*}")"
-  [[ -n "$archive" ]] || die "invalid asset url: $url"
-
-  curl -fL --retry 4 --retry-delay 1 --retry-all-errors --connect-timeout 10 \
-    "$url" -o "$archive" || return 1
-
-  # Verify BEFORE extracting or executing anything from the artifact.
-  verify_sha256 "$archive" "$url" || return 1
-
   local out="$tmpdir/$want_name"
   case "$archive" in
     *.tar.gz|*.tgz)
       local ex="$tmpdir/extract-$want_name"
       mkdir -p "$ex"
-      tar -xzf "$archive" -C "$ex"
+      tar -xzf "$archive" -C "$ex" || return 1
       local found
       found="$(find "$ex" -type f -name "$want_name" -print -quit)"
-      [[ -n "$found" ]] || die "archive $(basename "$archive") missing $want_name"
+      [[ -n "$found" ]] || { err "archive $(basename "$archive") missing $want_name"; return 1; }
       cp "$found" "$out"
       ;;
     *.zip)
-      command -v unzip >/dev/null 2>&1 || die "unzip not found (required for zip release assets)"
+      command -v unzip >/dev/null 2>&1 || { err "unzip not found (required for zip release assets)"; return 1; }
       local ex="$tmpdir/extract-$want_name"
       mkdir -p "$ex"
-      unzip -q "$archive" -d "$ex"
+      unzip -q "$archive" -d "$ex" || return 1
       local found
       found="$(find "$ex" -type f -name "$want_name" -print -quit)"
-      [[ -n "$found" ]] || die "archive $(basename "$archive") missing $want_name"
+      [[ -n "$found" ]] || { err "archive $(basename "$archive") missing $want_name"; return 1; }
       cp "$found" "$out"
       ;;
     *)
@@ -946,45 +1021,172 @@ download_release_binary() {
       return 1
     fi
   }
-  echo "$out"
+  printf '%s\n' "$out"
 }
 
 require_release_tools() {
   command -v curl    >/dev/null 2>&1 || die "curl not found"
   command -v python3 >/dev/null 2>&1 || die "python3 not found (required for release metadata parsing)"
+  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    die "sha256sum or shasum is required to verify release assets"
+  fi
+}
+
+# file_sha256 prints the hex digest. sha256sum is preferred; shasum -a 256
+# covers hosts (notably macOS) that do not ship sha256sum.
+file_sha256() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print tolower($1)}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" | awk '{print tolower($1)}'
+    return
+  fi
+  return 127
+}
+
+# verify_sha256_file returns 0 only when `name` in sums matches the file.
+# Callers abort; there is no fallback to an unverified install.
+verify_sha256_file() {
+  local file="$1" sums="$2" name="$3"
+  [[ -f "$sums" && -s "$sums" ]] || { err "SHA256SUMS is missing or empty"; return 1; }
+  [[ -f "$file" ]] || { err "missing ${name}"; return 1; }
+  local expect actual
+  # length() instead of {64}: mawk 1.3.3/1.3.4 (Debian/Ubuntu/Raspbian)
+  # does not implement awk interval expressions. Strip CR so a CRLF
+  # checksum file still matches.
+  expect="$(awk -v name="$name" '
+    {
+      gsub(/\r/, "")
+    }
+    length($1) == 64 && $1 !~ /[^0-9A-Fa-f]/ {
+      fn = $2
+      sub(/^\*/, "", fn)
+      if (fn == name) { print tolower($1); exit }
+    }
+  ' "$sums")" || { err "failed to read SHA256SUMS"; return 1; }
+  [[ -n "$expect" ]] || { err "SHA256SUMS has no entry for ${name}"; return 1; }
+  actual="$(file_sha256 "$file")" || { err "sha256sum/shasum failed while verifying ${name}"; return 1; }
+  [[ -n "$actual" ]] || { err "could not hash ${name}; install sha256sum or shasum"; return 1; }
+  if [[ "$actual" != "$expect" ]]; then
+    err "checksum mismatch for ${name}"
+    return 1
+  fi
+  log "checksum ok: $name"
+  return 0
+}
+
+# keep_verified_script copies a verified kekkai.sh out of the download
+# directory so later cleanup of that directory cannot delete it.
+keep_verified_script() {
+  local src="$1"
+  local dest
+  dest="$(mktemp)"
+  track_tmp "$dest"
+  cp "$src" "$dest"
+  chmod 0755 "$dest"
+  REL_NEW_SCRIPT="$dest"
+}
+
+reset_release_artifacts() {
+  REL_TAG=""
+  REL_NEW_AGENT=""
+  REL_NEW_CLI=""
+  REL_NEW_SCRIPT=""
+  REL_NEW_MOTD=""
+  REL_NEW_BASH_COMP=""
+  REL_NEW_ZSH_COMP=""
+  REL_NEW_UNIT=""
+}
+
+# load_verified_aux downloads one optional release file and verifies it.
+# An empty URL means this release does not publish the asset: the dest
+# variable is cleared and the function returns 0. A download or checksum
+# failure returns 1. Nothing is left executable until the caller checks.
+load_verified_aux() {
+  local url="$1" sums="$2" name="$3" dest="$4" varname="$5"
+  printf -v "$varname" '%s' ""
+  [[ -n "$url" ]] || return 0
+  if ! curl_fetch_to "$url" "$dest" || [[ ! -s "$dest" ]]; then
+    err "failed to download ${name}"
+    return 1
+  fi
+  verify_sha256_file "$dest" "$sums" "$name" || return 1
+  printf -v "$varname" '%s' "$dest"
+  return 0
 }
 
 # fetch_release_artifacts: shared release fetch/parse/download.
 # Inputs:  channel, tmpdir
-# Outputs (via globals): REL_TAG, REL_NEW_AGENT, REL_NEW_CLI
+# Outputs (via globals): REL_TAG, REL_NEW_AGENT, REL_NEW_CLI, REL_NEW_SCRIPT,
+#   and when the release publishes them: REL_NEW_MOTD, REL_NEW_BASH_COMP,
+#   REL_NEW_ZSH_COMP, REL_NEW_UNIT.
 #
-# Using globals keeps the caller simple (vs. parsing stdout). A trailing
-# `unset` in each caller is unnecessary — install is a one-shot script.
+# Every downloaded file is checksum-verified against that release's
+# SHA256SUMS before anything is executed or installed. A missing sums
+# file or a mismatch aborts; there is no unverified fallback.
 fetch_release_artifacts() {
   local channel="$1"
   local tmpdir="$2"
 
   require_release_tools
+  reset_release_artifacts
 
   local meta parsed
   meta="$(fetch_release_metadata "$channel")" || die "failed to fetch GitHub release metadata"
   parsed="$(printf '%s' "$meta" | select_release_assets "$channel" "$OS" "$ARCH")" \
-    || die "failed to resolve release assets for $OS/$ARCH"
+    || die "failed to resolve release assets for $OS/$ARCH (SHA256SUMS and kekkai.sh are required)"
 
-  REL_TAG="$(printf '%s\n' "$parsed" | sed -n '1p')"
-  local agent_url cli_url
-  agent_url="$(printf '%s\n' "$parsed" | sed -n '2p')"
-  cli_url="$(printf '%s\n' "$parsed"   | sed -n '3p')"
-  [[ -n "$agent_url" && -n "$cli_url" ]] || die "release metadata incomplete"
+  REL_TAG="$(parsed_field 1 "$parsed")"
+  local agent_url cli_url sums_url script_url
+  local motd_url bash_url zsh_url unit_url
+  agent_url="$(parsed_field 2 "$parsed")"
+  cli_url="$(parsed_field 3 "$parsed")"
+  sums_url="$(parsed_field 4 "$parsed")"
+  script_url="$(parsed_field 5 "$parsed")"
+  motd_url="$(parsed_field 6 "$parsed")"
+  bash_url="$(parsed_field 7 "$parsed")"
+  zsh_url="$(parsed_field 8 "$parsed")"
+  unit_url="$(parsed_field 9 "$parsed")"
+  [[ -n "$agent_url" && -n "$cli_url" && -n "$sums_url" && -n "$script_url" ]] \
+    || die "release metadata is incomplete (need binaries, SHA256SUMS, and kekkai.sh); refusing to install"
 
   log "selected release: $REL_TAG ($channel)"
   info "agent asset: $(basename "${agent_url%%\?*}")"
   info "cli asset:   $(basename "${cli_url%%\?*}")"
 
-  REL_NEW_AGENT="$(download_release_binary "$agent_url" "kekkai-agent" "$tmpdir")" \
-    || die "failed to download/verify kekkai-agent binary"
-  REL_NEW_CLI="$(download_release_binary "$cli_url" "kekkai" "$tmpdir")" \
-    || die "failed to download/verify kekkai binary"
+  local sums="$tmpdir/$ASSET_SUMS"
+  local script="$tmpdir/$ASSET_SCRIPT"
+  local agent_dl="$tmpdir/$(basename "${agent_url%%\?*}")"
+  local cli_dl="$tmpdir/$(basename "${cli_url%%\?*}")"
+  download_asset_file "$sums_url" "$sums"
+  download_asset_file "$script_url" "$script"
+  download_asset_file "$agent_url" "$agent_dl"
+  download_asset_file "$cli_url" "$cli_dl"
+
+  # Verify every download before chmod +x or executing a binary.
+  verify_sha256_file "$agent_dl" "$sums" "$(basename "$agent_dl")" \
+    || die "refusing to install unverified kekkai-agent"
+  verify_sha256_file "$cli_dl" "$sums" "$(basename "$cli_dl")" \
+    || die "refusing to install unverified kekkai"
+  verify_sha256_file "$script" "$sums" "$ASSET_SCRIPT" \
+    || die "refusing to install unverified kekkai.sh"
+  load_verified_aux "$motd_url" "$sums" "$ASSET_MOTD" "$tmpdir/$ASSET_MOTD" REL_NEW_MOTD \
+    || die "refusing to install unverified ${ASSET_MOTD}"
+  load_verified_aux "$bash_url" "$sums" "$ASSET_BASH_COMP" "$tmpdir/$ASSET_BASH_COMP" REL_NEW_BASH_COMP \
+    || die "refusing to install unverified ${ASSET_BASH_COMP}"
+  load_verified_aux "$zsh_url" "$sums" "$ASSET_ZSH_COMP" "$tmpdir/$ASSET_ZSH_COMP" REL_NEW_ZSH_COMP \
+    || die "refusing to install unverified ${ASSET_ZSH_COMP}"
+  load_verified_aux "$unit_url" "$sums" "$ASSET_UNIT" "$tmpdir/$ASSET_UNIT" REL_NEW_UNIT \
+    || die "refusing to install unverified ${ASSET_UNIT}"
+
+  REL_NEW_AGENT="$(stage_verified_binary "$agent_dl" "kekkai-agent" "$tmpdir")" \
+    || die "failed to prepare kekkai-agent after checksum verification"
+  REL_NEW_CLI="$(stage_verified_binary "$cli_dl" "kekkai" "$tmpdir")" \
+    || die "failed to prepare kekkai after checksum verification"
+  keep_verified_script "$script"
 }
 
 # files_match: 0 (true) if both files exist and have identical sha256.
@@ -992,9 +1194,9 @@ files_match() {
   local a="$1" b="$2"
   [[ -f "$a" && -f "$b" ]] || return 1
   local a_sha b_sha
-  a_sha="$(sha256sum "$a" | awk '{print $1}')"
-  b_sha="$(sha256sum "$b" | awk '{print $1}')"
-  [[ "$a_sha" == "$b_sha" ]]
+  a_sha="$(file_sha256 "$a")" || return 1
+  b_sha="$(file_sha256 "$b")" || return 1
+  [[ -n "$a_sha" && "$a_sha" == "$b_sha" ]]
 }
 
 # agent_unchanged / cli_unchanged: 0 (true) if the candidate binary matches
@@ -1023,16 +1225,6 @@ version_is_newer() {
   [[ "$top" == "$candidate" ]]
 }
 
-# sync_script_from_remote: fetch the latest kekkai.sh from $RAW_BASE and
-# compare with the currently installed /usr/local/bin/kekkai.sh.
-#
-# Exit codes:
-#   0   → remote content differs, installed copy was overwritten
-#   10  → remote matches installed copy (no-op)
-#   11  → fetch failed (network / curl missing) — caller should warn but not fail
-#
-# Kept separate from binary updates because the script can ship fixes that
-# have no corresponding binary release (this very patch is one such case).
 # use_staged_binaries reports whether /var/lib/kekkai/staged/ holds a
 # complete, strictly-newer release that release_update should consume
 # instead of fetching. Requirements:
@@ -1041,8 +1233,9 @@ version_is_newer() {
 #   - VERSION marker present and parseable
 #   - VERSION strictly newer than the currently installed CLI
 #
-# Conservative on failure (never trust half-staged state): any missing
-# piece → return 1, and release_update falls through to the fetch path.
+# The binaries are not executed here. release_update verifies them
+# against the release SHA256SUMS before any exec. A missing piece
+# returns 1 and release_update falls through to the fetch path.
 use_staged_binaries() {
   [[ -d "$STAGED_DIR" ]] || return 1
   [[ -s "$STAGED_DIR/kekkai-agent" && -s "$STAGED_DIR/kekkai" ]] || return 1
@@ -1063,30 +1256,142 @@ use_staged_binaries() {
   if ! version_is_newer "$staged_ver" "$installed_ver"; then
     return 1
   fi
-  # Also require the staged binaries to actually run — catches half-
-  # written files from an interrupted download.
-  "$STAGED_DIR/kekkai-agent" -check /dev/null >/dev/null 2>&1 || return 1
   return 0
 }
 
-sync_script_from_remote() {
+# install_verified_script copies the kekkai.sh that belongs to the release
+# being installed (REL_NEW_SCRIPT). It does not fetch the main branch.
+#
+# Exit codes:
+#   0   → installed copy was overwritten
+#   10  → installed copy already matches
+install_verified_script() {
   [[ "$OS" == "linux" ]] || return 10
-  command -v curl >/dev/null 2>&1 || return 11
-
-  local tmp
-  tmp="$(mktemp)"
-  if ! curl -fsSL "$RAW_BASE/$BRANCH/kekkai.sh" -o "$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then
-    rm -f "$tmp"
-    return 11
-  fi
-
-  if files_match "$SCRIPT_INSTALL_PATH" "$tmp"; then
-    rm -f "$tmp"
+  [[ -n "${REL_NEW_SCRIPT:-}" && -s "$REL_NEW_SCRIPT" ]] \
+    || die "refusing to install kekkai.sh without a checksum-verified release asset"
+  if [[ -f "$SCRIPT_INSTALL_PATH" ]] && files_match "$SCRIPT_INSTALL_PATH" "$REL_NEW_SCRIPT"; then
     return 10
   fi
+  $SUDO install -D -m 0755 "$REL_NEW_SCRIPT" "$SCRIPT_INSTALL_PATH"
+  return 0
+}
 
-  $SUDO install -D -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"
-  rm -f "$tmp"
+# fetch_release_by_tag loads one release object. '+' in the tag is
+# percent-encoded so it is not treated as a space. Returns non-zero on
+# HTTP errors so the staged path can fall back instead of aborting.
+fetch_release_by_tag() {
+  local tag="$1"
+  [[ -n "$tag" ]] || return 1
+  local enc="${tag//+/%2B}"
+  curl -fsSL -H "Accept: application/vnd.github+json" \
+    "$RELEASES_API_BASE/tags/${enc}"
+}
+
+clear_staged_dir() {
+  if [[ -z "${STAGED_DIR:-}" || "$STAGED_DIR" == "/" || ! -d "$STAGED_DIR" ]]; then
+    return 0
+  fi
+  $SUDO rm -f "$STAGED_DIR"/* 2>/dev/null || true
+  return 0
+}
+
+# verify_staged_copies checks private copies (not the live staged dir)
+# against the tag's SHA256SUMS. Returns 1 on tag 404, missing sums, or a
+# mismatch. The caller warns, clears the staged dir, and downloads.
+verify_staged_copies() {
+  local tag="$1"
+  local tmpdir="$2"
+  local meta parsed
+  if ! meta="$(fetch_release_by_tag "$tag" 2>/dev/null)"; then
+    warn "could not fetch release ${tag}; clearing ${STAGED_DIR} and downloading instead"
+    return 1
+  fi
+  # A tag URL returns one release object. Channel "release" keeps that
+  # object as-is (it does not require prerelease=false).
+  if ! parsed="$(printf '%s' "$meta" | select_release_assets release "$OS" "$ARCH" 2>/dev/null)"; then
+    warn "release ${tag} is missing SHA256SUMS or platform assets; clearing ${STAGED_DIR} and downloading instead"
+    return 1
+  fi
+
+  local sums_url script_url motd_url bash_url zsh_url unit_url
+  sums_url="$(parsed_field 4 "$parsed")"
+  script_url="$(parsed_field 5 "$parsed")"
+  motd_url="$(parsed_field 6 "$parsed")"
+  bash_url="$(parsed_field 7 "$parsed")"
+  zsh_url="$(parsed_field 8 "$parsed")"
+  unit_url="$(parsed_field 9 "$parsed")"
+  if [[ -z "$sums_url" || -z "$script_url" ]]; then
+    warn "release ${tag} is missing SHA256SUMS or kekkai.sh; clearing ${STAGED_DIR} and downloading instead"
+    return 1
+  fi
+
+  local sums="$tmpdir/$ASSET_SUMS"
+  local script="$tmpdir/$ASSET_SCRIPT"
+  if ! curl_fetch_to "$sums_url" "$sums" || [[ ! -s "$sums" ]]; then
+    warn "could not download SHA256SUMS for ${tag}; clearing ${STAGED_DIR} and downloading instead"
+    return 1
+  fi
+  if ! curl_fetch_to "$script_url" "$script" || [[ ! -s "$script" ]]; then
+    warn "could not download kekkai.sh for ${tag}; clearing ${STAGED_DIR} and downloading instead"
+    return 1
+  fi
+  if ! verify_sha256_file "$script" "$sums" "$ASSET_SCRIPT"; then
+    warn "kekkai.sh for ${tag} failed checksum verification; clearing ${STAGED_DIR} and downloading instead"
+    return 1
+  fi
+  if ! verify_sha256_file "$tmpdir/kekkai-agent" "$sums" "kekkai-agent-${OS}-${ARCH}"; then
+    warn "staged kekkai-agent failed checksum verification; clearing ${STAGED_DIR} and downloading instead"
+    return 1
+  fi
+  if ! verify_sha256_file "$tmpdir/kekkai" "$sums" "kekkai-${OS}-${ARCH}"; then
+    warn "staged kekkai failed checksum verification; clearing ${STAGED_DIR} and downloading instead"
+    return 1
+  fi
+  if ! load_verified_aux "$motd_url" "$sums" "$ASSET_MOTD" "$tmpdir/$ASSET_MOTD" REL_NEW_MOTD \
+    || ! load_verified_aux "$bash_url" "$sums" "$ASSET_BASH_COMP" "$tmpdir/$ASSET_BASH_COMP" REL_NEW_BASH_COMP \
+    || ! load_verified_aux "$zsh_url" "$sums" "$ASSET_ZSH_COMP" "$tmpdir/$ASSET_ZSH_COMP" REL_NEW_ZSH_COMP \
+    || ! load_verified_aux "$unit_url" "$sums" "$ASSET_UNIT" "$tmpdir/$ASSET_UNIT" REL_NEW_UNIT; then
+    warn "a release asset for ${tag} failed checksum verification; clearing ${STAGED_DIR} and downloading instead"
+    return 1
+  fi
+
+  keep_verified_script "$script"
+  REL_NEW_AGENT="$tmpdir/kekkai-agent"
+  REL_NEW_CLI="$tmpdir/kekkai"
+  REL_TAG="$tag"
+  REL_DOWNLOAD_DIR="$tmpdir"
+  return 0
+}
+
+# try_prepare_staged_release copies staged binaries into a private temp
+# dir, verifies those copies, and points REL_NEW_* at them. Any failure
+# clears the staged dir and returns 1 so the caller can download.
+try_prepare_staged_release() {
+  local tag tmpdir
+  tag="$(tr -d '[:space:]' < "$STAGED_DIR/VERSION" 2>/dev/null || true)"
+  if [[ -z "$tag" ]]; then
+    warn "staged VERSION is empty; clearing ${STAGED_DIR} and downloading instead"
+    reset_release_artifacts
+    clear_staged_dir
+    return 1
+  fi
+  tmpdir="$(mktemp -d)"
+  track_tmp "$tmpdir"
+  if ! cp -f "$STAGED_DIR/kekkai-agent" "$tmpdir/kekkai-agent" \
+    || ! cp -f "$STAGED_DIR/kekkai" "$tmpdir/kekkai"; then
+    warn "could not copy staged binaries; clearing ${STAGED_DIR} and downloading instead"
+    reset_release_artifacts
+    clear_staged_dir
+    rm -rf -- "$tmpdir" || true
+    return 1
+  fi
+  chmod 0755 "$tmpdir/kekkai-agent" "$tmpdir/kekkai" || true
+  if ! verify_staged_copies "$tag" "$tmpdir"; then
+    reset_release_artifacts
+    clear_staged_dir
+    rm -rf -- "$tmpdir" || true
+    return 1
+  fi
   return 0
 }
 
@@ -1103,21 +1408,30 @@ sync_script_from_remote() {
 # calls are OK cost-wise — both hit GitHub once each, and --force is a
 # one-shot operator action, not a tight loop.
 pick_max_channel_tag() {
-  local rel_meta prerel_meta rel_tag prerel_tag
+  # Initialize: bash 4.4+ leaves `local rel_tag` unset, and set -u aborts
+  # when one channel's lookup never assigns it.
+  local rel_meta="" prerel_meta="" rel_tag="" prerel_tag=""
   rel_meta="$(fetch_release_metadata release 2>/dev/null || true)"
   prerel_meta="$(fetch_release_metadata pre-release 2>/dev/null || true)"
 
+  # A release that is missing SHA256SUMS or kekkai.sh makes the selector
+  # exit non-zero. That channel is skipped; it must not abort --force.
   if [[ -n "$rel_meta" ]]; then
-    rel_tag="$(printf '%s' "$rel_meta" | select_release_assets release "$OS" "$ARCH" 2>/dev/null | sed -n '1p')"
+    rel_tag="$(printf '%s' "$rel_meta" | select_release_assets release "$OS" "$ARCH" 2>/dev/null | sed -n '1p' || true)"
   fi
   if [[ -n "$prerel_meta" ]]; then
-    prerel_tag="$(printf '%s' "$prerel_meta" | select_release_assets pre-release "$OS" "$ARCH" 2>/dev/null | sed -n '1p')"
+    prerel_tag="$(printf '%s' "$prerel_meta" | select_release_assets pre-release "$OS" "$ARCH" 2>/dev/null | sed -n '1p' || true)"
   fi
 
   # Strip leading v so sort -V compares cleanly.
   local rel_cmp="${rel_tag#v}" prerel_cmp="${prerel_tag#v}"
 
   if [[ -z "$rel_cmp" ]] && [[ -z "$prerel_cmp" ]]; then
+    if [[ -z "$rel_meta" && -z "$prerel_meta" ]]; then
+      echo "--force: could not fetch release metadata" >&2
+    else
+      echo "--force: neither channel has SHA256SUMS; refusing to install unverified files" >&2
+    fi
     return 1
   fi
   if [[ -z "$prerel_cmp" ]]; then
@@ -1150,8 +1464,15 @@ release_update() {
   # user always gets a genuine re-download — --force is a "give me
   # whatever is latest on GitHub right now, no caching" escape hatch.
   if (( force_flag )); then
-    local picked
-    picked="$(pick_max_channel_tag)" || die "--force: could not fetch release metadata"
+    local picked pick_rc=0 pick_err msg
+    pick_err="$(mktemp)"
+    track_tmp "$pick_err"
+    picked="$(pick_max_channel_tag 2>"$pick_err")" || pick_rc=$?
+    if (( pick_rc != 0 )); then
+      msg="$(head -n 1 "$pick_err" 2>/dev/null || true)"
+      [[ -n "$msg" ]] || msg="--force: could not fetch release metadata"
+      die "$msg"
+    fi
     [[ -n "$picked" ]] || die "--force: no release candidates found"
     channel="${picked%% *}"
     info "--force: cross-channel pick → channel=$channel tag=${picked#* }"
@@ -1163,16 +1484,21 @@ release_update() {
   # `sudo kekkai update` by hand just applies what's on disk.
   # --force always re-fetches so operators who suspect the staged copy
   # is broken can get a clean reinstall.
-  local tmpdir=""
+  #
+  # Staged files are copied into a private temp dir and verified there.
+  # Tag 404, a missing SHA256SUMS, or a mismatch warns, clears the staged
+  # dir, and falls through to fetch_release_artifacts.
+  local used_staged=0
   if (( force_flag == 0 )) && use_staged_binaries; then
-    REL_NEW_AGENT="$STAGED_DIR/kekkai-agent"
-    REL_NEW_CLI="$STAGED_DIR/kekkai"
-    REL_TAG="$(cat "$STAGED_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
-    [[ -n "$REL_TAG" ]] || REL_TAG="staged"
-    log "using staged binaries from $STAGED_DIR (tag=$REL_TAG)"
-  else
-    tmpdir="$(mktemp -d)"
-    fetch_release_artifacts "$channel" "$tmpdir"
+    if try_prepare_staged_release; then
+      used_staged=1
+      log "using staged binaries from $STAGED_DIR (tag=$REL_TAG)"
+    fi
+  fi
+  if (( used_staged == 0 )); then
+    REL_DOWNLOAD_DIR="$(mktemp -d)"
+    track_tmp "$REL_DOWNLOAD_DIR"
+    fetch_release_artifacts "$channel" "$REL_DOWNLOAD_DIR"
   fi
   local new_ver
   new_ver="$(read_cli_version "$REL_NEW_CLI")"
@@ -1183,9 +1509,7 @@ release_update() {
   # Downgrade guard: `kekkai update` must NEVER replace a newer binary with
   # an older one. Common footgun: user installs pre-release (build.9), then
   # forgets to set update.channel=pre-release in config, so the next update
-  # resolves to channel=release (build.4) and rolls them back. We refuse
-  # by pretending the binaries didn't change — kekkai.sh sync still runs
-  # (script fixes can legitimately ship between releases).
+  # resolves to channel=release (build.4) and rolls them back.
   #
   # --force bypasses this check by design (operator explicitly asked for
   # whatever is latest regardless of direction); a warning is still
@@ -1206,9 +1530,6 @@ release_update() {
   fi
 
   if (( downgrade_refused == 0 )); then
-    # Three-way diff: agent binary, CLI binary, and kekkai.sh itself.
-    # Any single one changing counts as "updated". kekkai.sh can ship
-    # fixes independent of a binary release, so we can't gate on agent alone.
     if ! agent_unchanged "$REL_NEW_AGENT"; then
       changed_parts+=("agent")
       need_restart=1
@@ -1225,48 +1546,42 @@ release_update() {
       $SUDO install -D -m 0755 "$REL_NEW_CLI" "$CLI_BIN"
       log "installed: $CLI_BIN"
       install_completions
+      install_motd
     fi
     # Consumed staged binaries — clear the staging dir so the next
     # auto-update tick starts from a clean slate and doctor's status
     # reflects the current installed version.
-    if [[ "$tmpdir" == "" ]] && [[ -d "$STAGED_DIR" ]]; then
-      $SUDO rm -f "$STAGED_DIR"/* 2>/dev/null || true
+    if (( used_staged == 1 )); then
+      clear_staged_dir
     fi
   fi
-  [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
 
-  # Script sync: independent of binary changes. Done after binaries
-  # because sync_script_from_remote may overwrite the script this very
-  # process is running — bash has already parsed our source, so this is
-  # safe as long as we don't source the file again afterward.
+  # Install the kekkai.sh that belongs to this release (already verified).
+  # A refused downgrade does not install that release's script either:
+  # the asset is the same release we just declined to put on disk.
+  # bash has already parsed this process, so replacing the on-disk script
+  # is safe as long as we don't source it again.
   #
-  # NOTE: `set -e` would kill us on the non-zero API returns (10/11) if we
-  # called this as a bare statement. The `|| script_rc=$?` idiom isolates
-  # the call from errexit so we can branch on the exit code ourselves.
-  local script_rc=0
-  sync_script_from_remote || script_rc=$?
-  case $script_rc in
-    0)  changed_parts+=("kekkai.sh") ;;
-    10) : ;; # already up-to-date
-    11) warn "could not fetch remote kekkai.sh (network?) — skipped script sync" ;;
-  esac
+  # NOTE: `set -e` would kill us on the non-zero "already matches" return
+  # (10) if we called this as a bare statement.
+  if (( downgrade_refused == 0 )); then
+    local script_rc=0
+    install_verified_script || script_rc=$?
+    case $script_rc in
+      0)  changed_parts+=("kekkai.sh") ;;
+      10) : ;; # already up-to-date
+      *) die "failed to install verified kekkai.sh (exit ${script_rc})" ;;
+    esac
+  fi
 
   if (( need_restart )); then
     setup_passwordless_sudo
     enable_and_start
   fi
 
-  # When a downgrade was refused, kekkai.sh may still have changed (script
-  # sync is orthogonal). Report based on what actually landed — but never
-  # show the `updated` version arrow pointing backwards, because `old_ver`
-  # is still the real installed version.
+  # A refused downgrade writes nothing. old_ver is still what is installed.
   if (( downgrade_refused )); then
-    local changed_str=""
-    if (( ${#changed_parts[@]} > 0 )); then
-      changed_str="${changed_parts[*]}"
-      changed_str="${changed_str// /, } (downgrade refused: $channel offered $new_ver)"
-    fi
-    print_update_result unchanged "$old_ver" "$old_ver" "$REL_TAG" "$channel" "$changed_str"
+    print_update_result unchanged "$old_ver" "$old_ver" "$REL_TAG" "$channel" ""
   elif (( ${#changed_parts[@]} == 0 )); then
     print_update_result unchanged "$old_ver" "$new_ver" "$REL_TAG" "$channel" ""
   else
@@ -1274,30 +1589,22 @@ release_update() {
     changed_str="${changed_str// /, }"
     print_update_result updated "$old_ver" "$new_ver" "$REL_TAG" "$channel" "$changed_str"
   fi
-}
-
-fetch_release_binaries_to_root_bin() {
-  local channel="$1"
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  fetch_release_artifacts "$channel" "$tmpdir"
-
-  mkdir -p "$ROOT/bin"
-  install -m 0755 "$REL_NEW_AGENT" "$LOCAL_AGENT_BIN"
-  install -m 0755 "$REL_NEW_CLI"   "$LOCAL_CLI_BIN"
-  rm -rf "$tmpdir"
+  cleanup_download_dir
+  return 0
 }
 
 validate_config_against_new_binary() {
-  local candidate_bin="${1:-$LOCAL_AGENT_BIN}"
+  local candidate_bin="${1:-}"
   [[ -f "$CONFIG_FILE" ]] || return 0
+  [[ -n "$candidate_bin" && -x "$candidate_bin" ]] || die "no verified binary to validate config against"
   log "validating $CONFIG_FILE against new binary"
 
   # mktemp gives us a per-run log file owned by whoever is executing
   # this function — avoids the "owned by root from a previous run"
   # permission denied footgun on a shared /tmp.
   local log_file
-  log_file="$(mktemp -t kekkai-check.XXXXXX)"
+  log_file="$(mktemp)"
+  track_tmp "$log_file"
   local rc=0
   if "$candidate_bin" -check "$CONFIG_FILE" >"$log_file" 2>&1; then
     rc=0
@@ -1338,20 +1645,25 @@ validate_config_against_new_binary() {
 }
 
 sync_user_config_to_canonical() {
-  local candidate_bin="${1:-$LOCAL_AGENT_BIN}"
+  local candidate_bin="${1:-}"
   [[ -f "$CONFIG_FILE" ]] || return 0
+  [[ -n "$candidate_bin" && -x "$candidate_bin" ]] || die "no verified binary to sync config against"
 
-  local tmp_show
-  tmp_show="$(mktemp -t kekkai-show.XXXXXX)"
+  local tmp_show show_log backup_log
+  tmp_show="$(mktemp)"
+  show_log="$(mktemp)"
+  backup_log="$(mktemp)"
+  track_tmp "$tmp_show"
+  track_tmp "$show_log"
+  track_tmp "$backup_log"
 
   # Render canonical config (with comments + defaulted fields) via the new
   # binary so newly introduced keys are written into /etc/kekkai/kekkai.yaml
   # after update.
-  if ! "$candidate_bin" -show -config "$CONFIG_FILE" >"$tmp_show" 2>/tmp/kekkai-show.log; then
-    rm -f "$tmp_show"
+  if ! "$candidate_bin" -show -config "$CONFIG_FILE" >"$tmp_show" 2>"$show_log"; then
     echo
     err "failed to render canonical config with new binary:"
-    sed 's/^/    /' /tmp/kekkai-show.log >&2 || true
+    sed 's/^/    /' "$show_log" >&2 || true
     echo
     return 1
   fi
@@ -1374,11 +1686,10 @@ sync_user_config_to_canonical() {
   fi
 
   local backup_out
-  if ! backup_out="$("$candidate_bin" -backup -config "$CONFIG_FILE" 2>/tmp/kekkai-backup.log)"; then
-    rm -f "$tmp_show"
+  if ! backup_out="$("$candidate_bin" -backup -config "$CONFIG_FILE" 2>"$backup_log")"; then
     echo
     err "failed to backup config before canonical sync:"
-    sed 's/^/    /' /tmp/kekkai-backup.log >&2 || true
+    sed 's/^/    /' "$backup_log" >&2 || true
     echo
     return 1
   fi
@@ -1391,6 +1702,7 @@ sync_user_config_to_canonical() {
   }
   log "config canonical sync: wrote normalized config to $CONFIG_FILE (v${cur_ver:-unknown} -> v${next_ver:-unknown})"
   rm -f "$tmp_show"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1408,6 +1720,7 @@ do_install() {
   install_config
   install_systemd_unit
   enable_and_start
+  cleanup_download_dir
   log "install complete"
   prompt_run_doctor
   post_install_hints
@@ -1437,6 +1750,7 @@ do_repair() {
   [[ -f "$CONFIG_FILE" ]] || install_config
   install_systemd_unit
   enable_and_start
+  cleanup_download_dir
   log "repair complete"
   prompt_run_doctor
 }
@@ -1462,6 +1776,8 @@ prompt_run_doctor() {
 
 do_doctor() {
   if [[ -x "$CLI_BIN" ]]; then
+    # exec replaces this process and skips the EXIT trap.
+    cleanup_tracked_tmp
     exec "$CLI_BIN" doctor
   fi
   # kekkai not installed yet — run read-only checks inline.
@@ -1485,7 +1801,11 @@ do_uninstall() {
   }
   $SUDO rm -f "$UNIT_DST" "$AGENT_BIN" "$CLI_BIN" "$ROLLBACK_BIN"
   $SUDO systemctl daemon-reload 2>/dev/null || true
-  $SUDO rm -rf "$BPFFS_DIR" "$STATS_DIR"
+  local p
+  for p in "$BPFFS_DIR" "$STATS_DIR"; do
+    [[ -n "$p" && "$p" != "/" ]] || die "refusing to remove empty path or /"
+  done
+  $SUDO rm -rf -- "$BPFFS_DIR" "$STATS_DIR"
   info "config preserved at $CONFIG_FILE"
   info "to remove it:  sudo rm -rf $CONFIG_DIR"
   log "uninstall complete"
@@ -1503,13 +1823,22 @@ post_install_hints() {
 
   if [[ $DO_RUN -eq 1 ]]; then
     log "launching kekkai-agent in foreground (Ctrl+C to stop)"
+    # exec replaces this process and skips the EXIT trap.
+    cleanup_tracked_tmp
     exec $SUDO "$AGENT_BIN" -config "$CONFIG_FILE"
   fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
+# Tests source this file with KEKKAI_SH_SOURCE_ONLY=1 after the functions
+# are defined. A normal execution never sets that variable.
+if [[ "${KEKKAI_SH_SOURCE_ONLY:-}" == 1 ]]; then
+  return 0
+fi
+
 [[ "$OS" != "unsupported" ]] || die "unsupported OS: $(uname -s)"
 [[ "$ARCH" != "unsupported" ]] || die "unsupported arch: $(uname -m)"
 

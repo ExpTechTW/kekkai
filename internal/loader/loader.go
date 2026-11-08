@@ -1,5 +1,18 @@
 package loader
 
+// Program and map names. Keep these aligned with bpf/xdp_filter.c.
+const (
+	progNameXDP      = "kekkai_xdp"
+	progNameTCEgress = "kekkai_tc_egress"
+
+	mapBlocklist  = "blocklist"
+	mapAllowlist  = "allowlist"
+	mapPorts      = "ports"
+	mapRuntimeCfg = "runtime_cfg"
+	mapStats      = "stats"
+	mapPerIP      = "perip"
+)
+
 // Loader attaches the WAF eBPF program to a network interface and exposes
 // handles to the maps shared with the data plane. Platform-specific
 // implementations live in loader_linux.go (real eBPF) and loader_stub.go
@@ -12,8 +25,8 @@ type Loader struct {
 // Options tune runtime-adjustable knobs applied to the eBPF spec or to the
 // attach step. Zero values keep compile-time defaults.
 type Options struct {
-	// PerIPMaxEntries overrides the entry count for perip_v4 (a per-CPU LRU
-	// hash; kernel memory is roughly this × nCPU × entry size).
+	// PerIPMaxEntries overrides the entry count for the perip map (a per-CPU
+	// LRU hash; kernel memory is roughly this × nCPU × entry size).
 	PerIPMaxEntries uint32
 
 	// XDPMode is one of "generic", "driver", "offload". Empty defaults to
@@ -28,8 +41,14 @@ type Options struct {
 
 type implementation interface {
 	attach(ifaceIndex int, opts Options) error
+	detach() error
 	close() error
+	egressActive() bool
 }
+
+// EgressActive reports whether the TC egress program is attached right now.
+// It is false in emergency bypass and when the kernel rejected the TC link.
+func (l *Loader) EgressActive() bool { return l.impl.egressActive() }
 
 func New(iface string) *Loader {
 	return &Loader{iface: iface, impl: newImpl()}
@@ -39,6 +58,12 @@ func New(iface string) *Loader {
 // attaches the XDP program to the given interface index.
 func (l *Loader) Attach(ifaceIndex int, opts Options) error {
 	return l.impl.attach(ifaceIndex, opts)
+}
+
+// Detach removes the XDP link but keeps maps open. Used when switching
+// into emergency bypass at runtime.
+func (l *Loader) Detach() error {
+	return l.impl.detach()
 }
 
 // Close tears down the whole collection.

@@ -105,15 +105,15 @@ func (r *Runner) Render(w io.Writer, colour bool) {
 	for _, sec := range r.sections {
 		fmt.Fprintf(w, "  %s %s\n", p.section("○"), p.sectionName(sec.Name))
 		for _, res := range sec.Results {
-			sym := res.Status.Symbol()
+			text := fmt.Sprintf("    %s  %-28s %s", res.Status.Symbol(), res.Title, res.Detail)
 			var line string
 			switch res.Status {
 			case StatusOK:
-				line = p.ok(fmt.Sprintf("    %s  %-28s %s", sym, res.Title, res.Detail))
+				line = p.ok(text)
 			case StatusWarn:
-				line = p.warn(fmt.Sprintf("    %s  %-28s %s", sym, res.Title, res.Detail))
+				line = p.warn(text)
 			case StatusError:
-				line = p.errCol(fmt.Sprintf("    %s  %-28s %s", sym, res.Title, res.Detail))
+				line = p.errCol(text)
 			}
 			fmt.Fprintln(w, line)
 			for _, s := range res.Suggestions {
@@ -190,8 +190,6 @@ func (p palette) title(s string) string       { return p.wrap(p.titleCode, s) }
 func (p palette) dim(s string) string         { return p.wrap(p.dimCode, s) }
 func (p palette) section(s string) string     { return p.wrap(p.sectCode, s) }
 func (p palette) sectionName(s string) string { return p.wrap(p.sectCode, strings.ToUpper(s)) }
-
-// ---------- check utilities ----------------------------------------------
 
 func humanSize(n int64) string {
 	const (

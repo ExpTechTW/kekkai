@@ -3,7 +3,6 @@ package tui
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -51,7 +50,7 @@ var (
 	dropStyle     = lipgloss.NewStyle().Foreground(cDanger).Bold(true)
 	warnStyle     = lipgloss.NewStyle().Foreground(cWarn).Bold(true)
 	alertStyle    = lipgloss.NewStyle().Foreground(cAlert).Bold(true)
-	criticalStyle = lipgloss.NewStyle().Foreground(cCritical).Bold(true).Blink(true)
+	criticalStyle = lipgloss.NewStyle().Foreground(cCritical).Bold(true)
 
 	boxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
@@ -93,11 +92,46 @@ var (
 			Bold(true)
 
 	sparkBlocks = []rune("▁▂▃▄▅▆▇█")
+
+	// Foreground styles built once. View used to allocate a new style on
+	// every gauge, sparkline, and banner, which showed up as UI jank.
+	boldBarrier  = lipgloss.NewStyle().Foreground(cBarrier).Bold(true)
+	boldWarn     = lipgloss.NewStyle().Foreground(cWarn).Bold(true)
+	boldAlert    = lipgloss.NewStyle().Foreground(cAlert).Bold(true)
+	boldDanger   = lipgloss.NewStyle().Foreground(cDanger).Bold(true)
+	boldCritical = lipgloss.NewStyle().Foreground(cCritical).Bold(true)
+	subStyle     = lipgloss.NewStyle().Foreground(cCyan).Italic(true)
+	labelNarrow  = labelStyle.Width(10)
+
+	fillCyan    = lipgloss.NewStyle().Foreground(cCyan)
+	fillDanger  = lipgloss.NewStyle().Foreground(cDanger)
+	fillPass    = lipgloss.NewStyle().Foreground(cPass)
+	fillWarn    = lipgloss.NewStyle().Foreground(cWarn)
+	fillMagenta = lipgloss.NewStyle().Foreground(cMagenta)
+	fillBarrier = lipgloss.NewStyle().Foreground(cBarrier)
+	fillDim     = lipgloss.NewStyle().Foreground(cDim)
+
+	rowSelected = lipgloss.NewStyle().Background(cBarrier).Foreground(cBg).Bold(true)
+
+	bypassBodyStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fecaca"))
+	bypassBoxStyle  = lipgloss.NewStyle().
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(cCritical).
+			Background(lipgloss.Color("#7f1d1d")).
+			Padding(0, 2)
 )
 
 // ---------- entry ---------------------------------------------------------
 
 func (m *Model) View() string {
+	if m.viewCache != "" {
+		return m.viewCache
+	}
+	m.viewCache = m.renderView()
+	return m.viewCache
+}
+
+func (m *Model) renderView() string {
 	if m.cur == nil && m.errMsg == "" {
 		return "\n  " + titleStyle.Render("◈ KEKKAI") + "  " +
 			dimStyle.Render("initialising barrier...") + "\n\n"
@@ -131,16 +165,10 @@ func (m *Model) View() string {
 // viewBypassBanner is the unmissable red strip shown when the XDP filter is
 // not attached — every packet is passing unfiltered.
 func (m *Model) viewBypassBanner() string {
-	body := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fecaca")).
-		Render("⚠  FILTER BYPASSED — NETWORK UNPROTECTED  ⚠\n" +
-			"XDP is detached on " + m.iface + "; every packet passes unfiltered.\n" +
-			"re-enable: sudo kekkai bypass off")
-	return lipgloss.NewStyle().
-		Border(lipgloss.DoubleBorder()).
-		BorderForeground(cCritical).
-		Background(lipgloss.Color("#7f1d1d")).
-		Padding(0, 2).
-		Render(body)
+	body := bypassBodyStyle.Render("⚠  FILTER BYPASSED — NETWORK UNPROTECTED  ⚠\n" +
+		"XDP is detached on " + m.iface + "; every packet passes unfiltered.\n" +
+		"re-enable: sudo kekkai bypass off")
+	return bypassBoxStyle.Render(body)
 }
 
 // ---------- chrome --------------------------------------------------------
@@ -151,9 +179,8 @@ func (m *Model) viewBypassBanner() string {
 func (m *Model) viewBanner() string {
 	t := m.threatLevel()
 
-	// Heartbeat glyph pulses once per tick; even a stopped agent breathes.
 	beat := "●"
-	if time.Now().UnixMilli()/500%2 == 0 {
+	if m.beat {
 		beat = "◉"
 	}
 
@@ -177,13 +204,10 @@ func (m *Model) viewBanner() string {
 		statusText = "THREAT CRITICAL"
 	}
 
-	left := lipgloss.NewStyle().Foreground(bannerColor).Bold(true).
-		Render("◈ KEKKAI")
+	left := boldFG(bannerColor).Render("◈ KEKKAI")
 	kanji := kanjiStyle.Render("結界")
-	sub := lipgloss.NewStyle().Foreground(cCyan).Italic(true).
-		Render("· edge barrier console ·")
-	status := lipgloss.NewStyle().Foreground(bannerColor).Bold(true).
-		Render(statusText)
+	sub := subStyle.Render("· edge barrier console ·")
+	status := boldFG(bannerColor).Render(statusText)
 
 	return fmt.Sprintf(" %s  %s  %s   %s %s",
 		left, kanji, sub, statusGlyph, status)
@@ -295,8 +319,17 @@ func (t threat) style() lipgloss.Style {
 
 // ---------- gauge ---------------------------------------------------------
 
+// Overview gauges are 22 cells. The glyph strings are built once; a wider
+// bar falls back to Repeat.
+const gaugeSlots = 22
+
+var (
+	gaugeOn  = strings.Repeat("▰", gaugeSlots)
+	gaugeOff = strings.Repeat("▱", gaugeSlots)
+)
+
 // gauge renders a horizontal bar using block glyphs. Saturates at `max`.
-func gauge(value, max float64, width int, fill lipgloss.Color) string {
+func gauge(value, max float64, width int, fill lipgloss.Style) string {
 	if max <= 0 {
 		max = 1
 	}
@@ -309,9 +342,32 @@ func gauge(value, max float64, width int, fill lipgloss.Color) string {
 	}
 	filled := int(ratio * float64(width))
 	empty := width - filled
-	f := lipgloss.NewStyle().Foreground(fill).Render(strings.Repeat("▰", filled))
-	e := lipgloss.NewStyle().Foreground(cDim).Render(strings.Repeat("▱", empty))
-	return f + e
+	return fill.Render(gaugePart(gaugeOn, "▰", filled)) + fillDim.Render(gaugePart(gaugeOff, "▱", empty))
+}
+
+func gaugePart(cached, glyph string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n*len(glyph) <= len(cached) {
+		return cached[:n*len(glyph)]
+	}
+	return strings.Repeat(glyph, n)
+}
+
+func boldFG(c lipgloss.Color) lipgloss.Style {
+	switch c {
+	case cWarn:
+		return boldWarn
+	case cAlert:
+		return boldAlert
+	case cDanger:
+		return boldDanger
+	case cCritical:
+		return boldCritical
+	default:
+		return boldBarrier
+	}
 }
 
 // ---------- pages ---------------------------------------------------------
@@ -327,8 +383,8 @@ func (m *Model) viewOverview() string {
 	threatBadge := t.style().Render(fmt.Sprintf(" ◆ THREAT %s ", t.label()))
 
 	const maxPPS = 10000.0
-	rxGauge := gauge(s.PPS, maxPPS, 22, cCyan)
-	dropGauge := gauge(s.DPS, maxPPS, 22, cDanger)
+	rxGauge := gauge(s.PPS, maxPPS, 22, fillCyan)
+	dropGauge := gauge(s.DPS, maxPPS, 22, fillDanger)
 
 	rxBox := boxStyle.Render(strings.Join([]string{
 		titleStyle.Render("◈ RX · XDP ingress"),
@@ -354,7 +410,8 @@ func (m *Model) viewOverview() string {
 		labelStyle.Render("tcp") + valueStyle.Render(fmtNum(s.PpsTCP)+" pps"),
 		labelStyle.Render("udp") + valueStyle.Render(fmtNum(s.PpsUDP)+" pps"),
 		labelStyle.Render("icmp") + valueStyle.Render(fmtNum(s.PpsICMP)+" pps"),
-		labelStyle.Render("stateful hit") + valueStyle.Render(fmtNum(s.PpsStatefulTCP+s.PpsStatefulUDP)+" pps"),
+		labelStyle.Render("udp flow") + valueStyle.Render(fmtNum(s.PpsUDPFlow)+" pps"),
+		labelStyle.Render("ipv6 share") + valueStyle.Render(ipv6Share(g)),
 		"",
 		dimStyle.Render(fmt.Sprintf("total: tcp=%s  udp=%s",
 			fmtU(g.PktsTCP), fmtU(g.PktsUDP))),
@@ -362,14 +419,14 @@ func (m *Model) viewOverview() string {
 
 	dropBox := boxStyle.Render(strings.Join([]string{
 		titleStyle.Render("◆ Drops (since start)"),
+		labelStyle.Render("non-ip") + dropStyle.Render(fmtU(g.DropNonIP)),
+		labelStyle.Render("malformed") + dropStyle.Render(fmtU(g.DropMalformed)),
 		labelStyle.Render("blocklist") + dropStyle.Render(fmtU(g.DropBlocklist)),
-		labelStyle.Render("dyn blocklist") + dropStyle.Render(fmtU(g.DropDynBlock)),
 		labelStyle.Render("not allowed") + dropStyle.Render(fmtU(g.DropNotAllowed)),
 		labelStyle.Render("no policy") + dropStyle.Render(fmtU(g.DropNoPolicy)),
-		labelStyle.Render("non-ipv4") + dropStyle.Render(fmtU(g.DropNonIPv4)),
 	}, "\n"))
 
-	topBox := renderTopBox(s, 5, -1)
+	topBox := renderTopBox(s, 5, -1, m.width)
 
 	row1 := lipgloss.JoinHorizontal(lipgloss.Top, rxBox, " ", txBox, " ", protoBox)
 	row2 := lipgloss.JoinHorizontal(lipgloss.Top, dropBox, " ", topBox)
@@ -401,29 +458,30 @@ func (m *Model) viewDetail() string {
 			fmt.Sprintf("pkts=%-12s bytes=%s", fmtU(g.PktsUDP), humanBytes(g.BytesUDP))),
 		labelStyle.Render("icmp") + valueStyle.Render(
 			fmt.Sprintf("pkts=%-12s bytes=%s", fmtU(g.PktsICMP), humanBytes(g.BytesICMP))),
-		labelStyle.Render("other l4") + valueStyle.Render(
-			fmt.Sprintf("pkts=%-12s bytes=%s", fmtU(g.PktsOtherL4), humanBytes(g.BytesOtherL4))),
+		labelStyle.Render("other") + valueStyle.Render(
+			fmt.Sprintf("pkts=%-12s bytes=%s", fmtU(g.PktsOther), humanBytes(g.BytesOther))),
+		labelStyle.Render("ipv6") + valueStyle.Render(
+			fmt.Sprintf("pkts=%-12s bytes=%s", fmtU(g.PktsIPv6), humanBytes(g.BytesIPv6))),
 	}, "\n"))
 
 	dropsBox := boxAlert.Render(strings.Join([]string{
 		titleStyle.Render("▼ Drops by reason"),
-		labelStyle.Render("non-ipv4") + dropStyle.Render(fmtU(g.DropNonIPv4)),
+		labelStyle.Render("non-ip") + dropStyle.Render(fmtU(g.DropNonIP)),
 		labelStyle.Render("malformed") + dropStyle.Render(fmtU(g.DropMalformed)),
 		labelStyle.Render("blocklist") + dropStyle.Render(fmtU(g.DropBlocklist)),
-		labelStyle.Render("dyn blocklist") + dropStyle.Render(fmtU(g.DropDynBlock)),
 		labelStyle.Render("not allowed") + dropStyle.Render(fmtU(g.DropNotAllowed)),
 		labelStyle.Render("no policy") + dropStyle.Render(fmtU(g.DropNoPolicy)),
 	}, "\n"))
 
 	passesBox := boxStyle.BorderForeground(cPass).Render(strings.Join([]string{
 		titleStyle.Render("▲ Passes by reason"),
-		labelStyle.Render("stateful tcp hit") + passStyle.Render(fmtU(g.PassStatefulTCP)),
-		labelStyle.Render("stateful udp hit") + passStyle.Render(fmtU(g.PassStatefulUDP)),
-		labelStyle.Render("stateful hit pps") + passStyle.Render(fmtNum(s.PpsStatefulTCP+s.PpsStatefulUDP)),
-		labelStyle.Render("return tcp (ACK)") + passStyle.Render(fmtU(g.PassReturnTCP)),
-		labelStyle.Render("return udp (eph)") + passStyle.Render(fmtU(g.PassReturnUDP)),
-		labelStyle.Render("return icmp") + passStyle.Render(fmtU(g.PassReturnICMP)),
+		labelStyle.Render("arp") + passStyle.Render(fmtU(g.PassARP)),
 		labelStyle.Render("ip fragment") + passStyle.Render(fmtU(g.PassFragment)),
+		labelStyle.Render("tcp established") + passStyle.Render(fmtU(g.PassTCPEst)),
+		labelStyle.Render("udp flow") + passStyle.Render(fmtU(g.PassUDPFlow)),
+		labelStyle.Render("udp flow pps") + passStyle.Render(fmtNum(s.PpsUDPFlow)),
+		labelStyle.Render("dhcp") + passStyle.Render(fmtU(g.PassDHCP)),
+		labelStyle.Render("icmp") + passStyle.Render(fmtU(g.PassICMP)),
 		labelStyle.Render("public tcp") + passStyle.Render(fmtU(g.PassPublicTCP)),
 		labelStyle.Render("public udp") + passStyle.Render(fmtU(g.PassPublicUDP)),
 		labelStyle.Render("private tcp") + passStyle.Render(fmtU(g.PassPrivateTCP)),
@@ -444,7 +502,7 @@ func (m *Model) viewTopN() string {
 	if maxRows < 5 {
 		maxRows = 5
 	}
-	box := renderTopBox(s, maxRows, m.topCursor)
+	box := renderTopBox(s, maxRows, m.topCursor, m.width)
 	hint := dimStyle.Render(fmt.Sprintf("  %d entries in perip table  |  ↑↓ scroll  home/end jump  ",
 		len(s.Top)))
 	return "\n" + box + "\n" + hint + "\n"
@@ -465,18 +523,17 @@ func (m *Model) viewCharts() string {
 
 	trafficBox := boxStyle.Render(strings.Join([]string{
 		titleStyle.Render("◈ Traffic trend (last 120s)"),
-		renderSeriesLine("pps total ", m.ppsHist, w, cCyan, s.PPS),
-		renderSeriesLine("pps drop  ", m.dpsHist, w, cDanger, s.DPS),
+		renderSeriesLine("pps total ", m.ppsHist, w, fillCyan, s.PPS),
+		renderSeriesLine("pps drop  ", m.dpsHist, w, fillDanger, s.DPS),
 		dimStyle.Render("left=old  right=now"),
 	}, "\n"))
 
 	protoBox := boxStyle.Render(strings.Join([]string{
 		titleStyle.Render("◈ Protocol trend (last 120s)"),
-		renderSeriesLine("tcp pps   ", m.tcpHist, w, cPass, s.PpsTCP),
-		renderSeriesLine("udp pps   ", m.udpHist, w, cWarn, s.PpsUDP),
-		renderSeriesLine("icmp pps  ", m.icmpHist, w, cMagenta, s.PpsICMP),
-		renderSeriesLine("stcp hit  ", m.statefulTCPHist, w, cBarrier2, s.PpsStatefulTCP),
-		renderSeriesLine("sudp hit  ", m.statefulUDPHist, w, cBarrier, s.PpsStatefulUDP),
+		renderSeriesLine("tcp pps   ", m.tcpHist, w, fillPass, s.PpsTCP),
+		renderSeriesLine("udp pps   ", m.udpHist, w, fillWarn, s.PpsUDP),
+		renderSeriesLine("icmp pps  ", m.icmpHist, w, fillMagenta, s.PpsICMP),
+		renderSeriesLine("udp flow  ", m.udpFlowHist, w, fillBarrier, s.PpsUDPFlow),
 		dimStyle.Render("adaptive scale per line"),
 	}, "\n"))
 
@@ -485,9 +542,10 @@ func (m *Model) viewCharts() string {
 
 // ---------- helpers -------------------------------------------------------
 
-func renderTopBox(s *Snapshot, limit, cursor int) string {
-	header := fmt.Sprintf("  %-3s %-16s %-14s %-14s %-10s %-5s %s",
-		"#", "SRC_IP", "PKTS", "BYTES", "DROPPED", "PROTO", "STATUS")
+func renderTopBox(s *Snapshot, limit, cursor, termWidth int) string {
+	addrW := addrColumnWidth(termWidth)
+	header := fmt.Sprintf("  %-3s %-*s %-14s %-14s %-10s %-5s %s",
+		"#", addrW, "SRC_IP", "PKTS", "BYTES", "DROPPED", "PROTO", "STATUS")
 
 	rows := []string{
 		titleStyle.Render("◈ Top source IPs"),
@@ -508,9 +566,10 @@ func renderTopBox(s *Snapshot, limit, cursor int) string {
 		} else {
 			status = passStyle.Render("▲ pass ")
 		}
-		line := fmt.Sprintf("  %-3d %-16s %-14s %-14s %-10s %-5s %s",
+		line := fmt.Sprintf("  %-3d %-*s %-14s %-14s %-10s %-5s %s",
 			i+1,
-			FormatAddr(e.Addr),
+			addrW,
+			truncateMiddle(FormatAddr(e.Addr), addrW),
 			fmtU(e.Pkts),
 			humanBytes(e.Bytes),
 			fmtU(e.PktsDropped),
@@ -518,11 +577,7 @@ func renderTopBox(s *Snapshot, limit, cursor int) string {
 			status,
 		)
 		if i == cursor {
-			line = lipgloss.NewStyle().
-				Background(cBarrier).
-				Foreground(cBg).
-				Bold(true).
-				Render(line)
+			line = rowSelected.Render(line)
 		}
 		rows = append(rows, line)
 	}
@@ -531,19 +586,66 @@ func renderTopBox(s *Snapshot, limit, cursor int) string {
 
 // ---------- formatting (shared with internal/stats) -----------------------
 
+// addrColMax is a full IPv6 textual address ("ffff:...:ffff", 39 columns).
+const addrColMax = 39
+
+// addrColumnWidth sizes the SRC_IP column so the row, the rounded border,
+// and the one-cell padding stay inside the terminal. A full address is used
+// when it fits; otherwise the caller truncates it.
+func addrColumnWidth(termWidth int) int {
+	const chrome = 4 // left/right border + Padding(0, 1)
+	const fixed = 61 // visual columns in the row besides the address
+	if termWidth <= 0 {
+		return 16
+	}
+	w := termWidth - chrome - fixed
+	if w > addrColMax {
+		return addrColMax
+	}
+	if w < 8 {
+		return 8
+	}
+	return w
+}
+
+// truncateMiddle shortens s to width columns with a single-column ellipsis
+// in the middle. Addresses are ASCII, so byte slices match columns.
+func truncateMiddle(s string, width int) string {
+	if width <= 0 || len(s) <= width {
+		return s
+	}
+	if width == 1 {
+		return "…"
+	}
+	keep := width - 1
+	left := keep / 2
+	right := keep - left
+	return s[:left] + "…" + s[len(s)-right:]
+}
+
+// ipv6Share is PktsIPv6 over the IP protocol mix. Those counters increment
+// only for IP packets, and the IPv6 counters only when the family is IPv6.
+func ipv6Share(g stats.Global) string {
+	den := g.PktsTCP + g.PktsUDP + g.PktsICMP + g.PktsOther
+	if den == 0 {
+		return "0%"
+	}
+	return fmt.Sprintf("%.1f%%", float64(g.PktsIPv6)*100/float64(den))
+}
+
 func fmtU(v uint64) string       { return stats.FormatCount(v) }
 func fmtNum(v float64) string    { return stats.FormatRate(v) }
 func humanBits(v float64) string { return stats.HumanBits(v) }
 func humanBytes(v uint64) string { return stats.HumanBytes(v) }
 func protoName(p uint8) string   { return stats.ProtoName(p) }
 
-func renderSeriesLine(label string, series []float64, width int, color lipgloss.Color, latest float64) string {
+func renderSeriesLine(label string, series []float64, width int, color lipgloss.Style, latest float64) string {
 	graph := sparkline(series, width, color)
 	val := valueStyle.Render(fmtNum(latest))
-	return labelStyle.Width(10).Render(label) + graph + "  " + val
+	return labelNarrow.Render(label) + graph + "  " + val
 }
 
-func sparkline(series []float64, width int, color lipgloss.Color) string {
+func sparkline(series []float64, width int, color lipgloss.Style) string {
 	if width <= 0 {
 		return ""
 	}
@@ -592,5 +694,5 @@ func sparkline(series []float64, width int, color lipgloss.Color) string {
 		}
 		b.WriteRune(sparkBlocks[level])
 	}
-	return lipgloss.NewStyle().Foreground(color).Render(b.String())
+	return color.Render(b.String())
 }

@@ -7,59 +7,114 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// PortSet wraps a HASH map keyed on a big-endian __u16 dst port. eBPF reads
-// `tcphdr->dest` directly which is already in network byte order, so the Go
-// side must match.
-type PortSet struct {
+// PortsMaxEntries is the ports map capacity (PORTS_MAX in bpf/xdp_filter.c).
+const PortsMaxEntries = 4096
+
+const (
+	// ProtoTCP and ProtoUDP are the IP protocol numbers stored in PortKey.
+	ProtoTCP uint8 = 6
+	ProtoUDP uint8 = 17
+
+	// PortClassPublic and PortClassPrivate are the ports map values.
+	PortClassPublic  uint8 = 1
+	PortClassPrivate uint8 = 2
+)
+
+// PortKey is the HASH key of the ports map. Port is big-endian on the
+// wire, matching tcphdr/udphdr port fields. Pad keeps the key 4 bytes.
+type PortKey struct {
+	Port  [2]byte
+	Proto uint8
+	Pad   uint8
+}
+
+func portKey(port uint16, proto uint8) PortKey {
+	var k PortKey
+	binary.BigEndian.PutUint16(k.Port[:], port)
+	k.Proto = proto
+	return k
+}
+
+// PortTable wraps the single ports map. Each entry is a destination port
+// plus protocol, valued as public or private.
+type PortTable struct {
 	m    *ebpf.Map
 	name string
 }
 
-func NewPortSet(m *ebpf.Map, name string) *PortSet {
-	return &PortSet{m: m, name: name}
+func NewPortTable(m *ebpf.Map, name string) *PortTable {
+	return &PortTable{m: m, name: name}
 }
 
-// Sync reconciles the map contents with the desired ports.
-func (s *PortSet) Sync(desired []uint16) error {
-	want := make(map[uint16]struct{}, len(desired))
-	for _, p := range desired {
-		want[htons(p)] = struct{}{}
+// Sync reconciles the map with the four configured port lists. Entries
+// whose class changed, and entries that are missing, are written first;
+// keys that are no longer wanted are deleted afterwards. An entry whose
+// class is already correct is not rewritten.
+func (t *PortTable) Sync(pubTCP, pubUDP, privTCP, privUDP []uint16) error {
+	want, err := t.desired(pubTCP, pubUDP, privTCP, privUDP)
+	if err != nil {
+		return err
 	}
 
-	var current []uint16
-	{
-		var key uint16
-		var val uint8
-		iter := s.m.Iterate()
-		for iter.Next(&key, &val) {
-			current = append(current, key)
-		}
-		if err := iter.Err(); err != nil {
-			return fmt.Errorf("%s iterate: %w", s.name, err)
-		}
+	current := make(map[PortKey]uint8, len(want))
+	var key PortKey
+	var val uint8
+	iter := t.m.Iterate()
+	for iter.Next(&key, &val) {
+		current[key] = val
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("%s iterate: %w", t.name, err)
 	}
 
-	for _, k := range current {
-		if _, keep := want[k]; !keep {
-			if err := s.m.Delete(k); err != nil {
-				return fmt.Errorf("%s prune: %w", s.name, err)
-			}
+	for k, class := range want {
+		if have, ok := current[k]; ok && have == class {
+			continue
+		}
+		if err := t.m.Update(k, class, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("%s update: %w", t.name, err)
 		}
 	}
-	val := uint8(1)
-	for k := range want {
-		if err := s.m.Update(k, val, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("%s add: %w", s.name, err)
+	for k := range current {
+		if _, keep := want[k]; keep {
+			continue
+		}
+		if err := t.m.Delete(k); err != nil {
+			return fmt.Errorf("%s prune: %w", t.name, err)
 		}
 	}
 	return nil
 }
 
-// htons converts a host-order port number to the eBPF key format (network
-// byte order). We pack it into a little-endian uint16 view of the two
-// big-endian bytes so that cilium/ebpf writes them verbatim to the kernel.
-func htons(v uint16) uint16 {
-	var b [2]byte
-	binary.BigEndian.PutUint16(b[:], v)
-	return binary.LittleEndian.Uint16(b[:])
+// desired builds the wanted key set. It does not touch the map, so a
+// conflict or a capacity error leaves the map unchanged.
+func (t *PortTable) desired(pubTCP, pubUDP, privTCP, privUDP []uint16) (map[PortKey]uint8, error) {
+	n := len(pubTCP) + len(pubUDP) + len(privTCP) + len(privUDP)
+	want := make(map[PortKey]uint8, n)
+	add := func(ports []uint16, proto, class uint8) error {
+		for _, p := range ports {
+			k := portKey(p, proto)
+			if prev, ok := want[k]; ok && prev != class {
+				return fmt.Errorf("%s: port %d proto %d is both public and private", t.name, p, proto)
+			}
+			want[k] = class
+		}
+		return nil
+	}
+	if err := add(pubTCP, ProtoTCP, PortClassPublic); err != nil {
+		return nil, err
+	}
+	if err := add(pubUDP, ProtoUDP, PortClassPublic); err != nil {
+		return nil, err
+	}
+	if err := add(privTCP, ProtoTCP, PortClassPrivate); err != nil {
+		return nil, err
+	}
+	if err := add(privUDP, ProtoUDP, PortClassPrivate); err != nil {
+		return nil, err
+	}
+	if len(want) > PortsMaxEntries {
+		return nil, fmt.Errorf("%s: %d entries exceed map capacity %d", t.name, len(want), PortsMaxEntries)
+	}
+	return want, nil
 }

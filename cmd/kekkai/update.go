@@ -1,89 +1,84 @@
 package main
 
-// `kekkai update` — delegates to kekkai.sh so the full install/rollback
-// logic lives in exactly one place (shell). This file is just a locator
-// for that script plus a thin exec wrapper.
+// `kekkai update` delegates to the installed kekkai.sh so the install and
+// rollback logic lives in exactly one place. The script path is fixed:
+// a root-owned regular file at /usr/local/bin/kekkai.sh. Environment
+// variables, the home directory, and the working directory are not
+// searched — those locations are writable by the user who can sudo kekkai
+// without a password.
 
 import (
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
+	"syscall"
 )
 
-// cmdUpdate delegates to kekkai.sh so update logic stays in one place
-// (release asset fetch + rollback-safe restart).
+const updateScriptPath = "/usr/local/bin/kekkai.sh"
+
+// cmdUpdate runs /usr/local/bin/kekkai.sh update after checking that the
+// script and its directory are root-owned and not group/world-writable.
 func cmdUpdate(args []string) int {
-	script, searched := resolveUpdateScript()
-	if script == "" {
-		fmt.Fprintln(os.Stderr, uiErr("kekkai update requires kekkai.sh"))
-		fmt.Fprintln(os.Stderr, uiWarn("run from repository root, or set KEKKAI_REPO=/path/to/waf-go"))
-		fmt.Fprintln(os.Stderr, uiKeyStyle.Render("searched:"))
-		for _, p := range searched {
-			fmt.Fprintf(os.Stderr, "  %s\n", uiInfoStyle.Render("- "+p))
-		}
+	if err := verifyUpdateScript(updateScriptPath, 0); err != nil {
+		fmt.Fprintln(os.Stderr, uiErr(err.Error()))
+		fmt.Fprintln(os.Stderr, "developers can still run `bash kekkai.sh update` directly")
 		return 1
 	}
 
-	// kekkai update pulls prebuilt release assets from GitHub — no git /
-	// SSH key required, so we just run kekkai.sh under the current (root)
-	// uid. requireRoot() above guarantees we're already root.
-	cmdArgs := append([]string{script, "update"}, args...)
+	cmdArgs := append([]string{updateScriptPath, "update"}, args...)
 	c := exec.Command("bash", cmdArgs...)
-	return runCommand(c, fmt.Sprintf("run %s update", script))
+	return runCommand(c, "run /usr/local/bin/kekkai.sh update")
 }
 
-// resolveUpdateScript walks a list of candidate paths for `kekkai.sh` and
-// returns the first one that exists. The full candidate list is returned
-// separately so the error message can show what was searched when nothing
-// matches.
-func resolveUpdateScript() (string, []string) {
-	var candidates []string
-
-	if p := strings.TrimSpace(os.Getenv("KEKKAI_SCRIPT")); p != "" {
-		candidates = append(candidates, p)
+// verifyUpdateScript reports whether path is a regular file (not a symlink)
+// owned by rootUID, not group/world-writable, living in a directory with
+// the same owner and mode constraints. rootUID is injectable so tests can
+// use a temp directory without running as uid 0.
+func verifyUpdateScript(path string, rootUID int) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("kekkai update requires %s: %w", path, err)
 	}
-	if repo := strings.TrimSpace(os.Getenv("KEKKAI_REPO")); repo != "" {
-		candidates = append(candidates, filepath.Join(repo, "kekkai.sh"))
+	if st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
+		return fmt.Errorf("%s must be a regular file owned by uid %d, not a symlink", path, rootUID)
 	}
-	// Common default clone location (legacy / dev).
-	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
-		candidates = append(candidates, filepath.Join(home, "kekkai", "kekkai.sh"))
+	if st.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s must not be group- or world-writable", path)
 	}
-	// When running as root via sudo, also look in the invoking user's home.
-	if sudoUser := strings.TrimSpace(os.Getenv("SUDO_USER")); sudoUser != "" {
-		candidates = append(candidates, filepath.Join("/home", sudoUser, "kekkai", "kekkai.sh"))
+	uid, err := fileOwnerUID(st)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
 	}
-	if wd, err := os.Getwd(); err == nil {
-		candidates = append(candidates, filepath.Join(wd, "kekkai.sh"))
-	}
-	if exe, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exe)
-		candidates = append(candidates,
-			filepath.Join(exeDir, "kekkai.sh"),
-			filepath.Join(exeDir, "..", "kekkai.sh"),
-		)
+	if uid != rootUID {
+		return fmt.Errorf("%s must be owned by uid %d", path, rootUID)
 	}
 
-	seen := make(map[string]struct{}, len(candidates))
-	searched := make([]string, 0, len(candidates))
-	for _, p := range candidates {
-		if p == "" {
-			continue
-		}
-		abs, err := filepath.Abs(p)
-		if err == nil {
-			p = abs
-		}
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		searched = append(searched, p)
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p, searched
-		}
+	dir := filepath.Dir(path)
+	dst, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("kekkai update script directory: %w", err)
 	}
-	return "", searched
+	if dst.Mode()&os.ModeSymlink != 0 || !dst.IsDir() {
+		return fmt.Errorf("%s must be a real directory owned by uid %d", dir, rootUID)
+	}
+	if dst.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s must not be group- or world-writable", dir)
+	}
+	dirUID, err := fileOwnerUID(dst)
+	if err != nil {
+		return fmt.Errorf("%s: %w", dir, err)
+	}
+	if dirUID != rootUID {
+		return fmt.Errorf("%s must be owned by uid %d", dir, rootUID)
+	}
+	return nil
+}
+
+func fileOwnerUID(info os.FileInfo) (int, error) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return 0, fmt.Errorf("cannot read owner uid")
+	}
+	return int(st.Uid), nil
 }

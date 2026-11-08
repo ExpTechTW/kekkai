@@ -26,11 +26,18 @@
 原因：Debian / Ubuntu / Pi OS 預設 `kernel.unprivileged_bpf_disabled=2`，非 root 呼叫 `bpf()` 會被 kernel 直接擋掉，`setcap` 無法繞過。為了跨主機一致、避免踩到平台差異，本專案乾脆把所有 CLI 使用統一到 sudo。
 
 安裝器的行為：
-- **會**寫 `/etc/sudoers.d/kekkai-cli-<user>` NOPASSWD drop-in → `sudo kekkai ...` 不會問密碼
+- **會**寫 `/etc/sudoers.d/kekkai-cli-<user>`。NOPASSWD 只涵蓋安全子指令：`status`、`doctor`、`ports`、`version`、`check`、`show`、`reload`、`bypass`、`config`，外加 `sudoedit /etc/kekkai/kekkai.yaml`（編輯器以你的身分執行，不是 root）。`update`、`reset`、`backup` **會問密碼**
 - **不會**設 file capabilities (`setcap cap_bpf,...`) — 在這個 kernel sysctl 下沒用
 - **不會**在 `.bashrc` / `.zshrc` 加 `alias kekkai='sudo kekkai'` — 避免跨主機 muscle memory 不一致
 
-直接把 `sudo kekkai` 背起來就好，體感上跟無 sudo 差不多（沒密碼提示）。若不小心打成 `kekkai`，CLI 會提示改用 sudo。
+日常的 `status` / `check` / `reload` 不會問密碼。`sudo kekkai update`、`reset`、`backup` 會。改設定：
+
+```bash
+sudoedit /etc/kekkai/kekkai.yaml
+sudo kekkai reload
+```
+
+`kekkai config` 只印出上面的做法並檢查目前的檔，不會自己開編輯器。若不小心打成 `kekkai`，CLI 會提示改用 sudo。
 
 若要關掉 NOPASSWD：`sudo rm /etc/sudoers.d/kekkai-cli-$USER`。
 
@@ -41,7 +48,7 @@
 
 ```bash
 sudo kekkai status                              # 預設讀 /etc/kekkai/kekkai.yaml
-sudo kekkai status /path/to/kekkai.yaml           # 指定 config 路徑
+sudo kekkai status /etc/kekkai/other.yaml        # 指定 config 路徑（限 /etc/kekkai/*.yaml）
 ```
 
 **畫面分四頁**
@@ -50,8 +57,8 @@ sudo kekkai status /path/to/kekkai.yaml           # 指定 config 路徑
 |---|---|
 | 1. Overview | RX / TX、協定速率、drop 原因摘要、top 5 IP |
 | 2. Detail | 完整計數、每個 drop/pass reason 的 slot 值 |
-| 3. Top-N | 整張 perip_v4 map 的 src IP 排行，支援上下捲動 |
-| 4. Charts | 最近 120 秒 PPS/DPS/TCP/UDP/ICMP + stateful hit 走勢圖 |
+| 3. Top-N | 整張 perip map 的 src IP（v4 / v6）排行，支援上下捲動 |
+| 4. Charts | 最近 120 秒 PPS/DPS/TCP/UDP/ICMP + UDP flow hit 走勢圖 |
 
 **鍵盤**
 
@@ -73,7 +80,7 @@ sudo kekkai status /path/to/kekkai.yaml           # 指定 config 路徑
 
 ```bash
 sudo kekkai check                               # 驗 /etc/kekkai/kekkai.yaml
-sudo kekkai check /tmp/new-kekkai.yaml          # 指定檔案
+sudo kekkai check /etc/kekkai/new.yaml          # 指定檔案（限 /etc/kekkai/*.yaml）
 ```
 
 實際的遷移寫回只會在 daemon 正式啟動（`systemctl start kekkai-agent` 或 `kekkai-agent -config ...`）時發生。
@@ -86,7 +93,7 @@ Exit code：`0` 通過、`1` 驗證失敗（錯誤訊息到 stderr）。推薦�
 
 ```bash
 sudo kekkai ports                               # 讀 /etc/kekkai/kekkai.yaml
-sudo kekkai ports /tmp/new-kekkai.yaml          # 指定檔案
+sudo kekkai ports /etc/kekkai/new.yaml          # 指定檔案（限 /etc/kekkai/*.yaml）
 ```
 
 輸出重點：
@@ -100,7 +107,7 @@ sudo kekkai ports /tmp/new-kekkai.yaml          # 指定檔案
 
 ```bash
 sudo kekkai show > /tmp/current.yaml       # 看 agent 實際在用什麼
-sudo kekkai show /tmp/test.yaml            # 指定檔案
+sudo kekkai show /etc/kekkai/test.yaml     # 指定檔案（限 /etc/kekkai/*.yaml）
 ```
 
 用途：
@@ -115,7 +122,7 @@ sudo kekkai show /tmp/test.yaml            # 指定檔案
 ```bash
 sudo kekkai backup                            # 備份 /etc/kekkai/kekkai.yaml
 sudo kekkai backup /etc/kekkai/kekkai.yaml    # 顯式指定
-sudo kekkai backup /tmp/test.yaml             # 任意路徑
+sudo kekkai backup /etc/kekkai/test.yaml      # 限 /etc/kekkai/*.yaml
 ```
 
 每個 kind (update/auto/backup) 各保留最新 10 份，舊的自動刪。
@@ -127,8 +134,8 @@ sudo kekkai backup /tmp/test.yaml             # 任意路徑
 ```bash
 sudo kekkai reset                              # 用 default route 自動偵測 iface
 sudo kekkai reset --iface eth1                 # 明確指定網卡
-sudo kekkai reset /tmp/test.yaml               # 任意路徑
-sudo kekkai reset /tmp/test.yaml --iface eth0
+sudo kekkai reset /etc/kekkai/test.yaml        # 限 /etc/kekkai/*.yaml
+sudo kekkai reset /etc/kekkai/test.yaml --iface eth0
 ```
 
 流程：
@@ -141,7 +148,7 @@ sudo kekkai reset /tmp/test.yaml --iface eth0
 
 ```bash
 sudo kekkai reset
-sudo nano /etc/kekkai/kekkai.yaml
+sudoedit /etc/kekkai/kekkai.yaml
 # 改成:
 #   ingress_allowlist:
 #     - 192.168.88.0/24     # 你的管理網段
@@ -309,7 +316,7 @@ Reload 成功時 journal 會記：
 | `security.*` | `systemctl reload` |
 | `runtime.emergency_bypass` | `systemctl reload` |
 | `interface.name` / `xdp_mode` | `systemctl restart`（會短暫放行封包） |
-| `runtime.perip_table_size` | `systemctl restart`（動到 map 大小） |
+| `runtime.perip_table_size` | `systemctl restart`（動到 map 大小；per-CPU，記憶體隨核心數放大） |
 
 Reload 失敗時會在 log 印 `reload failed (keeping previous config): ...`，既有規則維持不變。
 
@@ -366,7 +373,7 @@ interface:
 
 runtime:
   emergency_bypass: false    # true = 載入 eBPF 但不 attach
-  perip_table_size: 65536    # LRU hash 容量，需重啟才能改
+  perip_table_size: 65536    # per-CPU LRU 容量（≈ 筆數 × CPU 數 × 64 B），需重啟才能改
 
 observability:
   stats_file: /var/run/kekkai/stats.txt
@@ -391,17 +398,24 @@ filter:
 
 ### 5.4 過濾流程
 
-每個進站封包依序走：
+每個進站封包（IPv4 / IPv6 相同）依序走，括號是 stats / TUI 的計數名稱：
 
 ```
-1. 非 IPv4                  → DROP  (drop_non_ipv4)
-2. IP fragment 2+           → PASS  (pass_fragment)
-3. 回程封包                  → PASS
-   · TCP ACK 有設              (pass_return_tcp)
-   · UDP dst port >= 32768    (pass_return_udp)
-   · ICMP                      (pass_return_icmp)
-4. src 在 static_blocklist  → DROP  (drop_blocklist)
-5. src 在 dyn_blocklist     → DROP  (drop_dyn_blocklist，M6 之後才寫入)
+1. ARP                      → filter.allow_arp 開啟時 PASS (pass_arp)，否則 DROP
+   非 IPv4/IPv6/ARP          → DROP  (drop_non_ip)
+2. L3 / L4 header 格式錯誤、
+   TCP 不合法 flag 組合       → DROP  (drop_malformed)
+3. src 在 static_blocklist  → DROP  (drop_blocklist)   ← 最先檢查
+4. IP 分片第 2 片以後        → PASS  (pass_fragment)
+5. TCP 帶 ACK 或 RST         → PASS  (pass_tcp_established，不建立狀態；
+                                    只會落到 listener 的 ACK 比照 SYN 走 6/7)
+   UDP 本機送出 flow 的回包   → PASS  (pass_udp_flow)
+   DHCP/DHCPv6 回覆（本機 60 秒內送過請求）→ PASS (pass_dhcp)
+   ICMP/ICMPv6 echo         → filter.allow_icmp 開啟時 PASS (pass_icmp)
+   frag-needed / packet-too-big、
+   其他 ICMP 錯誤（對應本機現存連線）、
+   IPv6 NDP / MLD           → PASS  (pass_icmp)
+   其他 ICMP 類型 / L4 協定   → DROP  (drop_no_policy)
 6. dst port 在 public.*     → PASS  (pass_public_*)
 7. dst port 在 private.*:
      src 在 ingress_allowlist → PASS (pass_private_*)
@@ -409,7 +423,7 @@ filter:
 8. 都沒命中                  → DROP  (drop_no_policy)
 ```
 
-本機主動出去的連線回程靠規則 3 放行，不用特別設定。
+本機主動出去的連線回包靠規則 5 放行，不用特別設定。來源位址無法驗證真偽，白名單的安全邊界見 readme「安全邊界」。
 
 ### 5.5 驗證規則
 
@@ -522,7 +536,7 @@ update:
 ### 7.5 安裝完成後
 
 ```bash
-sudo nano /etc/kekkai/kekkai.yaml             # 填 ingress_allowlist
+sudoedit /etc/kekkai/kekkai.yaml             # 填 ingress_allowlist
 sudo kekkai check                              # 驗證
 sudo systemctl restart kekkai-agent             # 套用
 sudo kekkai doctor                              # 確認全綠
@@ -690,9 +704,9 @@ journalctl -u kekkai-agent -n 30 --no-pager
 主要會看這些環境變數：
 
 - `NO_COLOR`：關閉彩色輸出
-- `KEKKAI_SCRIPT`：直接指定 `kekkai.sh` 路徑（預設 `/usr/local/bin/kekkai.sh`）
-- `KEKKAI_REPO`：指定 `kekkai.sh` 所在目錄（罕用，大部分人用預設就好）
 - `KEKKAI_UPDATE_CHANNEL`：臨時覆蓋 `update.channel`（`release` / `pre-release`）
+
+> 安全限制：NOPASSWD 只給安全子指令（`status` `doctor` `ports` `version` `check` `show` `reload` `bypass` `config`）和 `sudoedit /etc/kekkai/kekkai.yaml`；`update` / `reset` / `backup` 會問密碼。就算已經是 root，`kekkai` 也只接受 `/etc/kekkai/` 底下的 `.yaml` / `.yml`。`kekkai update` 只執行 root 擁有、不可被其他人寫入的 `/usr/local/bin/kekkai.sh`（不再讀 `KEKKAI_SCRIPT` / `KEKKAI_REPO` 或家目錄的腳本）。`kekkai config` 不開編輯器，請改用 `sudoedit`。安裝與更新會先比對 release 的 `SHA256SUMS`，缺檔或不符即中止。開發時要跑 repo 裡的腳本請直接 `sudo bash kekkai.sh update`。
 
 ---
 
@@ -703,7 +717,7 @@ journalctl -u kekkai-agent -n 30 --no-pager
 sudo kekkai show | grep -A20 filter
 
 # 備份 + 編輯 + 驗證 + reload 的標準流程
-sudo kekkai backup && sudo nano /etc/kekkai/kekkai.yaml && sudo kekkai reload
+sudo kekkai backup && sudoedit /etc/kekkai/kekkai.yaml && sudo kekkai reload
 
 # 看被擋最多的 src IP
 sudo kekkai status      # 切到 Top-N 頁，排序已經是 by pkts
@@ -713,8 +727,8 @@ systemctl status kekkai-agent
 ps -o pid,rss,pcpu,cmd -p $(pgrep kekkai-agent)
 
 # 看 eBPF map 實際大小（需要裝 bpftool）
-sudo bpftool map show name blocklist_v4
-sudo bpftool map show name perip_v4
+sudo bpftool map show name blocklist
+sudo bpftool map show name perip
 
 # 匯出目前 stats 到檔案（給 debug 用）
 cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
@@ -738,7 +752,7 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 | 指令 | 實作 | 說明 |
 |---|---|---|
 | `kekkai status [path]`          | ✅ | 互動式 TUI |
-| `kekkai config [path]`          | ✅ | 顯示 config 路徑與安全編輯方式（`sudoedit` + `kekkai reload`)；**不再**直接開編輯器（避免 root editor 提權） |
+| `kekkai config [path]`          | ✅ | 印出 `sudoedit` 步驟並檢查 config；**不**開編輯器（避免 root editor 提權） |
 | `kekkai doctor`                 | ✅ | 全系統健康檢查（read-only） |
 | `kekkai check [path]`           | ✅ | 驗證 config (read-only) |
 | `kekkai ports [path]`           | ✅ | 彩色列出 public/private port 與 SSH 暴露狀態 |
@@ -768,7 +782,7 @@ cat /var/run/kekkai/stats.txt > /tmp/stats-$(date +%s).txt
 
 | 指令 | 規劃 milestone | 說明 |
 |---|---|---|
-| `kekkai block <ip> [--ttl]`   | M6 | 寫入 `dyn_blocklist_v4` 即時封鎖 |
+| `kekkai block <ip> [--ttl]`   | M6 | 即時封鎖（寫入 `blocklist` map，到期由 agent 移除） |
 | `kekkai unblock <ip>`         | M6 | 從動態黑名單移除 |
 | `kekkai logs [-f] [-n N]`     | M7 | `journalctl -u kekkai-agent` 包裝 |
 | `kekkai start/stop/restart/enable/disable` | M7 | systemctl 包裝 |

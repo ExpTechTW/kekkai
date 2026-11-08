@@ -24,15 +24,21 @@ package main
 // unlink the state file so the warning goes away.
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -124,12 +130,13 @@ func (a *agent) tickAutoUpdate(ctx context.Context, currentVersion string, log *
 		return
 	}
 
-	latestTag, agentURL, cliURL, err := fetchLatestRelease(ctx, cfg.Channel)
+	rel, err := fetchLatestRelease(ctx, cfg.Channel)
 	if err != nil {
-		a.recordAutoUpdateError("fetch_failed", latestTag, err.Error())
+		a.recordAutoUpdateError("fetch_failed", rel.Tag, err.Error())
 		log.Error("fetch release metadata failed", "channel", cfg.Channel, "err", err.Error())
 		return
 	}
+	latestTag := rel.Tag
 	log.Info("fetched release metadata", "channel", cfg.Channel, "latest", latestTag)
 
 	latest, latestOK := kver.Parse(latestTag)
@@ -154,6 +161,14 @@ func (a *agent) tickAutoUpdate(ctx context.Context, currentVersion string, log *
 		"running", currentVersion,
 		"latest", latestTag)
 
+	for _, raw := range []string{rel.AgentURL, rel.CLIURL, rel.SumsURL} {
+		if err := validateDownloadURL(raw); err != nil {
+			a.recordAutoUpdateError("download_url", latestTag, err.Error())
+			log.Error("refusing download url", "err", err.Error())
+			return
+		}
+	}
+
 	if err := os.MkdirAll(autoUpdateStagedDir, 0o755); err != nil {
 		a.recordAutoUpdateError("mkdir_staged", latestTag, err.Error())
 		log.Error("mkdir staged dir failed", "path", autoUpdateStagedDir, "err", err.Error())
@@ -170,25 +185,70 @@ func (a *agent) tickAutoUpdate(ctx context.Context, currentVersion string, log *
 
 	stagedAgent := filepath.Join(autoUpdateStagedDir, "kekkai-agent")
 	stagedCLI := filepath.Join(autoUpdateStagedDir, "kekkai")
+	agentPart := stagedAgent + ".part"
+	cliPart := stagedCLI + ".part"
+	sumsPart := filepath.Join(autoUpdateStagedDir, "SHA256SUMS")
 
-	log.Info("downloading agent binary", "url", agentURL, "dst", stagedAgent)
-	if err := downloadTo(ctx, agentURL, stagedAgent); err != nil {
+	discard := func() {
+		removePaths(agentPart, cliPart, sumsPart, stagedAgent, stagedCLI)
+	}
+
+	log.Info("downloading SHA256SUMS", "url", rel.SumsURL)
+	if err := downloadPart(ctx, rel.SumsURL, sumsPart, 0o640); err != nil {
+		discard()
+		a.recordAutoUpdateError("download_sums", latestTag, err.Error())
+		log.Error("download SHA256SUMS failed", "err", err.Error())
+		return
+	}
+
+	log.Info("downloading agent binary", "url", rel.AgentURL, "dst", stagedAgent)
+	if err := downloadPart(ctx, rel.AgentURL, agentPart, 0o755); err != nil {
+		discard()
 		a.recordAutoUpdateError("download_agent", latestTag, err.Error())
 		log.Error("download agent failed", "err", err.Error())
 		return
 	}
 
-	log.Info("downloading cli binary", "url", cliURL, "dst", stagedCLI)
-	if err := downloadTo(ctx, cliURL, stagedCLI); err != nil {
+	log.Info("downloading cli binary", "url", rel.CLIURL, "dst", stagedCLI)
+	if err := downloadPart(ctx, rel.CLIURL, cliPart, 0o755); err != nil {
+		discard()
 		a.recordAutoUpdateError("download_cli", latestTag, err.Error())
 		log.Error("download cli failed", "err", err.Error())
 		return
 	}
 
+	// Verify before the final rename. A missing entry or a mismatch
+	// discards the partial download and leaves the running binaries alone.
+	if err := verifySHA256File(agentPart, rel.AgentName, sumsPart); err != nil {
+		discard()
+		a.recordAutoUpdateError("checksum", latestTag, err.Error())
+		log.Error("agent checksum failed", "err", err.Error())
+		return
+	}
+	if err := verifySHA256File(cliPart, rel.CLIName, sumsPart); err != nil {
+		discard()
+		a.recordAutoUpdateError("checksum", latestTag, err.Error())
+		log.Error("cli checksum failed", "err", err.Error())
+		return
+	}
+	if err := os.Rename(agentPart, stagedAgent); err != nil {
+		discard()
+		a.recordAutoUpdateError("stage_rename", latestTag, err.Error())
+		log.Error("rename staged agent failed", "err", err.Error())
+		return
+	}
+	if err := os.Rename(cliPart, stagedCLI); err != nil {
+		discard()
+		a.recordAutoUpdateError("stage_rename", latestTag, err.Error())
+		log.Error("rename staged cli failed", "err", err.Error())
+		return
+	}
+	_ = os.Remove(sumsPart)
+
 	// Write a version marker so kekkai.sh / doctor can identify what's
 	// sitting in staged without having to exec the binary.
 	_ = os.WriteFile(filepath.Join(autoUpdateStagedDir, "VERSION"),
-		[]byte(latestTag+"\n"), 0o644)
+		[]byte(latestTag+"\n"), 0o640)
 
 	log.Info("auto-update staged", "tag", latestTag, "dir", autoUpdateStagedDir)
 
@@ -218,9 +278,21 @@ func (a *agent) tickAutoUpdate(ctx context.Context, currentVersion string, log *
 	writeLastRun("applying", latestTag)
 }
 
-// fetchLatestRelease calls the Releases API, picks the right tag for the
-// requested channel, and returns (tag, agent_asset_url, cli_asset_url).
-func fetchLatestRelease(ctx context.Context, channel string) (string, string, string, error) {
+// fetchedRelease is the subset of a GitHub release the stager needs.
+// SumsURL points at the SHA256SUMS asset for the same release as the
+// binaries. AgentName and CLIName are the names listed in that file.
+type fetchedRelease struct {
+	Tag       string
+	AgentURL  string
+	AgentName string
+	CLIURL    string
+	CLIName   string
+	SumsURL   string
+}
+
+// fetchLatestRelease calls the Releases API and picks the right tag for
+// the requested channel, plus the platform binaries and SHA256SUMS.
+func fetchLatestRelease(ctx context.Context, channel string) (fetchedRelease, error) {
 	url := autoUpdateReleasesAPI + "/latest"
 	if channel == "pre-release" {
 		url = autoUpdateReleasesAPI + "?per_page=30"
@@ -228,7 +300,7 @@ func fetchLatestRelease(ctx context.Context, channel string) (string, string, st
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", "", "", err
+		return fetchedRelease{}, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", autoUpdateUserAgent)
@@ -236,42 +308,53 @@ func fetchLatestRelease(ctx context.Context, channel string) (string, string, st
 	client := &http.Client{Timeout: autoUpdateHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", "", "", err
+		return fetchedRelease{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", "", "", fmt.Errorf("http %d", resp.StatusCode)
+		return fetchedRelease{}, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, autoUpdateMaxReleaseLen))
 	if err != nil {
-		return "", "", "", err
+		return fetchedRelease{}, err
 	}
 
 	pick, err := selectReleaseFromJSON(body, channel)
 	if err != nil {
-		return "", "", "", err
+		return fetchedRelease{}, err
 	}
 	// Asset matching mirrors kekkai.sh: pick the asset whose name ends
 	// with the current GOOS-GOARCH. `kekkai` must not accidentally match
 	// `kekkai-agent` — we check that prefix explicitly.
 	wantOSArch := runtime.GOOS + "-" + runtime.GOARCH
-	var agentURL, cliURL string
+	out := fetchedRelease{Tag: pick.TagName}
 	for _, asset := range pick.Assets {
 		name := asset.Name
-		if !endsWith(name, wantOSArch) {
+		if name == "SHA256SUMS" && asset.DownloadURL != "" {
+			out.SumsURL = asset.DownloadURL
 			continue
 		}
-		if startsWith(name, "kekkai-agent") {
-			agentURL = asset.DownloadURL
-		} else if startsWith(name, "kekkai") {
-			cliURL = asset.DownloadURL
+		if !strings.HasSuffix(name, wantOSArch) {
+			continue
+		}
+		// kekkai-agent is checked before kekkai. The shorter prefix also
+		// matches the agent asset, so the order is the match.
+		if strings.HasPrefix(name, "kekkai-agent") {
+			out.AgentURL = asset.DownloadURL
+			out.AgentName = name
+		} else if strings.HasPrefix(name, "kekkai") {
+			out.CLIURL = asset.DownloadURL
+			out.CLIName = name
 		}
 	}
-	if agentURL == "" || cliURL == "" {
-		return pick.TagName, "", "", fmt.Errorf("release %s has no %s assets", pick.TagName, wantOSArch)
+	if out.AgentURL == "" || out.CLIURL == "" {
+		return out, fmt.Errorf("release %s has no %s assets", pick.TagName, wantOSArch)
 	}
-	return pick.TagName, agentURL, cliURL, nil
+	if out.SumsURL == "" {
+		return out, fmt.Errorf("release %s is missing SHA256SUMS", pick.TagName)
+	}
+	return out, nil
 }
 
 // releaseAsset / releaseBody mirror the subset of the GitHub Releases API
@@ -289,10 +372,10 @@ type releaseBody struct {
 }
 
 // selectReleaseFromJSON returns the relevant release for the given channel.
-// - release channel: the /latest endpoint returns a single object.
-// - pre-release channel: the list endpoint returns an array; we pick the
-//   max-version prerelease (NOT the API's default created_at order,
-//   which has been observed to be unstable for republished tags).
+//   - release channel: the /latest endpoint returns a single object.
+//   - pre-release channel: the list endpoint returns an array; we pick the
+//     max-version prerelease (NOT the API's default created_at order,
+//     which has been observed to be unstable for republished tags).
 func selectReleaseFromJSON(body []byte, channel string) (*releaseBody, error) {
 	if channel == "release" {
 		var r releaseBody
@@ -328,54 +411,170 @@ func selectReleaseFromJSON(body []byte, channel string) (*releaseBody, error) {
 	return best, nil
 }
 
-// downloadTo pulls url to dst with a streaming copy and chmod +x on
-// success. Truncates dst on retry.
-func downloadTo(ctx context.Context, url, dst string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// downloadPart pulls url to dst. The caller renames dst into place only
+// after SHA256SUMS matches. mode is 0755 for binaries and 0640 for the
+// checksum file and other metadata.
+func downloadPart(ctx context.Context, rawURL, dst string, mode os.FileMode) error {
+	if err := validateDownloadURL(rawURL); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("User-Agent", autoUpdateUserAgent)
 
-	client := &http.Client{Timeout: 2 * time.Minute}
-	resp, err := client.Do(req)
+	resp, err := newAssetClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("http %d fetching %s", resp.StatusCode, url)
+		return fmt.Errorf("http %d fetching %s", resp.StatusCode, rawURL)
 	}
 
-	tmp := dst + ".part"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(f, resp.Body); err != nil {
 		f.Close()
-		_ = os.Remove(tmp)
+		_ = os.Remove(dst)
 		return err
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
+		_ = os.Remove(dst)
 		return err
 	}
-	return os.Rename(tmp, dst)
+	return nil
 }
 
-// launchDetachedUpdate forks kekkai.sh update into a new session so that
-// when the script restarts kekkai-agent (killing us) the script itself
-// keeps running until it completes or errors.
+// validateDownloadURL allows only the GitHub hosts that actually serve
+// release assets. Every redirect hop is checked the same way.
+func validateDownloadURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid download url: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("refusing download url %q: https required", raw)
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com":
+		return nil
+	default:
+		return fmt.Errorf("refusing download url host %q", u.Hostname())
+	}
+}
+
+func newAssetClient() *http.Client {
+	return &http.Client{
+		Timeout: 2 * time.Minute,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return validateDownloadURL(req.URL.String())
+		},
+	}
+}
+
+// verifySHA256File checks path against the sha256sum-format entry for
+// assetName. A missing line or a mismatched digest is an error.
+func verifySHA256File(path, assetName, sumsPath string) error {
+	sums, err := os.ReadFile(sumsPath)
+	if err != nil {
+		return fmt.Errorf("read SHA256SUMS: %w", err)
+	}
+	if len(bytes.TrimSpace(sums)) == 0 {
+		return fmt.Errorf("SHA256SUMS is empty; refusing to stage unverified files")
+	}
+	expect, ok := lookupSHA256(sums, assetName)
+	if !ok {
+		return fmt.Errorf("SHA256SUMS has no entry for %s", assetName)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	actual := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(actual, expect) {
+		return fmt.Errorf("checksum mismatch for %s", assetName)
+	}
+	return nil
+}
+
+// lookupSHA256 finds name in a sha256sum file. Lines are "<hex><whitespace><filename>"
+// or "<hex> *<filename>" (text mode).
+func lookupSHA256(sums []byte, name string) (string, bool) {
+	sc := bufio.NewScanner(bytes.NewReader(sums))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 || len(fields[0]) != 64 {
+			continue
+		}
+		fn := strings.TrimPrefix(fields[1], "*")
+		if fn == name {
+			return strings.ToLower(fields[0]), true
+		}
+	}
+	return "", false
+}
+
+func removePaths(paths ...string) {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		_ = os.Remove(p)
+	}
+}
+
+// launchDetachedUpdate starts `kekkai.sh update`, which replaces the
+// binaries and restarts kekkai-agent (killing us), so it must outlive us.
+//
+// The preferred path asks pid 1 for a transient unit via systemd-run. A
+// child of ours cannot do the job: it inherits this unit's sandbox
+// (ProtectSystem=strict leaves /usr/local/bin and /etc/systemd read-only)
+// and its cgroup, which `systemctl restart` kills wholesale regardless of
+// Setsid. The direct child below is only a fallback for hosts without
+// systemd-run.
 func launchDetachedUpdate(targetVersion string, log *logx.Logger) error {
 	if _, err := os.Stat(autoUpdateScriptPath); err != nil {
 		return fmt.Errorf("%s not found: %w", autoUpdateScriptPath, err)
+	}
+	childLog := filepath.Join(autoUpdateStateDir, "auto_update_child.log")
+
+	if sr, err := exec.LookPath("systemd-run"); err == nil {
+		unit := fmt.Sprintf("kekkai-update-%d", time.Now().Unix())
+		out, err := exec.Command(sr,
+			"--unit="+unit, "--collect", "--no-block",
+			"--service-type=oneshot",
+			"--property=StandardOutput=append:"+childLog,
+			"--property=StandardError=append:"+childLog,
+			"/bin/bash", autoUpdateScriptPath, "update",
+		).CombinedOutput()
+		if err == nil {
+			log.Info("update unit started", "target", targetVersion, "unit", unit, "log", childLog)
+			return nil
+		}
+		log.Warn("systemd-run failed; falling back to a direct child",
+			"err", err.Error(), "output", strings.TrimSpace(string(out)))
 	}
 
 	// Pipe child output into a small buffered tail file so the next
 	// operator can see what happened even though the parent (us) gets
 	// killed mid-run. Best effort — we don't block on failures here.
-	logOut, err := os.Create(filepath.Join(autoUpdateStateDir, "auto_update_child.log"))
+	logOut, err := os.OpenFile(childLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
 	if err != nil {
 		return err
 	}
@@ -402,7 +601,7 @@ func launchDetachedUpdate(targetVersion string, log *logx.Logger) error {
 	log.Info("detached update child launched",
 		"target", targetVersion,
 		"pid", cmd.Process.Pid,
-		"log", filepath.Join(autoUpdateStateDir, "auto_update_child.log"))
+		"log", childLog)
 	return nil
 }
 
@@ -418,7 +617,7 @@ func (a *agent) recordAutoUpdateError(kind, targetVersion, detail string) {
 	// No logger here — any failure on this path cannot be reported
 	// through logx without a logger reference. Writing to stderr still
 	// reaches journald; it just won't be pretty-formatted.
-	if err := os.WriteFile(autoUpdateErrorFile, []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(autoUpdateErrorFile, []byte(body), 0o640); err != nil {
 		fmt.Fprintf(os.Stderr, "auto-update: write error file: %v\n", err)
 	}
 	writeLastRun("failed", targetVersion+" ("+kind+")")
@@ -430,17 +629,5 @@ func (a *agent) recordAutoUpdateError(kind, targetVersion, detail string) {
 func writeLastRun(state, detail string) {
 	line := fmt.Sprintf("timestamp=%s\nstate=%s\ndetail=%s\n",
 		time.Now().UTC().Format(time.RFC3339), state, detail)
-	_ = os.WriteFile(autoUpdateLastRunFile, []byte(line), 0o644)
+	_ = os.WriteFile(autoUpdateLastRunFile, []byte(line), 0o640)
 }
-
-// Tiny local helpers to avoid pulling in strings just for these two.
-// The pattern set is bounded so an inline byte walk is cheaper and
-// clearer than strings.HasPrefix for this file's uses.
-func startsWith(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
-}
-
-func endsWith(s, suffix string) bool {
-	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
-}
-
